@@ -38,10 +38,14 @@ export default function TradesPage() {
       const res = await fetch("/api/trades/refresh", { method: "POST" });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Refresh failed");
+      const failedNote =
+        typeof json.failed === "number" && json.failed > 0
+          ? ` (${json.failed} update${json.failed === 1 ? "" : "s"} failed — check server logs)`
+          : "";
       setStatusMsg(
         json.resolved > 0
-          ? `Checked ${json.checked} open trades, resolved ${json.resolved}.`
-          : json.message ?? `Checked ${json.checked} open trades, no new resolutions.`
+          ? `Checked ${json.checked} open trades, resolved ${json.resolved}.${failedNote}`
+          : json.message ?? `Checked ${json.checked} open trades, no new resolutions.${failedNote}`
       );
       await fetchTrades();
     } catch (err) {

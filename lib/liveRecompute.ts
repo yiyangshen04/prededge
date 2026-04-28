@@ -17,6 +17,29 @@ import {
   estimateHoldingDays,
 } from "./polymarket/scoring";
 
+/**
+ * Resolution-effective end date for holding-day math. Mirrors the scanner's
+ * `effectiveEndDate` (scanner.ts) but also honours the `deadline:ISO` entry
+ * encoded in `decisionReasons` for rows rehydrated from persistence (where
+ * the typed `resolutionDeadline` column may be absent on legacy rows).
+ *
+ * Both the scanner card's live metrics and the TradeModal's Ann. Yield preview
+ * consume this, so PDUFA-style markets (description-parsed deadline strictly
+ * later than Gamma endDate) report consistent holding days in both places.
+ */
+export function effectiveEndDate(opp: Opportunity): string | null {
+  const fromReasons = opp.decisionReasons
+    ?.find((r) => r.startsWith("deadline:"))
+    ?.slice("deadline:".length);
+  return (
+    opp.expectedPayoutDate ??
+    opp.resolutionDeadline ??
+    fromReasons ??
+    opp.eventDeadline ??
+    opp.endDate
+  );
+}
+
 export interface LiveMetrics {
   /** Average fill price for the chosen tradeSize */
   avgFillPrice: number;
@@ -97,12 +120,7 @@ export function recomputeAtSize(
   // strictly later than Gamma's endDate, hold days are measured to the
   // deadline, not the event date — otherwise live yield would stay inflated
   // on PDUFA-style markets even after the scanner corrected the baseline.
-  const deadlineFromReasons = opp.decisionReasons
-    ?.find((r) => r.startsWith("deadline:"))
-    ?.slice("deadline:".length);
-  const effectiveEnd =
-    opp.resolutionDeadline ?? deadlineFromReasons ?? opp.endDate;
-  const holdDays = estimateHoldingDays(effectiveEnd);
+  const holdDays = estimateHoldingDays(effectiveEndDate(opp));
   const annualized = computeAnnualizedYield(netReturn, holdDays);
 
   return {

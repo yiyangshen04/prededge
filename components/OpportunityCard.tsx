@@ -5,11 +5,7 @@ import type { Opportunity } from "@/lib/types";
 import type { LiveMetrics } from "@/lib/liveRecompute";
 import { DecisionBadge } from "./DecisionBadge";
 import { TradeModal } from "./TradeModal";
-
-const HIDDEN_TAGS = new Set([
-  "hide from new",
-  "rewards automation 50 4.5 50",
-]);
+import { isHiddenTag } from "@/lib/virtualTags";
 
 /** Tags in `decision_reasons` that are informational (rendered as a badge
  * at the top of the card) rather than a downgrade cause. We strip them from
@@ -18,7 +14,14 @@ const INFO_REASON_TAGS = new Set(["rewards_incentivized"]);
 /** UMA status prefix lives in `decision_reasons` as `oracle_proposed` /
  * `oracle_disputed`. Rendered as a top badge; hidden from the bottom strip. */
 function isOracleReason(r: string): boolean {
-  return r.startsWith("oracle_");
+  return r === "oracle_proposed" || r === "oracle_disputed";
+}
+
+function isOracleResetStalled(opp: Opportunity): boolean {
+  return (
+    opp.oracleResolutionState === "reset_stalled" ||
+    opp.decisionReasons?.includes("oracle_reset_stalled") === true
+  );
 }
 
 /** Compute expiry display from raw endDate for maximum precision */
@@ -53,6 +56,13 @@ function formatExpiry(
     return `${d}d ${h}h`;
   }
   return `${Math.round(totalDays)}d`;
+}
+
+function sameTiming(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  const at = new Date(a).getTime();
+  const bt = new Date(b).getTime();
+  return !isNaN(at) && !isNaN(bt) && Math.abs(at - bt) < 60_000;
 }
 
 interface OpportunityCardProps {
@@ -144,26 +154,43 @@ export function OpportunityCard({
         <div className="flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
           {/* Badges derive from either the in-memory Opportunity fields (fresh
               POST /api/scan responses carry them) OR the decision_reasons
-              text[] column (the only channel that survives the Supabase round
-              trip without a schema migration). `oracleReason` prefix-matches
+              persisted list (the compatibility channel that works across
+              storage schemas). `oracleReason` prefix-matches
               `oracle_proposed` / `oracle_disputed` coming through reasons. */}
           {(() => {
             const oracleReason = opp.decisionReasons?.find(isOracleReason);
+            const normalizedUma = opp.umaResolutionStatus?.trim();
+            const resetStalled = isOracleResetStalled(opp);
             const uma =
-              opp.umaResolutionStatus && opp.umaResolutionStatus !== "None"
-                ? opp.umaResolutionStatus
+              normalizedUma && normalizedUma.toLowerCase() !== "none"
+                ? normalizedUma
                 : oracleReason
                   ? oracleReason.replace(/^oracle_/, "")
                   : null;
             return uma ? (
               <span
-                title="UMA oracle has a proposal in flight — outcome effectively decided, remaining ask-side yield is illusory"
+                title={
+                  resetStalled
+                    ? "Gamma reports this market as disputed, but chain state shows the adapter request was reset and no active UMA proposal is currently live."
+                    : "Gamma reports this market in UMA oracle resolution flow."
+                }
                 className="text-[10px] px-1.5 py-0.5 rounded bg-accent-red/15 text-accent-red border border-accent-red/30 uppercase tracking-wider"
               >
                 Oracle {uma}
               </span>
             ) : null;
           })()}
+          {isOracleResetStalled(opp) && (
+            <span
+              title={
+                opp.oracleResolutionDetails ??
+                "First UMA dispute reset this market's adapter request, but the current request has no active proposal and no available price."
+              }
+              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
+            >
+              Oracle Reset
+            </span>
+          )}
           {(opp.rewardsIncentivized ||
             opp.decisionReasons?.includes("rewards_incentivized")) && (
             <span
@@ -225,7 +252,7 @@ export function OpportunityCard({
             const gst = opp.gameStartTime;
             if (!gst && !isInPlayReason) return null;
             const t = gst ? new Date(gst).getTime() : NaN;
-            const mins = !isNaN(t) ? (t - Date.now()) / 60_000 : null;
+            const mins = !isNaN(t) ? (t - new Date().getTime()) / 60_000 : null;
             if (isInPlayReason || (mins != null && mins <= 0)) {
               return (
                 <span
@@ -250,9 +277,33 @@ export function OpportunityCard({
             }
             return null;
           })()}
+          {opp.staleRawEndDate && (
+            <span
+              title="Gamma endDate looked stale, so the scanner used the title/rules/lifecycle data to infer the current event cutoff."
+              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-green/15 text-accent-green border border-accent-green/30 uppercase tracking-wider"
+            >
+              Corrected
+            </span>
+          )}
+          {opp.recurrentLike && !opp.postponed && (
+            <span
+              title="Recurring or rolled-forward market. The displayed event cutoff is inferred from the current cycle rather than the stale raw Gamma endDate."
+              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-blue/15 text-accent-blue border border-accent-blue/30 uppercase tracking-wider"
+            >
+              Recurrent
+            </span>
+          )}
+          {opp.postponed && (
+            <span
+              title="Original event date moved after Gamma's raw endDate. Treat this as rescheduled/open rather than awaiting resolution."
+              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
+            >
+              Rescheduled
+            </span>
+          )}
           {opp.awaitingResolution && (
             <span
-              title="endDate passed but still accepting orders — arbitrageur-lag window"
+              title="Inferred event cutoff has passed, market is still accepting orders, and the book price is highly converged."
               className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
             >
               Awaiting
@@ -289,27 +340,26 @@ export function OpportunityCard({
 
       <div className="grid grid-cols-4 gap-3 mb-3">
         {(() => {
-          // Resolution deadline arrives either via `opp.resolutionDeadline`
-          // (fresh POST response) or encoded as `deadline:ISO` in the
-          // decision_reasons text[] column (survives the Supabase round trip).
-          const fromReasons = opp.decisionReasons
-            ?.find((r) => r.startsWith("deadline:"))
-            ?.slice("deadline:".length);
-          const deadline = opp.resolutionDeadline ?? fromReasons ?? null;
-          const showDeadline = deadline && deadline !== opp.endDate;
+          const eventDeadline = opp.eventDeadline ?? opp.endDate;
+          const payoutDeadline =
+            opp.expectedPayoutDate ?? opp.resolutionDeadline ?? eventDeadline;
+          const showPayout =
+            payoutDeadline != null && !sameTiming(payoutDeadline, eventDeadline);
+          const showRaw =
+            opp.staleRawEndDate &&
+            opp.endDate != null &&
+            !sameTiming(opp.endDate, eventDeadline);
+          const sub = showPayout
+            ? `settle ${formatExpiry(payoutDeadline)}`
+            : showRaw
+              ? `gamma ${formatExpiry(opp.endDate)}`
+              : undefined;
           return (
             <MetricCell
-              label="Expiry"
-              value={formatExpiry(
-                showDeadline ? deadline : opp.endDate,
-                opp.awaitingResolution
-              )}
+              label="Event"
+              value={formatExpiry(eventDeadline, opp.awaitingResolution)}
               mono
-              sub={
-                showDeadline && opp.endDate
-                  ? `event ${formatExpiry(opp.endDate, opp.awaitingResolution)}`
-                  : undefined
-              }
+              sub={sub}
             />
           );
         })()}
@@ -369,10 +419,10 @@ export function OpportunityCard({
       </div>
 
       {/* Tags */}
-      {opp.tags && opp.tags.filter((t) => !HIDDEN_TAGS.has(t.toLowerCase())).length > 0 && (
+      {opp.tags && opp.tags.filter((t) => !isHiddenTag(t)).length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1">
           {opp.tags
-            .filter((t) => !HIDDEN_TAGS.has(t.toLowerCase()))
+            .filter((t) => !isHiddenTag(t))
             .slice(0, 5)
             .map((tag) => (
               <span
@@ -395,6 +445,7 @@ export function OpportunityCard({
             r !== "neg_risk_bucket" &&
             r !== "in_play" &&
             !isOracleReason(r) &&
+            r !== "oracle_reset_stalled" &&
             !r.startsWith("deadline:") &&
             !r.startsWith("sports_")
         );

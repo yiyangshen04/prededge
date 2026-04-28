@@ -1,9 +1,11 @@
 import { NextRequest } from "next/server";
-import { createServerSupabaseClient } from "@/lib/supabase";
+import { insertPaperTrade } from "@/lib/localDb";
 import { PolymarketClient } from "@/lib/polymarket/client";
 import { DEFAULT_SCAN_CONFIG } from "@/lib/polymarket/config";
 import { fillOrder } from "@/lib/polymarket/fills";
 import { enforceRateLimit } from "@/lib/rateLimit";
+
+export const runtime = "nodejs";
 
 /** Guardrail against runaway inserts — paper only, but still worth bounding. */
 const MAX_USD_PER_TRADE = 10_000;
@@ -69,33 +71,21 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Persist
-    const supabase = createServerSupabaseClient();
-    const { data, error } = await supabase
-      .from("paper_trades")
-      .insert({
-        condition_id: conditionId,
-        token_id: tokenId,
-        market_question: question,
-        outcome_bought: outcome,
-        market_url: marketUrl ?? null,
-        end_date: endDate ?? null,
-        usd_amount: usdAmount - fill.remainingUsd, // actual invested
-        shares: fill.shares,
-        avg_fill_price: fill.avgFillPrice,
-        worst_fill_price: fill.worstFillPrice,
-        fills: fill.fills,
-        status: "open",
-      })
-      .select()
-      .single();
+    const trade = insertPaperTrade({
+      conditionId,
+      tokenId,
+      marketQuestion: question,
+      outcomeBought: outcome,
+      marketUrl: marketUrl ?? null,
+      endDate: endDate ?? null,
+      usdAmount: usdAmount - fill.remainingUsd, // actual invested
+      shares: fill.shares,
+      avgFillPrice: fill.avgFillPrice,
+      worstFillPrice: fill.worstFillPrice,
+      fills: fill.fills,
+    });
 
-    if (error) {
-      console.error("[api/trade] Insert failed:", error);
-      return Response.json({ error: error.message }, { status: 500 });
-    }
-
-    return Response.json({ trade: data, fill });
+    return Response.json({ trade, fill });
   } catch (err) {
     console.error("[api/trade] Error:", err);
     return Response.json(

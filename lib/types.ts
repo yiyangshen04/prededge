@@ -28,6 +28,16 @@ export interface ScanConfig {
   retryBackoffMs: number;
 }
 
+export type OracleResolutionState =
+  | "active_proposal"
+  | "ready"
+  | "reset_stalled"
+  | "second_dispute"
+  | "manual_review"
+  | "resolved"
+  | "requested"
+  | "unknown";
+
 // ── Gamma API raw market shape ──
 export interface GammaMarket {
   id: string;
@@ -78,6 +88,10 @@ export interface GammaMarket {
    * dispute window. In those states the price has almost always converged
    * and the "yield" is illusory — we exclude these from actionable. */
   umaResolutionStatus?: string | null;
+  /** Gamma also exposes a JSON-encoded status array on many rows, e.g.
+   * '["proposed"]'. Some markets only populate this plural field, so the
+   * scanner normalizes both shapes before classifying oracle-flow markets. */
+  umaResolutionStatuses?: string | string[] | null;
   /** For sports markets: 'moneyline' (winner picks), 'spreads' (point-spread
    * wagers), 'totals' (over/under), 'child_moneyline', etc. Non-moneyline
    * sports markets have tail-of-distribution prices that look like
@@ -118,6 +132,10 @@ export interface GammaMarket {
   bestAsk?: number;
   description?: string;
   resolutionSource?: string;
+  /** UMA CTF Adapter address used as the CTF oracle for this market. */
+  resolvedBy?: string | null;
+  /** UMA CTF Adapter question identifier. */
+  questionID?: string | null;
   image?: string;
   events?: Array<{ slug: string; title: string; id: string }>;
 }
@@ -160,6 +178,14 @@ export interface TailCandidate {
    * is broken. */
   eventTitle: string | null;
   endDate: string | null;
+  /** Best inferred real-world event/observation cutoff. This may differ from
+   * Gamma `endDate` when a recurring/rolled market keeps an old raw endDate. */
+  eventDeadline?: string | null;
+  /** Latest rules-based resolution deadline if it is materially later than the
+   * event cutoff. */
+  resolutionDeadline?: string | null;
+  /** Conservative expected payout/settlement date used for annualized yield. */
+  expectedPayoutDate?: string | null;
   tokenId: string;
   outcome: string;
   /** Price from Gamma outcomePrices */
@@ -175,6 +201,16 @@ export interface TailCandidate {
    * (the "arbitrageur lag" window — real-world outcome known, on-chain price
    * hasn't converged yet). */
   awaitingResolution?: boolean;
+  /** True when Gamma's raw `endDate` was contradicted by title/rules/lifecycle
+   * data and should not drive ranking or expiry display. */
+  staleRawEndDate?: boolean;
+  /** True for recurring or rolled-forward markets whose raw Gamma end date is
+   * stale but question/rules point to the current cycle. */
+  recurrentLike?: boolean;
+  /** Sports/event market whose original event date moved after Gamma endDate. */
+  postponed?: boolean;
+  timingConfidence?: "high" | "medium" | "low";
+  timingReasons?: string[];
   /** True when the parent market has a liquidity-rewards program
    * (rewardsMinSize > 0). These are usually dominated by maker bots; we
    * demote them out of `actionable` since the top of book isn't a mispricing. */
@@ -186,6 +222,10 @@ export interface TailCandidate {
    * that point the outcome is effectively decided, so the ask-side "yield"
    * is illusory. */
   umaResolutionStatus?: string | null;
+  /** UMA CTF Adapter address and question ID, used for on-chain oracle state
+   * refinement (e.g. reset-but-no-active-proposal). */
+  resolvedBy?: string | null;
+  questionID?: string | null;
   /** Gamma `sportsMarketType`. Used to demote non-moneyline sports markets
    * (spreads/totals) that have structural-tail prices rather than mispricings. */
   sportsMarketType?: string | null;
@@ -237,6 +277,10 @@ export interface Opportunity {
   liquidity: number;
   marketUrl: string;
   endDate: string | null;
+  /** Best inferred real-world event/observation cutoff. */
+  eventDeadline?: string | null;
+  /** Conservative expected payout/settlement date used for annualized yield. */
+  expectedPayoutDate?: string | null;
   /** Tags from the parent event (e.g. "Sports", "Crypto", "Weather") */
   tags: string[];
   /** All outcomes to token IDs for this market (for buying the opposite side) */
@@ -247,6 +291,14 @@ export interface Opportunity {
    * the "arbitrageur lag" window where real-world outcome is known but the
    * on-chain price hasn't converged to $1 yet. */
   awaitingResolution?: boolean;
+  /** True when Gamma's raw endDate was corrected by title/rules/lifecycle data. */
+  staleRawEndDate?: boolean;
+  /** True for recurring or rolled-forward markets after timing correction. */
+  recurrentLike?: boolean;
+  /** Sports/event market whose original event date moved after Gamma endDate. */
+  postponed?: boolean;
+  timingConfidence?: "high" | "medium" | "low";
+  timingReasons?: string[];
   /** True when the parent market has a liquidity-rewards program
    * (Gamma `rewardsMinSize > 0`). Top of book is bot-maintained; we demote
    * these out of `actionable`. UI shows a badge. */
@@ -259,6 +311,13 @@ export interface Opportunity {
    * the card is shown with an "oracle in progress" badge and the decision
    * is forced to `observe` at most. */
   umaResolutionStatus?: string | null;
+  /** On-chain refined oracle state from UMA CTF Adapter / Optimistic Oracle.
+   * `reset_stalled` means a dispute triggered an Adapter reset, but the
+   * current request has no active proposal and no available price. */
+  oracleResolutionState?: OracleResolutionState | null;
+  oracleResolutionDetails?: string | null;
+  resolvedBy?: string | null;
+  questionID?: string | null;
   /** Latest resolution deadline parsed from the market description
    * ("resolve ... by Month D, YYYY"). Populated only when strictly later
    * than `endDate`; used for holding-day math and surfaced in the UI so

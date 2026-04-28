@@ -49,7 +49,7 @@ export function StatsBar({ scan }: { scan: ScanRun | null }) {
     : null;
   const ageMin =
     completedMs && !Number.isNaN(completedMs)
-      ? (Date.now() - completedMs) / 60_000
+      ? (new Date().getTime() - completedMs) / 60_000
       : null;
   const timeAgo = completedMs
     ? formatTimeAgo(new Date(completedMs))
@@ -88,7 +88,7 @@ export function StatsBar({ scan }: { scan: ScanRun | null }) {
 }
 
 function formatTimeAgo(date: Date): string {
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  const seconds = Math.floor((new Date().getTime() - date.getTime()) / 1000);
   if (seconds < 60) return `${seconds}s ago`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes}m ago`;

@@ -10,6 +10,16 @@ import { NextRequest } from "next/server";
 type Bucket = { count: number; resetAt: number };
 const buckets = new Map<string, Bucket>();
 
+/** Size threshold above which a miss triggers a sweep of expired buckets.
+ * Picked high enough that normal, well-behaved traffic never pays the
+ * sweep cost, but low enough that a process seeing many unique keys
+ * (x-forwarded-for IPs, spoofed or real) can't grow the map without
+ * bound — so a long-lived self-hosted Node process doesn't leak
+ * monotonically over days. The sweep only runs on the miss path, so
+ * steady-state repeat traffic (same IP hitting the same route) stays
+ * on the cheap count++ branch. */
+const SWEEP_THRESHOLD = 1000;
+
 function clientKey(request: NextRequest): string {
   // x-forwarded-for is the canonical reverse-proxy header on Vercel and
   // most hosted platforms. Falls back to a sentinel for local dev so all
@@ -34,6 +44,11 @@ export function enforceRateLimit(
   const bucket = buckets.get(key);
 
   if (!bucket || now > bucket.resetAt) {
+    if (buckets.size >= SWEEP_THRESHOLD) {
+      for (const [k, v] of buckets) {
+        if (v.resetAt < now) buckets.delete(k);
+      }
+    }
     buckets.set(key, { count: 1, resetAt: now + windowMs });
     return null;
   }

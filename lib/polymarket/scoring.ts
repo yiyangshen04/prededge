@@ -209,11 +209,18 @@ export interface CandidateContext {
    * Imminent-future kickoffs are already hard-skipped by the scanner;
    * here we use this field only to demote already-past markets to observe. */
   inPlayGameStartedAt?: string | null;
+  /** Timing inference could not confidently identify the true event cutoff. */
+  timingConfidence?: "high" | "medium" | "low";
+  /** Market has a later rules deadline after the event window, so payout timing
+   * is less immediate than the raw event date suggests. */
+  resolutionWindow?: boolean;
+  /** Sports/event market where Gamma endDate is the old scheduled date and the
+   * event appears postponed or rescheduled. */
+  postponed?: boolean;
 }
 
 /** Informational tag (not a decision driver). UI reads it to render a badge;
- * persists through Supabase via the existing `decision_reasons` text[] column,
- * avoiding a schema change. */
+ * persists through the existing `decision_reasons` compatibility channel. */
 const INFO_TAGS = new Set(["rewards_incentivized"]);
 
 /**
@@ -260,6 +267,15 @@ export function decideCandidate(
   if (slippageBps > 30) {
     softFlags.push("moderate_slippage");
   }
+  if (context.timingConfidence === "low") {
+    softFlags.push("low_timing_confidence");
+  }
+  if (context.resolutionWindow) {
+    softFlags.push("resolution_deadline_later");
+  }
+  if (context.postponed) {
+    softFlags.push("postponed_or_rescheduled");
+  }
   // Context demotion: negRisk multi-outcome market. When the parent market
   // has N mutually-exclusive buckets (Multi-Strikes weather, Exact Score,
   // price brackets), a ~0.95 No on any single bucket is a mathematical tail
@@ -299,8 +315,8 @@ export function decideCandidate(
   }
   // Oracle in flight: outcome effectively decided. Keep visible for
   // tracking but never actionable.
-  const uma = context.umaResolutionStatus;
-  if (uma != null && uma !== "" && uma !== "None") {
+  const uma = context.umaResolutionStatus?.trim();
+  if (uma && uma.toLowerCase() !== "none") {
     softFlags.push(`oracle_${uma.toLowerCase()}`);
   }
 
@@ -318,8 +334,8 @@ export function decideCandidate(
  * Build the list of informational tags for a candidate. These describe the
  * market context (e.g. rewards program) but do not influence the decision —
  * the card shows a badge for each, and the scanner stores them in
- * `decision_reasons` so they survive the Supabase round trip without needing
- * new columns. The UI filters tags in INFO_TAGS out of the "decision reasons"
+ * `decision_reasons` so they survive persistence without needing new columns.
+ * The UI filters tags in INFO_TAGS out of the "decision reasons"
  * strip so they don't look like downgrade causes.
  */
 function informationalTags(context: CandidateContext): string[] {

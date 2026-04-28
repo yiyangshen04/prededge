@@ -16,11 +16,13 @@ import {
   decideCandidate,
   daysToExpiry,
 } from "./scoring";
-import { parseResolutionDeadline } from "./resolutionDeadline";
+import { inferMarketTiming } from "./timing";
+import { inspectOracleResolutionStates } from "./oracleState";
 
 // ── Helpers ──
 
-function parseJsonArray(raw: string | undefined | null): string[] {
+function parseJsonArray(raw: string | string[] | undefined | null): string[] {
+  if (Array.isArray(raw)) return raw.map(String);
   if (!raw) return [];
   const trimmed = raw.trim();
   if (!trimmed) return [];
@@ -55,6 +57,37 @@ function toFloat(val: unknown, fallback = 0): number {
   return isNaN(n) ? fallback : n;
 }
 
+function hasUmaResolutionStatus(
+  status: string | null | undefined
+): status is string {
+  const normalized = status?.trim();
+  return (
+    normalized != null &&
+    normalized.length > 0 &&
+    normalized.toLowerCase() !== "none"
+  );
+}
+
+function normalizeUmaResolutionStatus(market: GammaMarket): string | null {
+  const direct = market.umaResolutionStatus?.trim();
+  if (hasUmaResolutionStatus(direct)) return direct;
+
+  const statuses = parseJsonArray(market.umaResolutionStatuses);
+  return statuses.map((status) => status.trim()).find(hasUmaResolutionStatus) ?? null;
+}
+
+function isOracleResolutionCandidate(candidate: TailCandidate): boolean {
+  return hasUmaResolutionStatus(candidate.umaResolutionStatus);
+}
+
+function oracleInspectionKey(input: {
+  resolvedBy?: string | null;
+  questionID?: string | null;
+}): string | null {
+  if (!input.resolvedBy || !input.questionID) return null;
+  return `${input.resolvedBy.toLowerCase()}:${input.questionID}`;
+}
+
 /**
  * Max candidates to fetch order books for (controls scan speed).
  * At concurrency=15 and ~200ms/request, 300 tokens adds ~4s on top of the
@@ -62,6 +95,14 @@ function toFloat(val: unknown, fallback = 0): number {
  * has no advertised rate limit and 429s start to appear around ~500.
  */
 const MAX_BOOK_FETCHES = 300;
+
+/**
+ * Extra CLOB book slots reserved for markets already in UMA proposal/dispute
+ * flow. These can rank poorly on normal yield heuristics because the event
+ * date is stale or volume is thin, but they are exactly the "settlement tail"
+ * class users want to audit separately.
+ */
+const MAX_ORACLE_BOOK_FETCHES = 80;
 
 /**
  * Minimum outcome price for an `endDate < now` market to count as truly
@@ -112,58 +153,15 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
     if (market.archived === true) continue;
     if (market.enableOrderBook === false) continue;
 
-    // Skip markets already in UMA oracle resolution flow. At that point the
-    // outcome is effectively decided and any remaining ask depth will clear
-    // within hours — the "yield" a user sees is illusory, and many of these
-    // markets have already stopped accepting orders in the Polymarket UI even
-    // though the Gamma `acceptingOrders` flag lags. Observed statuses from
-    // the API: 'proposed' (proposal submitted), 'disputed' (proposal contested).
-    const umaStatus = market.umaResolutionStatus;
-    if (umaStatus != null && umaStatus !== "" && umaStatus !== "None") {
-      continue;
-    }
-
-    // Expired markets that are still accepting orders are the "arbitrageur
-    // lag" window: the real-world outcome is already known but the on-chain
-    // price hasn't converged to $1 yet. We keep them and flag with
-    // `awaitingResolution` so the UI can render a distinct badge. Only treat
-    // an expired market as "awaiting resolution" when we have POSITIVE
-    // evidence the end date is the real one (no rolling series). Previously
-    // we assumed awaiting-resolution by default, which picked up a lot of
-    // truly dead markets whose stale-endDate fields were just missing.
-    let awaitingResolution = false;
-    if (market.endDate) {
-      const end = new Date(market.endDate);
-      const expired = !isNaN(end.getTime()) && end.getTime() < Date.now();
-      if (expired) {
-        const endMs = end.getTime();
-        const afterEnd = (iso?: string): boolean => {
-          if (!iso) return false;
-          const t = new Date(iso).getTime();
-          return !isNaN(t) && t > endMs;
-        };
-        const staleEndDate =
-          afterEnd(market.startDate) ||
-          afterEnd(market.createdAt) ||
-          afterEnd(market.acceptingOrdersTimestamp);
-        if (staleEndDate) {
-          // Recurring-series roll forward: endDate is stale, market is really
-          // active — proceed as a normal candidate.
-        } else {
-          // Only real expiry that we can confirm (at least one date field
-          // supports it AND none of them contradict it). No evidence either
-          // way means we can't distinguish a real expired market from a
-          // Gamma row with missing timestamps, so we drop rather than
-          // speculatively flag it.
-          const hasSupportingEvidence =
-            !!market.startDate ||
-            !!market.createdAt ||
-            !!market.acceptingOrdersTimestamp;
-          if (!hasSupportingEvidence) continue;
-          awaitingResolution = true;
-        }
-      }
-    }
+    // Keep markets already in UMA oracle resolution flow visible, but classify
+    // them separately downstream. Observed statuses from Gamma:
+    // 'proposed' (proposal submitted), 'disputed' (proposal contested).
+    // These are not normal "awaiting resolution" tail windows because the
+    // oracle process itself is already in flight.
+    // Infer trusted timing before filtering/scoring. Gamma `endDate` is often
+    // stale on recurring or rescheduled markets, so the rest of the scanner
+    // uses eventDeadline/expectedPayoutDate instead of trusting the raw field.
+    const timing = inferMarketTiming(market, startTime);
 
     const tokenIds = parseJsonArray(market.clobTokenIds);
     const outcomes = parseJsonArray(market.outcomes);
@@ -177,6 +175,7 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
     const liq = toFloat(market.liquidityClob ?? market.liquidity);
     const rewardsIncentivized = toFloat(market.rewardsMinSize, 0) > 0;
     const negRisk = market.negRisk === true;
+    const umaResolutionStatus = normalizeUmaResolutionStatus(market);
     const sportsMarketType = market.sportsMarketType ?? null;
     const gameStartTime = market.gameStartTime ?? null;
 
@@ -223,6 +222,9 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
         eventSlug,
         eventTitle,
         endDate: market.endDate,
+        eventDeadline: timing.eventDeadline,
+        resolutionDeadline: timing.resolutionDeadline,
+        expectedPayoutDate: timing.expectedPayoutDate,
         tokenId: tokenIds[i],
         outcome: outcomes[i] ?? `Outcome ${i + 1}`,
         gammaPrice: price,
@@ -231,10 +233,17 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
         liquidity: liq,
         description: market.description ?? "",
         outcomeTokens,
-        awaitingResolution,
+        awaitingResolution: timing.awaitingResolution,
+        staleRawEndDate: timing.staleRawEndDate,
+        recurrentLike: timing.recurrentLike,
+        postponed: timing.postponed,
+        timingConfidence: timing.confidence,
+        timingReasons: timing.reasons,
         rewardsIncentivized,
         negRisk,
-        umaResolutionStatus: market.umaResolutionStatus ?? null,
+        umaResolutionStatus,
+        resolvedBy: market.resolvedBy ?? null,
+        questionID: market.questionID ?? null,
         sportsMarketType,
         gameStartTime: gameStartTime ?? undefined,
       });
@@ -254,8 +263,14 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
   console.log("[scan] Stage 3: Pre-scoring and selecting top candidates...");
 
   candidates.sort((a, b) => {
-    const holdA = Math.max(estimateHoldingDays(a.endDate), 1);
-    const holdB = Math.max(estimateHoldingDays(b.endDate), 1);
+    const holdA = Math.max(
+      estimateHoldingDays(a.expectedPayoutDate ?? a.eventDeadline ?? a.endDate),
+      1
+    );
+    const holdB = Math.max(
+      estimateHoldingDays(b.expectedPayoutDate ?? b.eventDeadline ?? b.endDate),
+      1
+    );
     const retA = 1.0 - a.gammaPrice;
     const retB = 1.0 - b.gammaPrice;
     const scoreA =
@@ -265,10 +280,19 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
     return scoreB - scoreA;
   });
 
-  const topCandidates = candidates.slice(0, MAX_BOOK_FETCHES);
+  const baseCandidates = candidates.slice(0, MAX_BOOK_FETCHES);
+  const oracleCandidates = candidates
+    .filter(isOracleResolutionCandidate)
+    .slice(0, MAX_ORACLE_BOOK_FETCHES);
+  const byTokenId = new Map<string, TailCandidate>();
+  for (const candidate of [...baseCandidates, ...oracleCandidates]) {
+    byTokenId.set(candidate.tokenId, candidate);
+  }
+  const topCandidates = [...byTokenId.values()];
   const droppedCount = candidates.length - topCandidates.length;
+  const oracleAddedCount = topCandidates.length - baseCandidates.length;
   console.log(
-    `[scan] Selected top ${topCandidates.length} for depth analysis (pre-sort dropped ${droppedCount})`
+    `[scan] Selected top ${topCandidates.length} for depth analysis (${baseCandidates.length} base + ${oracleAddedCount} oracle-status, pre-sort dropped ${droppedCount})`
   );
 
   // ── Stage 4: Fetch order books for top candidates ──
@@ -300,21 +324,13 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
     const slippageBps = analysis.slippageBps;
 
     const netReturnPct = computeNetReturn(realPrice, slippageBps, config);
-    // Gamma `endDate` is often the expected event date (e.g. FDA PDUFA,
-    // election day). The real resolution deadline — the latest date the
-    // market can still settle "No" — often lives in the description ("resolve
-    // ... by May 7, 2026"). When we can parse a deadline strictly later than
-    // endDate we use it for holding-day math; otherwise we trust endDate.
-    // Without this, short-horizon markets like PDUFA approvals report
-    // annualized yields inflated by 10×+.
-    const resolutionDeadline = parseResolutionDeadline(
-      c.description,
-      c.endDate
-    );
-    const effectiveEndDate = resolutionDeadline ?? c.endDate;
-    const holdDays = estimateHoldingDays(effectiveEndDate);
+    const eventDeadline = c.eventDeadline ?? c.endDate;
+    const resolutionDeadline = c.resolutionDeadline ?? null;
+    const expectedPayoutDate =
+      c.expectedPayoutDate ?? eventDeadline ?? c.endDate;
+    const holdDays = estimateHoldingDays(expectedPayoutDate);
     const annualizedYield = computeAnnualizedYield(netReturnPct, holdDays);
-    const days = daysToExpiry(effectiveEndDate);
+    const days = daysToExpiry(eventDeadline);
 
     const stabilityScore = computeStabilityScore(
       netReturnPct,
@@ -338,13 +354,15 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
         negRisk: c.negRisk,
         sportsMarketType: c.sportsMarketType,
         inPlayGameStartedAt: c.gameStartTime ?? null,
+        timingConfidence: c.timingConfidence,
+        resolutionWindow: resolutionDeadline != null,
+        postponed: c.postponed,
       }
     );
 
-    // Piggy-back the parsed deadline onto decision_reasons so it survives the
-    // Supabase round trip without requiring a schema change. Prefix ensures
-    // no collision with judgment reasons; UI strips this entry before
-    // rendering the reasons strip.
+    // Piggy-back the parsed deadline onto decision_reasons as a persistence
+    // compatibility channel. Prefix ensures no collision with judgment
+    // reasons; UI strips this entry before rendering the reasons strip.
     if (resolutionDeadline) {
       reasons.push(`deadline:${resolutionDeadline}`);
     }
@@ -385,6 +403,7 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
         ? `https://polymarket.com/event/${c.eventSlug}/${c.slug}`
         : `https://polymarket.com/market/${c.slug}`,
       endDate: c.endDate,
+      eventDeadline,
       tags: [],
       outcomeTokens: c.outcomeTokens,
       asks: topAsks,
@@ -392,15 +411,52 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
       // converged to the tail extreme — see AWAITING_PRICE_CONVERGED.
       awaitingResolution:
         c.awaitingResolution === true &&
+        !hasUmaResolutionStatus(c.umaResolutionStatus) &&
         (realPrice >= AWAITING_PRICE_CONVERGED ||
           realPrice <= 1 - AWAITING_PRICE_CONVERGED),
       rewardsIncentivized: c.rewardsIncentivized,
       negRisk: c.negRisk,
       umaResolutionStatus: c.umaResolutionStatus ?? null,
+      resolvedBy: c.resolvedBy ?? null,
+      questionID: c.questionID ?? null,
       resolutionDeadline,
+      expectedPayoutDate,
+      staleRawEndDate: c.staleRawEndDate,
+      recurrentLike: c.recurrentLike,
+      postponed: c.postponed,
+      timingConfidence: c.timingConfidence,
+      timingReasons: c.timingReasons ?? [],
       sportsMarketType: c.sportsMarketType ?? null,
       gameStartTime: c.gameStartTime ?? null,
     });
+  }
+
+  // ── Stage 5a: Refine UMA oracle-flow markets with on-chain Adapter state ──
+  const oracleOpps = opportunities.filter(
+    (o) => hasUmaResolutionStatus(o.umaResolutionStatus) && o.resolvedBy && o.questionID
+  );
+  if (oracleOpps.length > 0) {
+    console.log(
+      `[scan] Stage 5a: Inspecting on-chain UMA state for ${oracleOpps.length} oracle opportunities...`
+    );
+    const stateMap = await inspectOracleResolutionStates(
+      oracleOpps,
+      Math.min(config.concurrency, 4)
+    );
+    for (const opp of oracleOpps) {
+      const key = oracleInspectionKey(opp);
+      const inspected = key ? stateMap.get(key) : null;
+      if (!inspected) continue;
+      opp.oracleResolutionState = inspected.state;
+      opp.oracleResolutionDetails = inspected.details;
+      if (
+        inspected.state === "reset_stalled" &&
+        !opp.decisionReasons.includes("oracle_reset_stalled")
+      ) {
+        opp.decisionReasons.push("oracle_reset_stalled");
+      }
+    }
+    console.log(`[scan] Inspected ${stateMap.size} oracle adapter states`);
   }
 
   // ── Stage 5b: Fetch event tags for scored opportunities ──

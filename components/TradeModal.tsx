@@ -5,6 +5,7 @@ import Link from "next/link";
 import type { FillResult, Opportunity } from "@/lib/types";
 import { DEFAULT_SCAN_CONFIG } from "@/lib/polymarket/config";
 import { estimateHoldingDays } from "@/lib/polymarket/scoring";
+import { effectiveEndDate } from "@/lib/liveRecompute";
 
 interface Props {
   opportunity: Opportunity;
@@ -82,7 +83,7 @@ export function TradeModal({
           question: opportunity.question,
           outcome: outcomeName,
           marketUrl: opportunity.marketUrl,
-          endDate: opportunity.endDate,
+          endDate: effectiveEndDate(opportunity),
           usdAmount,
         }),
       });
@@ -109,7 +110,10 @@ export function TradeModal({
   // Estimate annualized yield using the same holding-days model the scanner
   // uses (ceiling + 3-day settlement floor for past-due markets), so a card
   // showing 1550% annualized doesn't become 2000% inside the modal.
-  const holdDays = estimateHoldingDays(opportunity.endDate);
+  // `effectiveEndDate` honours `resolutionDeadline` (and the `deadline:ISO`
+  // fallback from decisionReasons) so PDUFA-style markets with a description-
+  // parsed deadline later than Gamma's endDate don't get their hold days cut.
+  const holdDays = estimateHoldingDays(effectiveEndDate(opportunity));
   const annualizedYield =
     investedUsd > 0 ? (pnlIfWin / investedUsd) * (365 / holdDays) * 100 : 0;
 

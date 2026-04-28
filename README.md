@@ -1,4 +1,18 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+PredEdge is a local-first [Next.js](https://nextjs.org) app for scanning
+Polymarket tail-price opportunities and tracking paper trades.
+
+## Local Storage
+
+The app stores scan runs, opportunities, odds snapshots, and paper trades in a
+local SQLite database powered by Node's built-in `node:sqlite` module.
+
+- Default database file: `data/prededge.sqlite`
+- Override path: `LOCAL_DB_PATH=/absolute/or/relative/file.sqlite npm run dev`
+- No Supabase environment variables are required.
+- Requires a Node.js runtime with `node:sqlite` support. This workspace was
+  tested with Node v25.2.1.
+
+The database is created automatically on first API request.
 
 ## Getting Started
 

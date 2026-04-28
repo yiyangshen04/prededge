@@ -1,8 +1,10 @@
 import { NextRequest } from "next/server";
-import { createServerSupabaseClient } from "@/lib/supabase";
+import { listOpenPaperTrades, updatePaperTradeResolution } from "@/lib/localDb";
 import { PolymarketClient } from "@/lib/polymarket/client";
 import { DEFAULT_SCAN_CONFIG } from "@/lib/polymarket/config";
 import { enforceRateLimit } from "@/lib/rateLimit";
+
+export const runtime = "nodejs";
 
 function parseJsonArray(raw: string | undefined | null): string[] {
   if (!raw) return [];
@@ -23,19 +25,7 @@ export async function POST(request: NextRequest) {
   if (limited) return limited;
 
   try {
-    const supabase = createServerSupabaseClient();
-
-    // 1. Fetch open trades
-    const { data: openRows, error: fetchError } = await supabase
-      .from("paper_trades")
-      .select("*")
-      .eq("status", "open");
-
-    if (fetchError) {
-      return Response.json({ error: fetchError.message }, { status: 500 });
-    }
-
-    const openTrades = openRows ?? [];
+    const openTrades = listOpenPaperTrades();
     if (openTrades.length === 0) {
       return Response.json({
         checked: 0,
@@ -46,18 +36,18 @@ export async function POST(request: NextRequest) {
 
     // 2. Look up markets by conditionId
     const conditionIds = Array.from(
-      new Set(openTrades.map((t) => t.condition_id as string).filter(Boolean))
+      new Set(openTrades.map((t) => t.conditionId).filter(Boolean))
     );
 
     const client = new PolymarketClient(DEFAULT_SCAN_CONFIG);
     const marketMap = await client.fetchMarketsByConditionIds(conditionIds);
 
-    let resolvedCount = 0;
-    const updates: Array<Promise<unknown>> = [];
+    type UpdateResult = { ok: boolean; id: string; error?: unknown };
+    const updates: UpdateResult[] = [];
 
     // 3. For each open trade, decide its fate
     for (const trade of openTrades) {
-      const market = marketMap.get(trade.condition_id as string);
+      const market = marketMap.get(trade.conditionId);
       if (!market) continue;
       if (!market.closed) continue;
 
@@ -89,11 +79,11 @@ export async function POST(request: NextRequest) {
       let resolvedOutcome: string | null = null;
       let pnlUsd: number;
 
-      const usdAmount = Number(trade.usd_amount);
-      const shares = Number(trade.shares);
+      const usdAmount = trade.usdAmount;
+      const shares = trade.shares;
 
       resolvedOutcome = outcomes[winnerIdx] ?? null;
-      if (resolvedOutcome === trade.outcome_bought) {
+      if (resolvedOutcome === trade.outcomeBought) {
         status = "won";
         // Each share pays $1 on win; deduct fee + transfer cost so this
         // matches TradeModal's pre-trade "P&L if Win" preview. Without
@@ -110,28 +100,41 @@ export async function POST(request: NextRequest) {
 
       const pnlPct = usdAmount > 0 ? pnlUsd / usdAmount : 0;
 
-      updates.push(
-        Promise.resolve(
-          supabase
-            .from("paper_trades")
-            .update({
-              status,
-              resolved_outcome: resolvedOutcome,
-              pnl_usd: pnlUsd,
-              pnl_pct: pnlPct,
-              resolved_at: new Date().toISOString(),
-            })
-            .eq("id", trade.id)
-        )
-      );
-      resolvedCount++;
+      try {
+        const ok = updatePaperTradeResolution(trade.id, {
+          status,
+          resolvedOutcome,
+          pnlUsd,
+          pnlPct,
+          resolvedAt: new Date().toISOString(),
+        });
+        updates.push({
+          ok,
+          id: trade.id,
+          error: ok ? undefined : new Error("No local row was updated"),
+        });
+      } catch (error) {
+        updates.push({ ok: false, id: trade.id, error });
+      }
     }
 
-    await Promise.all(updates);
+    const results = updates;
+    const resolvedCount = results.filter((r) => r.ok).length;
+    const failedCount = results.length - resolvedCount;
+    for (const r of results) {
+      if (!r.ok) {
+        console.error(
+          "[api/trades/refresh] update failed for trade",
+          r.id,
+          r.error
+        );
+      }
+    }
 
     return Response.json({
       checked: openTrades.length,
       resolved: resolvedCount,
+      failed: failedCount,
     });
   } catch (err) {
     console.error("[api/trades/refresh] Error:", err);

@@ -17,15 +17,14 @@ function applyTheme(theme: Theme) {
 }
 
 export function ThemeToggle() {
-  const [theme, setTheme] = useState<Theme>("auto");
+  const [theme, setTheme] = useState<Theme>(() => {
+    if (typeof window === "undefined") return "auto";
+    return (localStorage.getItem("prededge-theme") as Theme | null) ?? "auto";
+  });
 
-  // Initialize from localStorage
   useEffect(() => {
-    const saved = localStorage.getItem("prededge-theme") as Theme | null;
-    const initial = saved ?? "auto";
-    setTheme(initial);
-    applyTheme(initial);
-  }, []);
+    applyTheme(theme);
+  }, [theme]);
 
   // Listen for system theme changes when in auto mode
   useEffect(() => {
@@ -42,7 +41,6 @@ export function ThemeToggle() {
       theme === "auto" ? "light" : theme === "light" ? "dark" : "auto";
     setTheme(next);
     localStorage.setItem("prededge-theme", next);
-    applyTheme(next);
   };
 
   const icon = theme === "auto" ? "A" : theme === "light" ? "\u2600" : "\u263E";

@@ -10,7 +10,13 @@ import {
   recomputeAtSize,
   sortWithDecisionPriority,
 } from "@/lib/liveRecompute";
-import { AWAITING_RESOLUTION_TAG, isVirtualTag } from "@/lib/virtualTags";
+import {
+  AWAITING_RESOLUTION_TAG,
+  ORACLE_RESET_TAG,
+  ORACLE_RESOLUTION_TAG,
+  isHiddenTag,
+  isVirtualTag,
+} from "@/lib/virtualTags";
 
 /** True iff the opportunity matches the named virtual tag. Virtual tags
  * don't live in `opp.tags` — they're derived from other Opportunity fields
@@ -19,12 +25,30 @@ function matchesVirtualTag(opp: Opportunity, tag: string): boolean {
   switch (tag) {
     case AWAITING_RESOLUTION_TAG:
       return opp.awaitingResolution === true;
+    case ORACLE_RESOLUTION_TAG:
+      return hasOracleResolutionStatus(opp.umaResolutionStatus);
+    case ORACLE_RESET_TAG:
+      return isOracleResetStalled(opp);
     default:
       return false;
   }
 }
 
-const HIDDEN_TAGS = new Set(["Hide From New", "Rewards Automation 50 4.5 50"]);
+function hasOracleResolutionStatus(status: string | null | undefined): boolean {
+  const normalized = status?.trim();
+  return (
+    normalized != null &&
+    normalized.length > 0 &&
+    normalized.toLowerCase() !== "none"
+  );
+}
+
+function isOracleResetStalled(opp: Opportunity): boolean {
+  return (
+    opp.oracleResolutionState === "reset_stalled" ||
+    opp.decisionReasons?.includes("oracle_reset_stalled") === true
+  );
+}
 
 /** Tags excluded by default when the dashboard loads (first visit only) */
 const DEFAULT_EXCLUDED_TAGS = [
@@ -121,30 +145,51 @@ export default function Dashboard() {
     });
   }, [filters.tags, filters.excludedTags, prefsLoaded]);
 
+  // `maxDaysToExpiry` is driven by a numeric <input> whose onChange fires on
+  // every keystroke; without debouncing, typing "30" would fire two fetches
+  // (for 3, then 30) and the earlier response could land last and clobber
+  // the newer one. We debounce the value before it enters fetchLatest's
+  // closure, and guard the fetch itself with an AbortController so even if a
+  // user types fast enough to miss the debounce window, the stale response
+  // is thrown away rather than overwriting `data`.
+  const [debouncedMaxDays, setDebouncedMaxDays] = useState<number | null>(
+    filters.maxDaysToExpiry
+  );
+  useEffect(() => {
+    const t = setTimeout(
+      () => setDebouncedMaxDays(filters.maxDaysToExpiry),
+      300
+    );
+    return () => clearTimeout(t);
+  }, [filters.maxDaysToExpiry]);
+
   // Load latest scan on mount. Sorting AND minYield filtering are applied
   // client-side (see `sortedFiltered`) because they depend on tradeSizeUsd,
   // which the server doesn't know — filtering on the stored baseline would
   // reject rows that are actionable at the user's size (or vice versa).
-  const fetchLatest = useCallback(async () => {
+  const fetchLatest = useCallback(async (signal: AbortSignal) => {
     try {
       const params = new URLSearchParams();
       if (filters.decision !== "all") params.set("decision", filters.decision);
-      if (filters.maxDaysToExpiry != null)
-        params.set("maxDays", String(filters.maxDaysToExpiry));
+      if (debouncedMaxDays != null)
+        params.set("maxDays", String(debouncedMaxDays));
 
-      const res = await fetch(`/api/scan?${params}`);
+      const res = await fetch(`/api/scan?${params}`, { signal });
       if (res.ok) {
         const json = await res.json();
         setData(json);
         setError(null);
       }
-    } catch {
+    } catch (err) {
+      if ((err as Error).name === "AbortError") return;
       // No scan data yet, that's fine
     }
-  }, [filters.decision, filters.maxDaysToExpiry]);
+  }, [filters.decision, debouncedMaxDays]);
 
   useEffect(() => {
-    fetchLatest();
+    const ctrl = new AbortController();
+    fetchLatest(ctrl.signal);
+    return () => ctrl.abort();
   }, [fetchLatest]);
 
   // Trigger a new scan
@@ -176,6 +221,10 @@ export default function Dashboard() {
       isVirtualTag(tag)
         ? matchesVirtualTag(opp, tag)
         : opp.tags?.includes(tag) === true;
+    const oracleResolutionSelected = filters.tags.includes(
+      ORACLE_RESOLUTION_TAG
+    );
+    const oracleResetSelected = filters.tags.includes(ORACLE_RESET_TAG);
 
     const keep = opps.filter((opp) => {
       if (
@@ -184,7 +233,15 @@ export default function Dashboard() {
       ) {
         return false;
       }
+      // Oracle Resolution is a cross-tag settlement state. When that virtual
+      // tag is selected, it should include all oracle-flow markets even if
+      // their real Polymarket tags are manually excluded in the UI.
+      const skipExclusions =
+        (oracleResolutionSelected &&
+          matchesVirtualTag(opp, ORACLE_RESOLUTION_TAG)) ||
+        (oracleResetSelected && matchesVirtualTag(opp, ORACLE_RESET_TAG));
       if (
+        !skipExclusions &&
         filters.excludedTags.length > 0 &&
         filters.excludedTags.some((tag) => matchesTag(opp, tag))
       ) {
@@ -220,15 +277,21 @@ export default function Dashboard() {
     ...new Set(
       (data?.opportunities ?? [])
         .flatMap((o) => o.tags ?? [])
-        .filter((t) => !HIDDEN_TAGS.has(t))
+        .filter((t) => !isHiddenTag(t))
     ),
   ].sort();
 
   const hasAwaiting = (data?.opportunities ?? []).some(
     (o) => o.awaitingResolution === true
   );
+  const hasOracleResolution = (data?.opportunities ?? []).some(
+    (o) => hasOracleResolutionStatus(o.umaResolutionStatus)
+  );
+  const hasOracleReset = (data?.opportunities ?? []).some(isOracleResetStalled);
   const availableTags = [
     ...(hasAwaiting ? [AWAITING_RESOLUTION_TAG] : []),
+    ...(hasOracleResolution ? [ORACLE_RESOLUTION_TAG] : []),
+    ...(hasOracleReset ? [ORACLE_RESET_TAG] : []),
     ...realTags,
   ];
 

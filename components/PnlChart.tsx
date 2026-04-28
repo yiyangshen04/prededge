@@ -36,9 +36,11 @@ export function PnlChart({ trades }: { trades: PaperTrade[] }) {
     );
   }
 
-  let running = 0;
-  const data: Point[] = resolved.map((t) => {
-    running += t.pnlUsd ?? 0;
+  const tradePnls = resolved.map((t) => t.pnlUsd ?? 0);
+  const data: Point[] = resolved.map((t, index) => {
+    const running = tradePnls
+      .slice(0, index + 1)
+      .reduce((sum, pnl) => sum + pnl, 0);
     const ts = new Date(t.resolvedAt!);
     return {
       t: ts.getTime(),
@@ -51,6 +53,7 @@ export function PnlChart({ trades }: { trades: PaperTrade[] }) {
     };
   });
 
+  const running = data[data.length - 1]?.cumulativePnl ?? 0;
   const isPositive = running >= 0;
 
   return (

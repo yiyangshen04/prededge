@@ -24,6 +24,13 @@ function isOracleResetStalled(opp: Opportunity): boolean {
   );
 }
 
+function isOracleSecondDispute(opp: Opportunity): boolean {
+  return (
+    opp.oracleResolutionState === "second_dispute" ||
+    opp.decisionReasons?.includes("oracle_second_dispute") === true
+  );
+}
+
 /** Compute expiry display from raw endDate for maximum precision */
 function formatExpiry(
   endDate: string | null | undefined,
@@ -161,6 +168,7 @@ export function OpportunityCard({
             const oracleReason = opp.decisionReasons?.find(isOracleReason);
             const normalizedUma = opp.umaResolutionStatus?.trim();
             const resetStalled = isOracleResetStalled(opp);
+            const secondDispute = isOracleSecondDispute(opp);
             const uma =
               normalizedUma && normalizedUma.toLowerCase() !== "none"
                 ? normalizedUma
@@ -170,9 +178,11 @@ export function OpportunityCard({
             return uma ? (
               <span
                 title={
-                  resetStalled
-                    ? "Gamma reports this market as disputed, but chain state shows the adapter request was reset and no active UMA proposal is currently live."
-                    : "Gamma reports this market in UMA oracle resolution flow."
+                  secondDispute
+                    ? "Re-proposal after the first dispute was disputed again — question has been escalated to UMA DVM full vote (48-72h)."
+                    : resetStalled
+                      ? "Gamma reports this market as disputed, but chain state shows the adapter request was reset and no active UMA proposal is currently live."
+                      : "Gamma reports this market in UMA oracle resolution flow."
                 }
                 className="text-[10px] px-1.5 py-0.5 rounded bg-accent-red/15 text-accent-red border border-accent-red/30 uppercase tracking-wider"
               >
@@ -189,6 +199,17 @@ export function OpportunityCard({
               className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
             >
               Oracle Reset
+            </span>
+          )}
+          {isOracleSecondDispute(opp) && (
+            <span
+              title={
+                opp.oracleResolutionDetails ??
+                "Adapter was reset by the first dispute, the re-proposed price was disputed again, and the question is now in UMA DVM full-vote (48-72h). Outcome is no longer locally inferable."
+              }
+              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
+            >
+              Second Dispute
             </span>
           )}
           {(opp.rewardsIncentivized ||
@@ -446,6 +467,7 @@ export function OpportunityCard({
             r !== "in_play" &&
             !isOracleReason(r) &&
             r !== "oracle_reset_stalled" &&
+            r !== "oracle_second_dispute" &&
             !r.startsWith("deadline:") &&
             !r.startsWith("sports_")
         );

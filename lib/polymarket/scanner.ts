@@ -534,6 +534,12 @@ export async function runScan(
       ) {
         opp.decisionReasons.push("oracle_reset_stalled");
       }
+      if (
+        inspected.state === "second_dispute" &&
+        !opp.decisionReasons.includes("oracle_second_dispute")
+      ) {
+        opp.decisionReasons.push("oracle_second_dispute");
+      }
     }
     console.log(`[scan] Inspected ${stateMap.size} oracle adapter states`);
   }

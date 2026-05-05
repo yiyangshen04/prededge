@@ -19,6 +19,12 @@ export const ORACLE_RESOLUTION_TAG = "Oracle Resolution";
  * the current request has no active proposal and no available price. */
 export const ORACLE_RESET_TAG = "Oracle Reset";
 
+/** Filter for markets where the post-reset re-proposal was disputed again —
+ * the question has been escalated to UMA DVM full-vote (48-72h). Outcome is
+ * no longer locally inferable; we surface them so users can track the queue
+ * separately from the still-actionable Reset state. */
+export const ORACLE_SECOND_DISPUTE_TAG = "Oracle Second Dispute";
+
 /** All virtual tag labels. FilterBar styles these differently from real tags
  * and page.tsx routes them to field-specific predicates instead of
  * `opp.tags.includes(...)`. */
@@ -26,6 +32,7 @@ export const VIRTUAL_TAGS = new Set<string>([
   AWAITING_RESOLUTION_TAG,
   ORACLE_RESOLUTION_TAG,
   ORACLE_RESET_TAG,
+  ORACLE_SECOND_DISPUTE_TAG,
 ]);
 
 export function isVirtualTag(tag: string): boolean {

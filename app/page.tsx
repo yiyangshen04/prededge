@@ -14,6 +14,7 @@ import {
   AWAITING_RESOLUTION_TAG,
   ORACLE_RESET_TAG,
   ORACLE_RESOLUTION_TAG,
+  ORACLE_SECOND_DISPUTE_TAG,
   isHiddenTag,
   isVirtualTag,
 } from "@/lib/virtualTags";
@@ -29,6 +30,8 @@ function matchesVirtualTag(opp: Opportunity, tag: string): boolean {
       return hasOracleResolutionStatus(opp.umaResolutionStatus);
     case ORACLE_RESET_TAG:
       return isOracleResetStalled(opp);
+    case ORACLE_SECOND_DISPUTE_TAG:
+      return isOracleSecondDispute(opp);
     default:
       return false;
   }
@@ -47,6 +50,13 @@ function isOracleResetStalled(opp: Opportunity): boolean {
   return (
     opp.oracleResolutionState === "reset_stalled" ||
     opp.decisionReasons?.includes("oracle_reset_stalled") === true
+  );
+}
+
+function isOracleSecondDispute(opp: Opportunity): boolean {
+  return (
+    opp.oracleResolutionState === "second_dispute" ||
+    opp.decisionReasons?.includes("oracle_second_dispute") === true
   );
 }
 
@@ -237,6 +247,9 @@ export default function Dashboard() {
       ORACLE_RESOLUTION_TAG
     );
     const oracleResetSelected = filters.tags.includes(ORACLE_RESET_TAG);
+    const oracleSecondDisputeSelected = filters.tags.includes(
+      ORACLE_SECOND_DISPUTE_TAG
+    );
 
     const keep = opps.filter((opp) => {
       if (
@@ -251,7 +264,9 @@ export default function Dashboard() {
       const skipExclusions =
         (oracleResolutionSelected &&
           matchesVirtualTag(opp, ORACLE_RESOLUTION_TAG)) ||
-        (oracleResetSelected && matchesVirtualTag(opp, ORACLE_RESET_TAG));
+        (oracleResetSelected && matchesVirtualTag(opp, ORACLE_RESET_TAG)) ||
+        (oracleSecondDisputeSelected &&
+          matchesVirtualTag(opp, ORACLE_SECOND_DISPUTE_TAG));
       if (
         !skipExclusions &&
         filters.excludedTags.length > 0 &&
@@ -300,10 +315,14 @@ export default function Dashboard() {
     (o) => hasOracleResolutionStatus(o.umaResolutionStatus)
   );
   const hasOracleReset = (data?.opportunities ?? []).some(isOracleResetStalled);
+  const hasOracleSecondDispute = (data?.opportunities ?? []).some(
+    isOracleSecondDispute
+  );
   const availableTags = [
     ...(hasAwaiting ? [AWAITING_RESOLUTION_TAG] : []),
     ...(hasOracleResolution ? [ORACLE_RESOLUTION_TAG] : []),
     ...(hasOracleReset ? [ORACLE_RESET_TAG] : []),
+    ...(hasOracleSecondDispute ? [ORACLE_SECOND_DISPUTE_TAG] : []),
     ...realTags,
   ];
 

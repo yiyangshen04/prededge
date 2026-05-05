@@ -7,8 +7,29 @@ import {
 import { runScan } from "@/lib/polymarket/scanner";
 import { DEFAULT_SCAN_CONFIG } from "@/lib/polymarket/config";
 import { enforceRateLimit } from "@/lib/rateLimit";
+import type { ScanTagFilters } from "@/lib/types";
 
 export const runtime = "nodejs";
+
+function normalizeTagArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((tag) => String(tag).trim())
+    .filter((tag) => tag.length > 0)
+    .slice(0, 100);
+}
+
+async function readScanTagFilters(request: NextRequest): Promise<ScanTagFilters> {
+  try {
+    const body = await request.json();
+    return {
+      tags: normalizeTagArray(body?.tags),
+      excludedTags: normalizeTagArray(body?.excludedTags),
+    };
+  } catch {
+    return {};
+  }
+}
 
 /**
  * POST /api/scan — Trigger a new scan and persist results.
@@ -18,7 +39,8 @@ export async function POST(request: NextRequest) {
   if (limited) return limited;
 
   try {
-    const result = await runScan(DEFAULT_SCAN_CONFIG);
+    const tagFilters = await readScanTagFilters(request);
+    const result = await runScan(DEFAULT_SCAN_CONFIG, tagFilters);
     persistScanResult(result.scan, result.opportunities);
 
     return Response.json(result);

@@ -1,6 +1,8 @@
 import type { GammaMarket, OrderBook, EventTag, ScanConfig } from "../types";
 import { GAMMA_API, CLOB_API } from "./config";
 
+const eventTagCache = new Map<string, EventTag[]>();
+
 /**
  * Polymarket API client.
  * All methods are read-only — no authentication needed.
@@ -147,6 +149,9 @@ export class PolymarketClient {
    * Fetch tags for a single event by slug.
    */
   async fetchEventTags(eventSlug: string): Promise<EventTag[]> {
+    const cached = eventTagCache.get(eventSlug);
+    if (cached) return cached;
+
     try {
       const data = await this.fetchJson<
         Record<string, unknown> | Record<string, unknown>[]
@@ -154,11 +159,13 @@ export class PolymarketClient {
       const event = Array.isArray(data) ? data[0] : data;
       const rawTags = (event as Record<string, unknown>)?.tags;
       if (!Array.isArray(rawTags)) return [];
-      return rawTags.map((t: Record<string, unknown>) => ({
+      const tags = rawTags.map((t: Record<string, unknown>) => ({
         id: String(t.id ?? ""),
         label: String(t.label ?? ""),
         slug: String(t.slug ?? ""),
       }));
+      eventTagCache.set(eventSlug, tags);
+      return tags;
     } catch {
       return [];
     }

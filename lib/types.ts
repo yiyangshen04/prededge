@@ -28,6 +28,13 @@ export interface ScanConfig {
   retryBackoffMs: number;
 }
 
+export interface ScanTagFilters {
+  /** Tags the scan candidate must match before CLOB order-book analysis. */
+  tags?: string[];
+  /** Tags to remove before CLOB order-book analysis. */
+  excludedTags?: string[];
+}
+
 export type OracleResolutionState =
   | "active_proposal"
   | "ready"
@@ -186,6 +193,8 @@ export interface TailCandidate {
   resolutionDeadline?: string | null;
   /** Conservative expected payout/settlement date used for annualized yield. */
   expectedPayoutDate?: string | null;
+  /** Event tags fetched before order-book selection when scan tag filters apply. */
+  tags: string[];
   tokenId: string;
   outcome: string;
   /** Price from Gamma outcomePrices */

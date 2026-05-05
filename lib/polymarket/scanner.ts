@@ -5,6 +5,7 @@ import type {
   ScanRun,
   ScanResponse,
   ScanConfig,
+  ScanTagFilters,
 } from "../types";
 import { PolymarketClient } from "./client";
 import {
@@ -80,6 +81,55 @@ function isOracleResolutionCandidate(candidate: TailCandidate): boolean {
   return hasUmaResolutionStatus(candidate.umaResolutionStatus);
 }
 
+function normalizeTagLabel(tag: string): string {
+  return tag.trim().toLowerCase();
+}
+
+function normalizeTagFilters(filters?: ScanTagFilters): {
+  included: Set<string>;
+  excluded: Set<string>;
+} {
+  const included = new Set(
+    (filters?.tags ?? [])
+      .map(normalizeTagLabel)
+      .filter((tag) => tag.length > 0)
+  );
+  const excluded = new Set(
+    (filters?.excludedTags ?? [])
+      .map(normalizeTagLabel)
+      .filter((tag) => tag.length > 0)
+  );
+
+  return { included, excluded };
+}
+
+function hasTagFilters(filters: { included: Set<string>; excluded: Set<string> }) {
+  return filters.included.size > 0 || filters.excluded.size > 0;
+}
+
+function candidateMatchesScanTag(candidate: TailCandidate, tag: string): boolean {
+  // Match the dashboard's synthetic Sports behavior: some sports markets carry
+  // a `sportsMarketType` even when event tags arrive late or are incomplete.
+  if (tag === "sports" && candidate.sportsMarketType != null) return true;
+  return candidate.tags.some((candidateTag) => normalizeTagLabel(candidateTag) === tag);
+}
+
+function candidatePassesTagFilters(
+  candidate: TailCandidate,
+  filters: { included: Set<string>; excluded: Set<string> }
+): boolean {
+  if (
+    filters.included.size > 0 &&
+    ![...filters.included].some((tag) => candidateMatchesScanTag(candidate, tag))
+  ) {
+    return false;
+  }
+
+  return ![...filters.excluded].some((tag) =>
+    candidateMatchesScanTag(candidate, tag)
+  );
+}
+
 function oracleInspectionKey(input: {
   resolvedBy?: string | null;
   questionID?: string | null;
@@ -124,15 +174,20 @@ const AWAITING_PRICE_CONVERGED = 0.97;
  * Optimized pipeline:
  *   1. Fetch all active markets from Gamma API
  *   2. Filter for tail prices using Gamma's outcomePrices (no CLOB calls needed)
- *   3. Pre-score using Gamma data to pick top candidates
- *   4. Fetch order books ONLY for top candidates
- *   5. Final score and classify
- *   6. Deduplicate by event, rank, and return
+ *   3. Apply scan-time tag preferences, when provided
+ *   4. Pre-score using Gamma data to pick top candidates
+ *   5. Fetch order books ONLY for top candidates
+ *   6. Final score and classify
+ *   7. Deduplicate by event, rank, and return
  */
-export async function runScan(config: ScanConfig): Promise<ScanResponse> {
+export async function runScan(
+  config: ScanConfig,
+  tagFilters?: ScanTagFilters
+): Promise<ScanResponse> {
   const startTime = Date.now();
   const scanId = `scan_${startTime}`;
   const client = new PolymarketClient(config);
+  const normalizedTagFilters = normalizeTagFilters(tagFilters);
 
   // ── Stage 1: Fetch all active markets ──
   console.log("[scan] Stage 1: Fetching markets from Gamma API...");
@@ -141,7 +196,7 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
 
   // ── Stage 2: Filter for tail candidates using Gamma outcomePrices ──
   console.log("[scan] Stage 2: Filtering tail candidates...");
-  const candidates: TailCandidate[] = [];
+  let candidates: TailCandidate[] = [];
 
   for (const market of markets) {
     // Strict filters (Gamma can return markets whose `active=true&closed=false`
@@ -225,6 +280,7 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
         eventDeadline: timing.eventDeadline,
         resolutionDeadline: timing.resolutionDeadline,
         expectedPayoutDate: timing.expectedPayoutDate,
+        tags: [],
         tokenId: tokenIds[i],
         outcome: outcomes[i] ?? `Outcome ${i + 1}`,
         gammaPrice: price,
@@ -250,6 +306,29 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
     }
   }
   console.log(`[scan] Found ${candidates.length} tail candidates`);
+
+  const prefetchedCandidateTags = hasTagFilters(normalizedTagFilters);
+  if (prefetchedCandidateTags && candidates.length > 0) {
+    const eventSlugs = [
+      ...new Set(candidates.map((c) => c.eventSlug).filter(Boolean)),
+    ];
+    console.log(
+      `[scan] Stage 2a: Fetching tags for ${eventSlugs.length} candidate events...`
+    );
+    const tagMap = await client.fetchEventTagsBatch(eventSlugs);
+    for (const candidate of candidates) {
+      const eventTags = tagMap.get(candidate.eventSlug) ?? [];
+      candidate.tags = eventTags.map((t) => t.label);
+    }
+
+    const beforeTagFilter = candidates.length;
+    candidates = candidates.filter((candidate) =>
+      candidatePassesTagFilters(candidate, normalizedTagFilters)
+    );
+    console.log(
+      `[scan] Tag filters kept ${candidates.length}/${beforeTagFilter} tail candidates`
+    );
+  }
 
   if (candidates.length === 0) {
     return buildEmptyResponse(scanId, markets.length, startTime);
@@ -404,7 +483,7 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
         : `https://polymarket.com/market/${c.slug}`,
       endDate: c.endDate,
       eventDeadline,
-      tags: [],
+      tags: c.tags,
       outcomeTokens: c.outcomeTokens,
       asks: topAsks,
       // Only flag awaiting-resolution once the real book price has
@@ -460,15 +539,21 @@ export async function runScan(config: ScanConfig): Promise<ScanResponse> {
   }
 
   // ── Stage 5b: Fetch event tags for scored opportunities ──
-  const eventSlugs = [...new Set(opportunities.map((o) => o.eventSlug).filter(Boolean))];
-  console.log(`[scan] Stage 5b: Fetching tags for ${eventSlugs.length} events...`);
-  const tagMap = await client.fetchEventTagsBatch(eventSlugs);
+  if (prefetchedCandidateTags) {
+    console.log("[scan] Stage 5b: Reusing candidate tags");
+  } else {
+    const eventSlugs = [
+      ...new Set(opportunities.map((o) => o.eventSlug).filter(Boolean)),
+    ];
+    console.log(`[scan] Stage 5b: Fetching tags for ${eventSlugs.length} events...`);
+    const tagMap = await client.fetchEventTagsBatch(eventSlugs);
 
-  for (const opp of opportunities) {
-    const eventTags = tagMap.get(opp.eventSlug) ?? [];
-    opp.tags = eventTags.map((t) => t.label);
+    for (const opp of opportunities) {
+      const eventTags = tagMap.get(opp.eventSlug) ?? [];
+      opp.tags = eventTags.map((t) => t.label);
+    }
+    console.log(`[scan] Fetched tags for ${tagMap.size} events`);
   }
-  console.log(`[scan] Fetched tags for ${tagMap.size} events`);
 
   // ── Stage 6: Deduplicate by event, sort ──
   console.log("[scan] Stage 6: Deduplicating and ranking...");

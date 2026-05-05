@@ -52,12 +52,14 @@ function isOracleResetStalled(opp: Opportunity): boolean {
 
 /** Tags excluded by default when the dashboard loads (first visit only) */
 const DEFAULT_EXCLUDED_TAGS = [
+  "Sports",
   "Weather", "Daily Temperature",
   "Crypto", "Bitcoin", "Ethereum", "Crypto Prices",
 ];
 
-/** localStorage key for persisting user's tag selections */
-const TAG_PREFS_KEY = "prededge.tagPrefs.v1";
+/** localStorage key for persisting user's tag selections.
+ * v2 resets old saved prefs so Sports starts excluded by default. */
+const TAG_PREFS_KEY = "prededge.tagPrefs.v2";
 /** localStorage key for persisting the user's trade-size input */
 const TRADE_SIZE_KEY = "prededge.tradeSize.v1";
 /** Default trade size in USD — matches DEFAULT_SCAN_CONFIG.minDepthUsd */
@@ -197,7 +199,15 @@ export default function Dashboard() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/scan", { method: "POST" });
+      const scanTagFilters = {
+        tags: filters.tags.filter((tag) => !isVirtualTag(tag)),
+        excludedTags: filters.excludedTags.filter((tag) => !isVirtualTag(tag)),
+      };
+      const res = await fetch("/api/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(scanTagFilters),
+      });
       if (!res.ok) {
         const json = await res.json();
         throw new Error(json.error || `Scan failed (${res.status})`);
@@ -218,9 +228,11 @@ export default function Dashboard() {
   const sortedFiltered = useMemo(() => {
     const opps = data?.opportunities ?? [];
     const matchesTag = (opp: Opportunity, tag: string) =>
-      isVirtualTag(tag)
-        ? matchesVirtualTag(opp, tag)
-        : opp.tags?.includes(tag) === true;
+      tag === "Sports" && opp.sportsMarketType != null
+        ? true
+        : isVirtualTag(tag)
+          ? matchesVirtualTag(opp, tag)
+          : opp.tags?.includes(tag) === true;
     const oracleResolutionSelected = filters.tags.includes(
       ORACLE_RESOLUTION_TAG
     );

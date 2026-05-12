@@ -36,6 +36,9 @@ export function Navbar() {
         <Link href="/trades" className={linkClass("/trades")}>
           Paper Trading
         </Link>
+        <Link href="/mstr" className={linkClass("/mstr")}>
+          MSTR Report
+        </Link>
         <ThemeToggle />
         <a
           href="https://polymarket.com"

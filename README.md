@@ -1,6 +1,35 @@
 PredEdge is a local-first [Next.js](https://nextjs.org) app for scanning
 Polymarket tail-price opportunities and tracking paper trades.
 
+## Features
+
+- **Scanner** (`/`) — Sweeps Polymarket for tail-priced contracts (0.93–0.995),
+  walks the ask side of each order book to compute fill-aware VWAP and slippage,
+  then scores and sorts every candidate into actionable / observe / rejected.
+  Filter by tag and recompute yields live at your own trade size.
+- **Paper Trading** (`/trades`) — Simulate buying into scanned opportunities and
+  track how the scanner's picks actually play out.
+- **MSTR Report** (`/mstr`) — Backtest review and live verification of the
+  Polymarket × Saylor strict-signal weekly BTC strategy.
+- **Saylor BTC Signal** (`/saylor`) — Combines @saylor tweet cues, the earnings
+  calendar, federal holidays, and capital actions into a probability that MSTR
+  buys BTC next week.
+
+## Getting Started
+
+```bash
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000) and click **Scan** on the
+Scanner page to fetch the latest markets (the first run takes 30–60s).
+
+> **Run it locally.** A full scan walks thousands of markets and can take
+> 30–60s, which exceeds Vercel's serverless function execution limit — a scan
+> triggered on a Vercel deployment will likely time out. Running locally has no
+> such limit.
+
 ## Local Storage
 
 The app stores scan runs, opportunities, odds snapshots, and paper trades in a
@@ -13,38 +42,3 @@ local SQLite database powered by Node's built-in `node:sqlite` module.
   tested with Node v25.2.1.
 
 The database is created automatically on first API request.
-
-## Getting Started
-
-First, run the development server:
-
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.

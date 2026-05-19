@@ -27,6 +27,11 @@ interface CurrentApiResponse {
   capitalAction: CapitalActionFlag | null;
   weekStart: string;
   weekEnd: string;
+  /** Week the prediction was actually computed for (may be a past week when
+   *  the current week has no Saylor activity yet). */
+  evaluationWeek?: string;
+  evaluationWeekEnd?: string;
+  isCurrentWeek?: boolean;
   fetchedCount?: number;
   errors?: string[];
 }
@@ -287,9 +292,14 @@ export default function SaylorPage() {
           <div className="md:col-span-2 space-y-3">
             <div className="flex items-baseline gap-3">
               <h2 className="text-lg font-medium text-text-primary">
-                This week:{" "}
-                <span className="font-mono">{data?.weekStart ?? "—"}</span> →{" "}
-                <span className="font-mono">{data?.weekEnd ?? "—"}</span>
+                {data?.isCurrentWeek === false ? "Latest signal week" : "This week"}:{" "}
+                <span className="font-mono">
+                  {data?.evaluationWeek ?? data?.weekStart ?? "—"}
+                </span>{" "}
+                →{" "}
+                <span className="font-mono">
+                  {data?.evaluationWeekEnd ?? data?.weekEnd ?? "—"}
+                </span>
               </h2>
               {data?.prediction && (
                 <DecisionBadge
@@ -299,6 +309,15 @@ export default function SaylorPage() {
                 />
               )}
             </div>
+            {data?.isCurrentWeek === false && (
+              <div className="text-xs text-accent-amber">
+                No Saylor activity in the current week (
+                <span className="font-mono">{data?.weekStart}</span> →{" "}
+                <span className="font-mono">{data?.weekEnd}</span>) yet — showing
+                the most recent week with a signal. Paste a tweet or hit Refresh
+                to evaluate this week.
+              </div>
+            )}
             <div className="text-xs text-text-muted font-mono">
               Reason:{" "}
               <span className="text-text-secondary">

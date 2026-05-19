@@ -9,6 +9,9 @@
 
 import { getDb } from "../localDb";
 import type { SqliteValue } from "../localDb";
+import { mondayOf } from "./calendar";
+import { classifyTweet } from "./classifier";
+import { SEED_TWEETS } from "./seedTweets";
 import type {
   CapitalActionFlag,
   SaylorTweet,
@@ -212,6 +215,44 @@ export function latestTweetTimestamp(): string | null {
   return row ? String(row.posted_at) : null;
 }
 
+export function countTweets(): number {
+  const row = getDb().prepare("SELECT COUNT(*) AS c FROM saylor_tweets").get();
+  return Number(row?.c ?? 0);
+}
+
+/**
+ * Seed the tweets + signals tables from the committed snapshot on first use.
+ *
+ * The Saylor predictor is useless without tweets to classify, and the live X
+ * Syndication endpoint is almost always rate-limited from a datacenter IP, so
+ * on Vercel the DB would otherwise stay empty (and the gauge stuck at the
+ * "no signals → 50%" default). This loads ~120 real recent tweets, classifies
+ * each, and buckets the resulting signals into their actual posting week.
+ *
+ * Idempotent and cheap: it no-ops once any tweet exists, so it runs at most
+ * once per cold-started serverless instance (the SQLite file lives in /tmp and
+ * is recreated on each cold start). Fresh tweets from refresh / manual paste
+ * layer on top and are never overwritten.
+ */
+export function ensureSeeded(): void {
+  if (countTweets() > 0) return;
+  for (const seed of SEED_TWEETS) {
+    const tweet: SaylorTweet = {
+      id: seed.id,
+      postedAt: seed.postedAt,
+      text: seed.text,
+      url: seed.url,
+      source: "syndication",
+      fetchedAt: seed.postedAt,
+    };
+    upsertTweet(tweet);
+    const hits = classifyTweet(tweet.text, tweet.id);
+    if (hits.length > 0) {
+      saveSignals(hits, mondayOf(new Date(tweet.postedAt)));
+    }
+  }
+}
+
 // Signals
 export function saveSignals(hits: SignalHit[], weekStart: string): void {
   if (hits.length === 0) return;
@@ -240,6 +281,20 @@ export function listSignalsForWeek(weekStart: string): SignalHit[] {
     )
     .all(weekStart)
     .map(signalFromRow);
+}
+
+/**
+ * Most recent week (Monday ISO date) that has at least one classified signal,
+ * or null if none. Used to fall back to the latest week with Saylor activity
+ * when the current week is still silent.
+ */
+export function latestSignalWeek(): string | null {
+  const row = getDb()
+    .prepare(
+      `SELECT week_start FROM saylor_signals ORDER BY week_start DESC LIMIT 1`
+    )
+    .get();
+  return row ? String(row.week_start) : null;
 }
 
 // Capital actions

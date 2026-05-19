@@ -1,22 +1,23 @@
-import { NextRequest } from "next/server";
 import {
+  ensureSeeded,
   getCapitalActionFlag,
-  getLatestPrediction,
-  listSignalsForWeek,
   listTweets,
 } from "@/lib/saylor/db";
+import { resolveEvaluation } from "@/lib/saylor/evaluate";
 import { mondayOf, sundayOf } from "@/lib/saylor/calendar";
-import type { CurrentResponse, WeekPrediction } from "@/lib/saylor/types";
+import type { CurrentResponse } from "@/lib/saylor/types";
 
 export const runtime = "nodejs";
 
-void NextRequest;
-
 /**
  * GET /api/saylor/current
- * Returns the latest cached prediction + recent tweets for the current
- * Monday-week. Does NOT fetch new data — call POST /api/saylor/refresh for
- * that.
+ * Recomputes the prediction live from the signals currently in the DB. Does
+ * NOT hit the network — call POST /api/saylor/refresh to pull fresh tweets.
+ *
+ * Seeds the DB from the committed tweet snapshot on first use, then evaluates
+ * the current week; if the current week has no Saylor activity yet, it falls
+ * back to the most recent week that does, so the gauge shows a real
+ * tweet-derived probability instead of the flat 50% default.
  */
 export async function GET() {
   const now = new Date();
@@ -24,50 +25,29 @@ export async function GET() {
   const weekEnd = sundayOf(now);
 
   try {
-    const stored = getLatestPrediction(weekStart);
-    let prediction: WeekPrediction | null = null;
-    if (stored) {
-      let parsed: {
-        breakdown?: WeekPrediction["breakdown"];
-        flags?: WeekPrediction["flags"];
-        reason?: string;
-      } = {};
-      try {
-        parsed = JSON.parse(stored.signalBreakdown);
-      } catch {
-        parsed = {};
-      }
-      prediction = {
-        weekStart: stored.weekStart,
-        weekEnd: stored.weekEnd,
-        probability: stored.probability,
-        recommendation: stored.recommendation as WeekPrediction["recommendation"],
-        breakdown: parsed.breakdown ?? [],
-        flags:
-          parsed.flags ?? {
-            holidayMonday: false,
-            earningsBlackout: false,
-            mixedSignal: false,
-            capitalAction: false,
-            greenPresent: false,
-            prevWeekNobuy: false,
-          },
-        reason: parsed.reason ?? "stored",
-      };
-    }
+    ensureSeeded();
 
+    const evaluated = resolveEvaluation(now);
+    const capitalAction = getCapitalActionFlag(evaluated.evaluationWeek);
     const tweets = listTweets({ limit: 30 });
-    const signals = listSignalsForWeek(weekStart);
-    const capitalAction = getCapitalActionFlag(weekStart);
 
-    const body: CurrentResponse & { weekStart: string; weekEnd: string } = {
-      prediction,
+    const body: CurrentResponse & {
+      weekStart: string;
+      weekEnd: string;
+      evaluationWeek: string;
+      evaluationWeekEnd: string;
+      isCurrentWeek: boolean;
+    } = {
+      prediction: evaluated.prediction,
       market: null, // populated by POST /refresh
       tweets,
-      signals,
+      signals: evaluated.signals,
       capitalAction,
       weekStart,
       weekEnd,
+      evaluationWeek: evaluated.evaluationWeek,
+      evaluationWeekEnd: evaluated.evaluationWeekEnd,
+      isCurrentWeek: evaluated.isCurrentWeek,
     };
     return Response.json(body);
   } catch (err) {

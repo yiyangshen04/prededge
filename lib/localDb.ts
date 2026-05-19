@@ -3,15 +3,15 @@ import { mkdirSync } from "fs";
 import path from "path";
 import type { Fill, Opportunity, PaperTrade, ScanRun } from "./types";
 
-type SqliteValue = string | number | bigint | null;
+export type SqliteValue = string | number | bigint | null;
 
-interface StatementSync {
+export interface StatementSync {
   all(...params: SqliteValue[]): Array<Record<string, unknown>>;
   get(...params: SqliteValue[]): Record<string, unknown> | undefined;
   run(...params: SqliteValue[]): { changes: number; lastInsertRowid: number | bigint };
 }
 
-interface DatabaseSync {
+export interface DatabaseSync {
   exec(sql: string): void;
   prepare(sql: string): StatementSync;
 }
@@ -59,7 +59,7 @@ function ensureDbDir(filename: string) {
   mkdirSync(path.dirname(filename), { recursive: true });
 }
 
-function getDb(): DatabaseSync {
+export function getDb(): DatabaseSync {
   if (db) return db;
 
   const filename = dbPath();
@@ -169,6 +169,73 @@ function getDb(): DatabaseSync {
       ON opportunities (decision);
 	    CREATE INDEX IF NOT EXISTS idx_paper_trades_status
 	      ON paper_trades (status, created_at DESC);
+
+    -- ===== Saylor BTC predictor tables =====
+    CREATE TABLE IF NOT EXISTS mstr_weekly_history (
+      week_idx INTEGER PRIMARY KEY,
+      start_date TEXT NOT NULL,
+      end_date TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      open_price REAL,
+      close_price REAL,
+      min_price REAL,
+      max_price REAL,
+      avg_price REAL,
+      volume_usd REAL,
+      category TEXT,
+      condition_id TEXT,
+      yes_token_id TEXT,
+      slug TEXT,
+      title TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_mstr_weekly_start
+      ON mstr_weekly_history (start_date);
+
+    CREATE TABLE IF NOT EXISTS saylor_tweets (
+      id TEXT PRIMARY KEY,
+      posted_at TEXT NOT NULL,
+      text TEXT NOT NULL,
+      url TEXT,
+      source TEXT NOT NULL,
+      fetched_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_saylor_tweets_posted
+      ON saylor_tweets (posted_at DESC);
+
+    CREATE TABLE IF NOT EXISTS saylor_signals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tweet_id TEXT NOT NULL,
+      week_start TEXT NOT NULL,
+      signal_type TEXT NOT NULL,
+      matched_phrase TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (tweet_id) REFERENCES saylor_tweets(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_saylor_signals_week
+      ON saylor_signals (week_start);
+
+    CREATE TABLE IF NOT EXISTS saylor_capital_actions (
+      week_start TEXT PRIMARY KEY,
+      flagged INTEGER NOT NULL DEFAULT 0,
+      note TEXT,
+      flagged_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS saylor_predictions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      week_start TEXT NOT NULL,
+      week_end TEXT NOT NULL,
+      probability REAL NOT NULL,
+      recommendation TEXT NOT NULL,
+      signal_breakdown TEXT NOT NULL,
+      polymarket_yes_price REAL,
+      polymarket_condition_id TEXT,
+      computed_at TEXT NOT NULL,
+      UNIQUE (week_start, computed_at)
+    );
+    CREATE INDEX IF NOT EXISTS idx_saylor_predictions_week
+      ON saylor_predictions (week_start DESC);
 	  `);
 
   ensureOpportunityColumns(db);

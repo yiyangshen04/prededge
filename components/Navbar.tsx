@@ -39,6 +39,9 @@ export function Navbar() {
         <Link href="/mstr" className={linkClass("/mstr")}>
           MSTR Report
         </Link>
+        <Link href="/saylor" className={linkClass("/saylor")}>
+          Saylor
+        </Link>
         <ThemeToggle />
         <a
           href="https://polymarket.com"

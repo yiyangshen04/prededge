@@ -44,4 +44,9 @@ next-env.d.ts
 /tmp
 /output
 /.playwright-cli
+/.playwright-mcp
 /data
+
+# Claude Code worktrees + per-session settings
+/.claude/worktrees
+/.claude/settings.local.json

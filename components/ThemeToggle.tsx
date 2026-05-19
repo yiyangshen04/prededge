@@ -1,8 +1,38 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 
 type Theme = "light" | "dark" | "auto";
+
+const THEME_STORAGE_KEY = "prededge-theme";
+const THEME_CHANGE_EVENT = "prededge-theme-change";
+const DEFAULT_THEME: Theme = "auto";
+
+function isTheme(value: string | null): value is Theme {
+  return value === "light" || value === "dark" || value === "auto";
+}
+
+function getStoredTheme(): Theme {
+  const storedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+  return isTheme(storedTheme) ? storedTheme : DEFAULT_THEME;
+}
+
+function subscribeThemeChange(onChange: () => void) {
+  const handleStorage = (event: StorageEvent) => {
+    if (event.key === THEME_STORAGE_KEY) {
+      onChange();
+    }
+  };
+  const handleThemeChange = () => onChange();
+
+  window.addEventListener("storage", handleStorage);
+  window.addEventListener(THEME_CHANGE_EVENT, handleThemeChange);
+
+  return () => {
+    window.removeEventListener("storage", handleStorage);
+    window.removeEventListener(THEME_CHANGE_EVENT, handleThemeChange);
+  };
+}
 
 function getSystemDark(): boolean {
   return window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -17,10 +47,11 @@ function applyTheme(theme: Theme) {
 }
 
 export function ThemeToggle() {
-  const [theme, setTheme] = useState<Theme>(() => {
-    if (typeof window === "undefined") return "auto";
-    return (localStorage.getItem("prededge-theme") as Theme | null) ?? "auto";
-  });
+  const theme = useSyncExternalStore(
+    subscribeThemeChange,
+    getStoredTheme,
+    () => DEFAULT_THEME
+  );
 
   useEffect(() => {
     applyTheme(theme);
@@ -39,8 +70,8 @@ export function ThemeToggle() {
   const cycle = () => {
     const next: Theme =
       theme === "auto" ? "light" : theme === "light" ? "dark" : "auto";
-    setTheme(next);
-    localStorage.setItem("prededge-theme", next);
+    localStorage.setItem(THEME_STORAGE_KEY, next);
+    window.dispatchEvent(new Event(THEME_CHANGE_EVENT));
   };
 
   const icon = theme === "auto" ? "A" : theme === "light" ? "\u2600" : "\u263E";

@@ -17,19 +17,29 @@ const SEARCH_QUERIES = [
   "strategy bitcoin week",
 ] as const;
 
-function isWeeklyMstrMarket(m: GammaMarket): boolean {
-  if (!m.question) return false;
-  if (!MSTR_QUESTION_RE.test(m.question)) return false;
+/**
+ * True iff a market question is the weekly "Will MicroStrategy buy bitcoin
+ * this week" series (excluding annual/holdings markets like "...hold X BTC by
+ * 2027"). Exported so the scanner-side model overlay can match opportunities
+ * by their question without re-deriving the regex.
+ */
+export function matchesMstrWeeklyQuestion(
+  question: string | null | undefined
+): boolean {
+  if (!question) return false;
+  if (!MSTR_QUESTION_RE.test(question)) return false;
   // Exclude annual / general "will MicroStrategy hold X BTC by 2027" markets.
-  if (/\b(2026|2027|2028|2029|2030|by\s+the\s+end)\b/i.test(m.question)) {
+  if (/\b(2026|2027|2028|2029|2030|by\s+the\s+end)\b/i.test(question)) {
     // Allow if it also names a week range.
-    if (
-      !/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(m.question)
-    ) {
+    if (!/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(question)) {
       return false;
     }
   }
   return true;
+}
+
+function isWeeklyMstrMarket(m: GammaMarket): boolean {
+  return matchesMstrWeeklyQuestion(m.question);
 }
 
 async function searchMarkets(

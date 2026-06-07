@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import path from "path";
-import type { Fill, Opportunity, PaperTrade, ScanRun } from "./types";
+import type { Fill, ModelOverlay, Opportunity, PaperTrade, ScanRun } from "./types";
 
 export type SqliteValue = string | number | bigint | null;
 
@@ -127,6 +127,7 @@ export function getDb(): DatabaseSync {
 	      timing_reasons TEXT,
 	      sports_market_type TEXT,
 	      game_start_time TEXT,
+	      model_overlay TEXT,
 	      scanned_at TEXT NOT NULL,
       FOREIGN KEY (scan_id) REFERENCES scan_runs(scan_id) ON DELETE CASCADE
     );
@@ -258,6 +259,7 @@ function ensureOpportunityColumns(database: DatabaseSync) {
     ["oracle_resolution_details", "oracle_resolution_details TEXT"],
     ["resolved_by", "resolved_by TEXT"],
     ["question_id", "question_id TEXT"],
+    ["model_overlay", "model_overlay TEXT"],
   ];
 
   for (const [name, ddl] of columns) {
@@ -380,6 +382,7 @@ function opportunityFromRow(row: Record<string, unknown>): Opportunity {
 	    sportsMarketType:
 	      row.sports_market_type == null ? null : String(row.sports_market_type),
     gameStartTime: row.game_start_time == null ? null : String(row.game_start_time),
+    modelOverlay: fromJson<ModelOverlay | null>(row.model_overlay, null),
   };
 }
 
@@ -401,6 +404,7 @@ function opportunityRowForApi(row: Record<string, unknown>) {
 	    recurrent_like: intToBool(row.recurrent_like),
 	    postponed: intToBool(row.postponed),
 	    timing_reasons: fromJson<string[]>(row.timing_reasons, []),
+	    model_overlay: fromJson<ModelOverlay | null>(row.model_overlay, null),
 	  };
 	}
 
@@ -463,8 +467,8 @@ export function persistScanResult(scan: ScanRun, opportunities: Opportunity[]) {
 	        oracle_resolution_state, oracle_resolution_details, resolved_by,
 	        question_id, resolution_deadline, expected_payout_date,
 	        stale_raw_end_date, recurrent_like, postponed, timing_confidence,
-	        timing_reasons, sports_market_type, game_start_time, scanned_at
-	      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	        timing_reasons, sports_market_type, game_start_time, model_overlay, scanned_at
+	      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertSnapshot = database.prepare(
       `INSERT INTO odds_snapshots (condition_id, token_id, outcome, price)
@@ -515,6 +519,7 @@ export function persistScanResult(scan: ScanRun, opportunities: Opportunity[]) {
 	        toJson(opp.timingReasons ?? []),
 	        opp.sportsMarketType ?? null,
         opp.gameStartTime ?? null,
+        toJson(opp.modelOverlay ?? null),
         scannedAt
       );
       insertSnapshot.run(opp.conditionId, opp.tokenId, opp.outcome, opp.price);

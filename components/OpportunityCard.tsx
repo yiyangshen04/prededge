@@ -10,7 +10,7 @@ import { isHiddenTag } from "@/lib/virtualTags";
 /** Tags in `decision_reasons` that are informational (rendered as a badge
  * at the top of the card) rather than a downgrade cause. We strip them from
  * the "Decision reasons" chip strip at the bottom to avoid double-display. */
-const INFO_REASON_TAGS = new Set(["rewards_incentivized"]);
+const INFO_REASON_TAGS = new Set(["rewards_incentivized", "model_backed"]);
 /** UMA status prefix lives in `decision_reasons` as `oracle_proposed` /
  * `oracle_disputed`. Rendered as a top badge; hidden from the bottom strip. */
 function isOracleReason(r: string): boolean {
@@ -330,6 +330,18 @@ export function OpportunityCard({
               Awaiting
             </span>
           )}
+          {opp.modelOverlay && (
+            <span
+              title={`Saylor BTC-weekly model fair value for this outcome: ${(
+                opp.modelOverlay.fairValue * 100
+              ).toFixed(0)}% (model P(YES) = ${(
+                opp.modelOverlay.fairValueYes * 100
+              ).toFixed(0)}%). The scanner has no probability model of its own; this is the one market where the Saylor predictor supplies a fair value.`}
+              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-blue/15 text-accent-blue border border-accent-blue/30 uppercase tracking-wider"
+            >
+              Model
+            </span>
+          )}
           <DecisionBadge decision={opp.decision} />
         </div>
       </div>
@@ -401,6 +413,58 @@ export function OpportunityCard({
         />
       </div>
 
+      {/* Saylor model fair-value overlay. The scanner ranks tail prices but
+          has no view on true probability; for the MSTR weekly market the Saylor
+          predictor supplies one, turning the bare ask into a model-vs-market
+          edge. A materially richer market demotes the card to "observe". */}
+      {opp.modelOverlay && (() => {
+        const m = opp.modelOverlay;
+        const edgePositive = m.edgePp >= 0;
+        const contradicts = opp.decisionReasons.includes(
+          "model_contradicts_market"
+        );
+        return (
+          <div className="mb-3 rounded border border-accent-blue/30 bg-accent-blue/5 px-3 py-2">
+            <div className="flex items-center justify-between gap-2 flex-wrap text-[11px]">
+              <span className="uppercase tracking-wider text-text-muted">
+                Saylor model
+              </span>
+              <div className="flex items-center gap-2.5 font-mono">
+                <span className="text-text-secondary">
+                  fair{" "}
+                  <span className="text-text-primary">
+                    {(m.fairValue * 100).toFixed(0)}%
+                  </span>
+                </span>
+                <span className="text-text-muted">vs</span>
+                <span className="text-text-secondary">
+                  mkt{" "}
+                  <span className="text-text-primary">
+                    {(opp.price * 100).toFixed(0)}%
+                  </span>
+                </span>
+                <span
+                  className={
+                    edgePositive ? "text-accent-green" : "text-accent-red"
+                  }
+                >
+                  {edgePositive ? "+" : ""}
+                  {m.edgePp.toFixed(1)}pp
+                </span>
+                <span className="px-1.5 py-0.5 rounded bg-bg-input border border-border uppercase tracking-wider text-text-secondary">
+                  {m.recommendation}
+                </span>
+              </div>
+            </div>
+            <div className="text-[10px] text-text-muted mt-1">
+              {contradicts
+                ? "Market prices this outcome above the model's fair value — tail demoted to observe."
+                : `model signal: ${m.reason}`}
+            </div>
+          </div>
+        );
+      })()}
+
       {live?.bookDrained && tradeSizeUsd != null && (
         <div className="mb-3 text-[11px] text-accent-amber bg-accent-amber/10 border border-accent-amber/30 rounded px-2 py-1">
           ⚠ Book drained at ${tradeSizeUsd.toLocaleString()} — only $
@@ -469,7 +533,8 @@ export function OpportunityCard({
             r !== "oracle_reset_stalled" &&
             r !== "oracle_second_dispute" &&
             !r.startsWith("deadline:") &&
-            !r.startsWith("sports_")
+            !r.startsWith("sports_") &&
+            r !== "model_contradicts_market"
         );
         if (shown.length === 0) return null;
         return (

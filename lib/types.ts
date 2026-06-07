@@ -262,6 +262,28 @@ export interface AskLevel {
   size: number;
 }
 
+/** A fair-value estimate from an external model, overlaid on a scanner
+ * opportunity. The scanner itself has no opinion on true probability — it only
+ * ranks structural tail prices — so for the one market a model *does* cover
+ * (the MSTR weekly "buy bitcoin" series, via the Saylor predictor) we attach
+ * its probability here to turn a bare tail price into a model-vs-market edge.
+ * `recommendation` is a free string (not the saylor `Recommendation` type) so
+ * this Polymarket-side type stays decoupled from the saylor domain. */
+export interface ModelOverlay {
+  /** Identifies the model that produced the fair value, e.g. "saylor-btc-weekly". */
+  source: string;
+  /** Model fair-value probability for THIS opportunity's outcome (0..1). */
+  fairValue: number;
+  /** Model fair-value probability for the YES outcome (0..1), for display. */
+  fairValueYes: number;
+  /** fairValue − price in probability points (signed; negative = market richer). */
+  edgePp: number;
+  /** Model recommendation, e.g. "BUY_YES" / "BUY_NO" / "HOLD". */
+  recommendation: string;
+  /** Short machine reason from the model, e.g. "back_to_work_pivot". */
+  reason: string;
+}
+
 // ── Scored opportunity ready for display/storage ──
 export interface Opportunity {
   conditionId: string;
@@ -343,6 +365,10 @@ export interface Opportunity {
    * (kickoff already past) are demoted to observe and badged since price
    * snapshots go stale within minutes. */
   gameStartTime?: string | null;
+  /** Fair-value overlay from an external model (currently the Saylor BTC-weekly
+   * predictor), attached only to the markets that model covers. Null/absent for
+   * every other opportunity. See ModelOverlay. */
+  modelOverlay?: ModelOverlay | null;
 }
 
 // ── Paper Trading ──

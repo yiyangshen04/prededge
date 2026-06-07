@@ -7,6 +7,7 @@ import {
 import { runScan } from "@/lib/polymarket/scanner";
 import { DEFAULT_SCAN_CONFIG } from "@/lib/polymarket/config";
 import { enforceRateLimit } from "@/lib/rateLimit";
+import { annotateOpportunitiesWithSaylorModel } from "@/lib/saylor/scannerOverlay";
 import type { ScanTagFilters } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -41,6 +42,20 @@ export async function POST(request: NextRequest) {
   try {
     const tagFilters = await readScanTagFilters(request);
     const result = await runScan(DEFAULT_SCAN_CONFIG, tagFilters);
+
+    // Overlay the Saylor model's fair value onto the MSTR weekly market. This
+    // can demote actionable→observe, so refresh the run counts before persist.
+    annotateOpportunitiesWithSaylorModel(result.opportunities);
+    result.scan.actionableCount = result.opportunities.filter(
+      (o) => o.decision === "actionable"
+    ).length;
+    result.scan.observeCount = result.opportunities.filter(
+      (o) => o.decision === "observe"
+    ).length;
+    result.scan.rejectedCount = result.opportunities.filter(
+      (o) => o.decision === "rejected"
+    ).length;
+
     persistScanResult(result.scan, result.opportunities);
 
     return Response.json(result);

@@ -188,7 +188,12 @@ export function computeStabilityScore(
 export interface CandidateContext {
   /** Gamma `rewardsMinSize > 0` — top of book is bot-maintained. */
   rewardsIncentivized?: boolean;
-  /** UMA oracle proposal/dispute in progress. Outcome effectively decided. */
+  /** UMA oracle proposal/dispute in progress. Informational, not a demotion:
+   * this is the dispute-arbitrage class the research track targets
+   * (official-direction calls settled 32/32 with zero upsets), so the tail
+   * spread here is the opportunity itself, not noise around a decided
+   * outcome. Surfaced as an `oracle_*` reason for card badges and virtual
+   * tags. */
   umaResolutionStatus?: string | null;
   /** Parent market is one of many mutually-exclusive outcomes (Multi-Strikes,
    * Exact Score, Spread tiers). Even when the top ask is real, a ~0.95 ask on
@@ -313,13 +318,6 @@ export function decideCandidate(
       softFlags.push("in_play");
     }
   }
-  // Oracle in flight: outcome effectively decided. Keep visible for
-  // tracking but never actionable.
-  const uma = context.umaResolutionStatus?.trim();
-  if (uma && uma.toLowerCase() !== "none") {
-    softFlags.push(`oracle_${uma.toLowerCase()}`);
-  }
-
   if (softFlags.length > 0) {
     return {
       decision: "observe",
@@ -341,6 +339,12 @@ export function decideCandidate(
 function informationalTags(context: CandidateContext): string[] {
   const out: string[] = [];
   if (context.rewardsIncentivized) out.push("rewards_incentivized");
+  // Oracle in flight: kept as a badge/virtual-tag signal only — actionability
+  // is decided by the quantitative gates like any other candidate.
+  const uma = context.umaResolutionStatus?.trim();
+  if (uma && uma.toLowerCase() !== "none") {
+    out.push(`oracle_${uma.toLowerCase()}`);
+  }
   return out;
 }
 

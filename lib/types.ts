@@ -143,6 +143,12 @@ export interface GammaMarket {
   resolvedBy?: string | null;
   /** UMA CTF Adapter question identifier. */
   questionID?: string | null;
+  /** For negRisk markets the adapter's storage key is NOT `questionID`
+   * (which encodes the NegRiskOperator marketId+index) but this field —
+   * getQuestion/getUpdates called with `questionID` return empty structs.
+   * Verified on-chain 2026-07-04: all 3 neg-risk disputed markets read
+   * correctly only via negRiskRequestID. */
+  negRiskRequestID?: string | null;
   image?: string;
   events?: Array<{ slug: string; title: string; id: string }>;
 }
@@ -235,6 +241,8 @@ export interface TailCandidate {
    * refinement (e.g. reset-but-no-active-proposal). */
   resolvedBy?: string | null;
   questionID?: string | null;
+  /** Adapter storage key for negRisk markets (see GammaMarket.negRiskRequestID). */
+  negRiskRequestID?: string | null;
   /** Gamma `sportsMarketType`. Used to demote non-moneyline sports markets
    * (spreads/totals) that have structural-tail prices rather than mispricings. */
   sportsMarketType?: string | null;
@@ -282,6 +290,40 @@ export interface ModelOverlay {
   recommendation: string;
   /** Short machine reason from the model, e.g. "back_to_work_pivot". */
   reason: string;
+}
+
+/** How an official stance was derived: parsed from the on-chain additional
+ * context text, or inferred from an extreme price on an already-disputed
+ * market when the text is absent or carries no direction. */
+export type OfficialStanceVia = "text" | "price_fallback";
+
+export type OfficialStanceConfidence =
+  | "high"
+  | "medium"
+  | "low"
+  | "none"
+  | "price_fallback";
+
+/** Polymarket's official on-chain "additional context" for a disputed market,
+ * classified into an implied resolution direction. Backed by the dispute-arb
+ * research: markets where officials wrote a directional context settled the
+ * official way 32/32 (multi-round disputes 20/20). Attached only to disputed
+ * opportunities; null/absent everywhere else. */
+export interface OfficialContext {
+  /** "YES" | "NO" | "leans_YES" | "leans_NO" | "resolve_to_<outcome>" |
+   * "stay_open" | "clarity_only" | "rule_context" | "dispute_notice" | "none" */
+  stance: string;
+  confidence: OfficialStanceConfidence;
+  via: OfficialStanceVia;
+  /** Number of on-chain context updates (0 when stance came from price). */
+  updateCount: number;
+  /** ISO timestamp of the latest update; null when none. */
+  lastUpdateAt: string | null;
+  /** Latest update text, truncated for display; null for price_fallback. */
+  excerpt: string | null;
+  /** Any update mentions refunding losing positions — the spread is then not
+   * a real risk transfer and gets arbitraged to ~0. */
+  refundClause: boolean;
 }
 
 // ── Scored opportunity ready for display/storage ──
@@ -339,8 +381,8 @@ export interface Opportunity {
    * for a real mispricing. */
   negRisk?: boolean;
   /** UMA oracle status: `'proposed'` / `'disputed'` / null. When non-null
-   * the card is shown with an "oracle in progress" badge and the decision
-   * is forced to `observe` at most. */
+   * the card is shown with an "oracle in progress" badge; actionability is
+   * decided by the quantitative gates like any other candidate. */
   umaResolutionStatus?: string | null;
   /** On-chain refined oracle state from UMA CTF Adapter / Optimistic Oracle.
    * `reset_stalled` means a dispute triggered an Adapter reset, but the
@@ -349,6 +391,9 @@ export interface Opportunity {
   oracleResolutionDetails?: string | null;
   resolvedBy?: string | null;
   questionID?: string | null;
+  /** Adapter storage key for negRisk markets — getQuestion/getUpdates must
+   * be called with this instead of questionID (see GammaMarket). */
+  negRiskRequestID?: string | null;
   /** Latest resolution deadline parsed from the market description
    * ("resolve ... by Month D, YYYY"). Populated only when strictly later
    * than `endDate`; used for holding-day math and surfaced in the UI so
@@ -369,6 +414,16 @@ export interface Opportunity {
    * predictor), attached only to the markets that model covers. Null/absent for
    * every other opportunity. See ModelOverlay. */
   modelOverlay?: ModelOverlay | null;
+  /** Official on-chain additional-context classification for disputed markets.
+   * Drives the pinned "Official Ruling" section. See OfficialContext. */
+  officialContext?: OfficialContext | null;
+  /** True for the trailing (<0.5) leg of a disputed market — the "divergence
+   * play" shape where the market disagrees with the eventual ruling. Its raw
+   * net-return number is conditional on the official direction landing, so
+   * it is only actionable when a high-confidence official TEXT stance backs
+   * this side (reason `official_divergence_play`); otherwise it is capped at
+   * observe (reason `divergence_leg_needs_text_backing`). */
+  divergenceLeg?: boolean;
 }
 
 // ── Paper Trading ──
@@ -423,12 +478,43 @@ export interface ScanRun {
   durationMs: number;
   startedAt: string;
   completedAt: string | null;
+  /** Dispute-flow ("cohort C") backstop census for this run. `complete=false`
+   * means a backstop page failed and the Official Ruling section may be
+   * missing markets — surfaced in the UI instead of a silent shrink.
+   * Absent on runs persisted before this field existed. */
+  disputeCoverage?: {
+    /** Open markets whose current UMA status is `disputed`. */
+    disputedCount: number;
+    /** Re-proposed markets (history contains a dispute, current status
+     * `proposed` — the ~2h liveness window). */
+    replayCount: number;
+    complete: boolean;
+  } | null;
 }
 
 // ── Combined response from scan API ──
 export interface ScanResponse {
   scan: ScanRun;
   opportunities: Opportunity[];
+  /** What happened on-chain since the previous scan (dispute resets and
+   * official context postings), from the incremental event sweep. Null when
+   * the sweep was unavailable (RPC failure) — distinct from "no events". */
+  onchainEvents?: {
+    fromBlock: number;
+    toBlock: number;
+    resetCount: number;
+    contextUpdateCount: number;
+    knownHits: number;
+    discovered: Array<{
+      question: string;
+      slug: string;
+      conditionId: string;
+      umaResolutionStatus: string | null;
+      via: Array<"reset" | "context">;
+    }>;
+    unmatchedQuestionIds: string[];
+    incomplete: boolean;
+  } | null;
 }
 
 // ── Filter state for the dashboard ──

@@ -25,6 +25,13 @@ export const ORACLE_RESET_TAG = "Oracle Reset";
  * separately from the still-actionable Reset state. */
 export const ORACLE_SECOND_DISPUTE_TAG = "Oracle Second Dispute";
 
+/** Filter for the Official Ruling class: disputed markets where Polymarket's
+ * official on-chain additional context implies a resolution direction and
+ * this opportunity sits on the favored side. Backed by the dispute-arb
+ * research (official-direction calls settled 32/32 with zero upsets). These
+ * are also pinned in their own section above the main list. */
+export const OFFICIAL_RULING_TAG = "Official Ruling";
+
 /** All virtual tag labels. FilterBar styles these differently from real tags
  * and page.tsx routes them to field-specific predicates instead of
  * `opp.tags.includes(...)`. */
@@ -33,10 +40,27 @@ export const VIRTUAL_TAGS = new Set<string>([
   ORACLE_RESOLUTION_TAG,
   ORACLE_RESET_TAG,
   ORACLE_SECOND_DISPUTE_TAG,
+  OFFICIAL_RULING_TAG,
 ]);
 
 export function isVirtualTag(tag: string): boolean {
   return VIRTUAL_TAGS.has(tag);
+}
+
+/** Official-context stances that carry no resolution direction. Lives here
+ * (dependency-free, client-safe) so UI components can classify stances
+ * without bundling the on-chain reader in lib/polymarket/officialContext. */
+export const DIRECTIONLESS_STANCES = new Set([
+  "none",
+  "clarity_only",
+  "rule_context",
+  "dispute_notice",
+  "stay_open",
+]);
+
+export function isDirectionalStance(stance: string | null | undefined): boolean {
+  if (!stance) return false;
+  return !DIRECTIONLESS_STANCES.has(stance);
 }
 
 /** Meta tags the scanner surfaces from Polymarket but that shouldn't appear

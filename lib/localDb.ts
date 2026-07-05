@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { mkdirSync } from "fs";
 import path from "path";
-import type { Fill, ModelOverlay, Opportunity, PaperTrade, ScanRun } from "./types";
+import type { Fill, ModelOverlay, OfficialContext, Opportunity, PaperTrade, ScanRun } from "./types";
 
 export type SqliteValue = string | number | bigint | null;
 
@@ -128,6 +128,7 @@ export function getDb(): DatabaseSync {
 	      sports_market_type TEXT,
 	      game_start_time TEXT,
 	      model_overlay TEXT,
+	      official_context TEXT,
 	      scanned_at TEXT NOT NULL,
       FOREIGN KEY (scan_id) REFERENCES scan_runs(scan_id) ON DELETE CASCADE
     );
@@ -139,6 +140,12 @@ export function getDb(): DatabaseSync {
       outcome TEXT NOT NULL,
       price REAL NOT NULL,
       captured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS kv_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS paper_trades (
@@ -260,6 +267,7 @@ function ensureOpportunityColumns(database: DatabaseSync) {
     ["resolved_by", "resolved_by TEXT"],
     ["question_id", "question_id TEXT"],
     ["model_overlay", "model_overlay TEXT"],
+    ["official_context", "official_context TEXT"],
   ];
 
   for (const [name, ddl] of columns) {
@@ -383,6 +391,7 @@ function opportunityFromRow(row: Record<string, unknown>): Opportunity {
 	      row.sports_market_type == null ? null : String(row.sports_market_type),
     gameStartTime: row.game_start_time == null ? null : String(row.game_start_time),
     modelOverlay: fromJson<ModelOverlay | null>(row.model_overlay, null),
+    officialContext: fromJson<OfficialContext | null>(row.official_context, null),
   };
 }
 
@@ -405,6 +414,7 @@ function opportunityRowForApi(row: Record<string, unknown>) {
 	    postponed: intToBool(row.postponed),
 	    timing_reasons: fromJson<string[]>(row.timing_reasons, []),
 	    model_overlay: fromJson<ModelOverlay | null>(row.model_overlay, null),
+	    official_context: fromJson<OfficialContext | null>(row.official_context, null),
 	  };
 	}
 
@@ -467,8 +477,9 @@ export function persistScanResult(scan: ScanRun, opportunities: Opportunity[]) {
 	        oracle_resolution_state, oracle_resolution_details, resolved_by,
 	        question_id, resolution_deadline, expected_payout_date,
 	        stale_raw_end_date, recurrent_like, postponed, timing_confidence,
-	        timing_reasons, sports_market_type, game_start_time, model_overlay, scanned_at
-	      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	        timing_reasons, sports_market_type, game_start_time, model_overlay,
+	        official_context, scanned_at
+	      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertSnapshot = database.prepare(
       `INSERT INTO odds_snapshots (condition_id, token_id, outcome, price)
@@ -497,7 +508,7 @@ export function persistScanResult(scan: ScanRun, opportunities: Opportunity[]) {
 	        opp.volume24hr,
 	        opp.liquidity,
 	        opp.marketUrl,
-	        opp.endDate,
+	        opp.endDate ?? null,
 	        opp.eventDeadline ?? null,
 	        toJson(opp.tags),
 	        toJson(opp.outcomeTokens),
@@ -520,6 +531,7 @@ export function persistScanResult(scan: ScanRun, opportunities: Opportunity[]) {
 	        opp.sportsMarketType ?? null,
         opp.gameStartTime ?? null,
         toJson(opp.modelOverlay ?? null),
+        toJson(opp.officialContext ?? null),
         scannedAt
       );
       insertSnapshot.run(opp.conditionId, opp.tokenId, opp.outcome, opp.price);
@@ -681,6 +693,25 @@ export function insertPaperTrade(input: {
     createdAt,
     resolvedAt: null,
   };
+}
+
+// ── Generic key-value state (e.g. on-chain event sweep cursor) ──
+
+export function getKvState(key: string): string | null {
+  const row = getDb()
+    .prepare("SELECT value FROM kv_state WHERE key = ?")
+    .get(key);
+  return row ? String(row.value) : null;
+}
+
+export function setKvState(key: string, value: string): void {
+  getDb()
+    .prepare(
+      `INSERT INTO kv_state (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    )
+    .run(key, value, new Date().toISOString());
 }
 
 export function updatePaperTradeResolution(

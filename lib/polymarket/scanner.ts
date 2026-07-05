@@ -18,7 +18,13 @@ import {
   daysToExpiry,
 } from "./scoring";
 import { inferMarketTiming } from "./timing";
-import { inspectOracleResolutionStates } from "./oracleState";
+import { adapterQuestionID, inspectOracleResolutionStates } from "./oracleState";
+import { sweepDisputeEvents } from "./onchainEvents";
+import {
+  applyOfficialContextDecision,
+  attachOfficialContexts,
+  isDirectionalStance,
+} from "./officialContext";
 
 // ── Helpers ──
 
@@ -70,11 +76,24 @@ function hasUmaResolutionStatus(
 }
 
 function normalizeUmaResolutionStatus(market: GammaMarket): string | null {
+  // "disputed" wins over the single-value field: after a dispute resets the
+  // adapter and officials re-propose, Gamma reports `proposed` in the single
+  // field while the statuses history still carries `disputed` — that market
+  // IS in dispute flow (the strongest cohort of the dispute-arb research).
   const direct = market.umaResolutionStatus?.trim();
+  const statuses = parseJsonArray(market.umaResolutionStatuses).map((s) => s.trim());
+  if (
+    direct?.toLowerCase() === "disputed" ||
+    statuses.some((s) => s.toLowerCase() === "disputed")
+  ) {
+    return "disputed";
+  }
   if (hasUmaResolutionStatus(direct)) return direct;
+  return statuses.find(hasUmaResolutionStatus) ?? null;
+}
 
-  const statuses = parseJsonArray(market.umaResolutionStatuses);
-  return statuses.map((status) => status.trim()).find(hasUmaResolutionStatus) ?? null;
+function candidateIsDisputed(candidate: TailCandidate): boolean {
+  return candidate.umaResolutionStatus?.trim().toLowerCase() === "disputed";
 }
 
 function isOracleResolutionCandidate(candidate: TailCandidate): boolean {
@@ -133,9 +152,14 @@ function candidatePassesTagFilters(
 function oracleInspectionKey(input: {
   resolvedBy?: string | null;
   questionID?: string | null;
+  negRisk?: boolean;
+  negRiskRequestID?: string | null;
 }): string | null {
-  if (!input.resolvedBy || !input.questionID) return null;
-  return `${input.resolvedBy.toLowerCase()}:${input.questionID}`;
+  // Must mirror the key construction inside inspectOracleResolutionStates:
+  // negRisk markets are keyed by negRiskRequestID, not questionID.
+  const qid = adapterQuestionID(input);
+  if (!input.resolvedBy || !qid) return null;
+  return `${input.resolvedBy.toLowerCase()}:${qid}`;
 }
 
 /**
@@ -150,9 +174,32 @@ const MAX_BOOK_FETCHES = 300;
  * Extra CLOB book slots reserved for markets already in UMA proposal/dispute
  * flow. These can rank poorly on normal yield heuristics because the event
  * date is stale or volume is thin, but they are exactly the "settlement tail"
- * class users want to audit separately.
+ * class users want to audit separately. Disputed candidates are NOT capped by
+ * this — they all get a book fetch (see Stage 3).
  */
 const MAX_ORACLE_BOOK_FETCHES = 80;
+
+/**
+ * Price window for oracle-in-flight candidates. The Official Ruling class is
+ * defined by oracle state + official stance, not by tail price: a disputed
+ * market converged to 0.999 or still split at 0.70 is exactly what the
+ * dispute-arb research targets, so the normal [0.93, 0.995] window must not
+ * cut it. Plain `proposed` markets only collect the leading side (≥ 0.5);
+ * DISPUTED markets collect BOTH legs — the trailing leg is the "divergence
+ * play" (officials backing the side the market is against), the only
+ * high-EV shape in this class. Its actionability is gated downstream on a
+ * high-confidence official text stance (see the divergence-leg gate).
+ */
+const ORACLE_PRICE_MIN = 0.5;
+const ORACLE_PRICE_MAX = 0.9999;
+const DISPUTED_PRICE_MIN = 0.0001;
+
+/**
+ * Disputed markets trade rarely, so their CLOB book snapshots are routinely
+ * older than the 60s default staleness cutoff. Dropping them would silently
+ * shrink the Official Ruling class, so they get a wider window instead.
+ */
+const DISPUTED_BOOK_MAX_AGE_MS = 10 * 60_000;
 
 /**
  * Minimum outcome price for an `endDate < now` market to count as truly
@@ -194,6 +241,73 @@ export async function runScan(
   const markets = await client.fetchAllMarkets();
   console.log(`[scan] Fetched ${markets.length} markets`);
 
+  // ── Stage 1b: Coverage backstop — merge the full dispute-flow class ──
+  // fetchAllMarkets samples by volume and endDate; a dispute-flow market that
+  // is neither high-volume nor near-expiry can fall through both dimensions.
+  // Two queries give the full "cohort C" census: currently-disputed (also
+  // covers reset-awaiting-reproposal and second disputes) plus re-proposed
+  // markets whose history contains a dispute (the ~2h liveness window the
+  // disputed query can't see).
+  const backstop = await client.fetchDisputeFlowBackstop();
+  const knownConditionIds = new Set(
+    markets.map((m) => m.conditionId).filter(Boolean)
+  );
+  let mergedDisputed = 0;
+  for (const market of [...backstop.disputed, ...backstop.replay]) {
+    if (!market.conditionId || knownConditionIds.has(market.conditionId)) continue;
+    knownConditionIds.add(market.conditionId);
+    markets.push(market);
+    mergedDisputed += 1;
+  }
+  const disputeCoverage = {
+    disputedCount: backstop.disputed.length,
+    replayCount: backstop.replay.length,
+    complete: backstop.complete,
+  };
+  console.log(
+    `[scan] Stage 1b: dispute-flow backstop ${backstop.disputed.length} disputed + ${backstop.replay.length} re-proposed (${mergedDisputed} new, complete=${backstop.complete})`
+  );
+  // ── Stage 1c: On-chain event sweep since the previous scan ──
+  // QuestionReset/AncillaryDataUpdated are ground truth for the dispute flow;
+  // this catches the ~2h re-proposal windows and Gamma indexing lag between
+  // two manual refreshes. Failure never blocks the scan.
+  let onchainEvents: ScanResponse["onchainEvents"] = null;
+  try {
+    const knownQids = new Set<string>();
+    const extraAdapters: string[] = [];
+    for (const m of markets) {
+      if (m.questionID) knownQids.add(m.questionID.toLowerCase());
+      if (m.negRiskRequestID) knownQids.add(m.negRiskRequestID.toLowerCase());
+      if (m.resolvedBy) extraAdapters.push(m.resolvedBy);
+    }
+    const sweep = await sweepDisputeEvents(client, knownQids, extraAdapters);
+    onchainEvents = sweep.summary;
+    let mergedFromChain = 0;
+    for (const market of sweep.markets) {
+      if (!market.conditionId || knownConditionIds.has(market.conditionId)) continue;
+      // Only inject still-tradeable rows into the pool; resolved ones remain
+      // visible in the event summary.
+      if (market.closed === true || market.active !== true) continue;
+      knownConditionIds.add(market.conditionId);
+      markets.push(market);
+      mergedFromChain += 1;
+    }
+    console.log(
+      `[scan] Stage 1c: on-chain sweep blocks ${sweep.summary.fromBlock}-${sweep.summary.toBlock}: ` +
+        `${sweep.summary.resetCount} resets, ${sweep.summary.contextUpdateCount} context updates, ` +
+        `${sweep.summary.discovered.length} discovered (${mergedFromChain} merged)` +
+        (sweep.summary.incomplete ? " [INCOMPLETE]" : "")
+    );
+  } catch (err) {
+    console.warn(
+      `[scan] Stage 1c: on-chain sweep unavailable: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  // Gamma snapshots of disputed markets — the official-context price fallback
+  // reads outcomePrices from here when the on-chain text gives no direction.
+  const disputedByConditionId = new Map<string, GammaMarket>();
+
   // ── Stage 2: Filter for tail candidates using Gamma outcomePrices ──
   console.log("[scan] Stage 2: Filtering tail candidates...");
   let candidates: TailCandidate[] = [];
@@ -231,8 +345,13 @@ export async function runScan(
     const rewardsIncentivized = toFloat(market.rewardsMinSize, 0) > 0;
     const negRisk = market.negRisk === true;
     const umaResolutionStatus = normalizeUmaResolutionStatus(market);
+    const oracleInFlight = hasUmaResolutionStatus(umaResolutionStatus);
     const sportsMarketType = market.sportsMarketType ?? null;
     const gameStartTime = market.gameStartTime ?? null;
+
+    if (umaResolutionStatus === "disputed" && market.conditionId) {
+      disputedByConditionId.set(market.conditionId, market);
+    }
 
     // Hard-skip sports markets whose kickoff is imminent (<15 min future).
     // Per Polymarket's official docs, sports markets have all outstanding
@@ -245,7 +364,9 @@ export async function runScan(
     // in-play / window-open price drift is handled by the downstream
     // decideCandidate demotion, not by hard filtering.
     // https://help.polymarket.com/en/articles/13364444-limit-orders
-    if (gameStartTime && sportsMarketType) {
+    // Oracle-in-flight sports markets are exempt: their game is long over and
+    // the book that matters is the settlement tail, not the kickoff window.
+    if (gameStartTime && sportsMarketType && !oracleInFlight) {
       const kickoffMs = new Date(gameStartTime).getTime();
       if (!isNaN(kickoffMs)) {
         const minsToKickoff = (kickoffMs - Date.now()) / 60_000;
@@ -268,7 +389,20 @@ export async function runScan(
       // (<= 0.05) is a longshot lottery ticket, not a sweep — on binary
       // markets the equivalent "safe" play is the sibling NO token at 0.95+,
       // which is already covered by the high-tail branch.
-      if (price < config.tailPriceMin || price > config.tailPriceMax) continue;
+      // Oracle-in-flight markets get a wider window: the Official Ruling
+      // class is defined by oracle state, not tail price, so converged
+      // (>0.995) and still-split (≥0.5) sides must both survive.
+      // Disputed markets additionally keep the TRAILING leg (two-leg
+      // collection): if officials back the side trading at 0.08, that leg is
+      // the actual opportunity and must reach the book/context stages.
+      const isDisputedMarket = umaResolutionStatus === "disputed";
+      const priceMin = isDisputedMarket
+        ? DISPUTED_PRICE_MIN
+        : oracleInFlight
+          ? ORACLE_PRICE_MIN
+          : config.tailPriceMin;
+      const priceMax = oracleInFlight ? ORACLE_PRICE_MAX : config.tailPriceMax;
+      if (price < priceMin || price > priceMax) continue;
 
       candidates.push({
         conditionId: market.conditionId,
@@ -300,6 +434,7 @@ export async function runScan(
         umaResolutionStatus,
         resolvedBy: market.resolvedBy ?? null,
         questionID: market.questionID ?? null,
+        negRiskRequestID: market.negRiskRequestID ?? null,
         sportsMarketType,
         gameStartTime: gameStartTime ?? undefined,
       });
@@ -322,11 +457,17 @@ export async function runScan(
     }
 
     const beforeTagFilter = candidates.length;
-    candidates = candidates.filter((candidate) =>
-      candidatePassesTagFilters(candidate, normalizedTagFilters)
+    // Dispute-flow candidates are exempt from tag filters: the Official
+    // Ruling class must stay complete even when the user excludes a category
+    // (e.g. exclude-Sports would silently drop esports disputes — two real
+    // cases on 2026-07-04).
+    candidates = candidates.filter(
+      (candidate) =>
+        isOracleResolutionCandidate(candidate) ||
+        candidatePassesTagFilters(candidate, normalizedTagFilters)
     );
     console.log(
-      `[scan] Tag filters kept ${candidates.length}/${beforeTagFilter} tail candidates`
+      `[scan] Tag filters kept ${candidates.length}/${beforeTagFilter} tail candidates (oracle-flow exempt)`
     );
   }
 
@@ -359,25 +500,41 @@ export async function runScan(
     return scoreB - scoreA;
   });
 
-  const baseCandidates = candidates.slice(0, MAX_BOOK_FETCHES);
+  // Three pools:
+  // - disputed: ALL of them, uncapped — the Official Ruling class must not
+  //   lose members to a book-fetch quota (they are tens, not hundreds).
+  // - other oracle-in-flight (proposed): capped reserve as before.
+  // - base: everything else. Oracle candidates are excluded from the base
+  //   slice because the widened price window inflates their (1-price) pre-
+  //   score and they would crowd real tail candidates out of the top 300.
+  const disputedCandidates = candidates.filter(candidateIsDisputed);
   const oracleCandidates = candidates
-    .filter(isOracleResolutionCandidate)
+    .filter((c) => isOracleResolutionCandidate(c) && !candidateIsDisputed(c))
     .slice(0, MAX_ORACLE_BOOK_FETCHES);
+  const baseCandidates = candidates
+    .filter((c) => !isOracleResolutionCandidate(c))
+    .slice(0, MAX_BOOK_FETCHES);
   const byTokenId = new Map<string, TailCandidate>();
-  for (const candidate of [...baseCandidates, ...oracleCandidates]) {
+  for (const candidate of [...baseCandidates, ...oracleCandidates, ...disputedCandidates]) {
     byTokenId.set(candidate.tokenId, candidate);
   }
   const topCandidates = [...byTokenId.values()];
   const droppedCount = candidates.length - topCandidates.length;
-  const oracleAddedCount = topCandidates.length - baseCandidates.length;
   console.log(
-    `[scan] Selected top ${topCandidates.length} for depth analysis (${baseCandidates.length} base + ${oracleAddedCount} oracle-status, pre-sort dropped ${droppedCount})`
+    `[scan] Selected ${topCandidates.length} for depth analysis (${baseCandidates.length} base + ${oracleCandidates.length} oracle-status + ${disputedCandidates.length} disputed, pre-sort dropped ${droppedCount})`
   );
 
   // ── Stage 4: Fetch order books for top candidates ──
   console.log("[scan] Stage 4: Fetching order books...");
-  const bookTokenIds = topCandidates.map((c) => c.tokenId);
-  const bookMap = await client.fetchBooksBatch(bookTokenIds);
+  const disputedTokenIds = new Set(disputedCandidates.map((c) => c.tokenId));
+  const normalTokenIds = topCandidates
+    .map((c) => c.tokenId)
+    .filter((id) => !disputedTokenIds.has(id));
+  const [bookMap, disputedBooks] = await Promise.all([
+    client.fetchBooksBatch(normalTokenIds),
+    client.fetchBooksBatch([...disputedTokenIds], DISPUTED_BOOK_MAX_AGE_MS),
+  ]);
+  for (const [tokenId, book] of disputedBooks) bookMap.set(tokenId, book);
   console.log(`[scan] Fetched ${bookMap.size} order books`);
 
   // ── Stage 5: Score and classify ──
@@ -385,19 +542,48 @@ export async function runScan(
   console.log("[scan] Stage 5: Scoring candidates (using order book prices)...");
   const opportunities: Opportunity[] = [];
 
-  for (const c of topCandidates) {
-    const book = bookMap.get(c.tokenId);
-    if (!book) continue;
+  // Disputed candidates dropped here must be explainable — the coverage
+  // audit ("don't miss any") relies on these counters.
+  const disputedDrops = { noBook: 0, noAsks: 0, priceWindow: 0 };
 
-    const analysis = analyzeOrderBook(book, config);
+  for (const c of topCandidates) {
+    const isDisputed = candidateIsDisputed(c);
+    const book = bookMap.get(c.tokenId);
+    if (!book) {
+      if (isDisputed) disputedDrops.noBook += 1;
+      continue;
+    }
+
+    // Oracle-in-flight candidates keep their widened price window through
+    // book analysis too: with the default config, analyzeOrderBook caps
+    // near-depth at tailPriceMax, so a 0.998 disputed ask would read as
+    // zero depth and the asks snapshot below would come out empty.
+    // Disputed legs keep the two-leg window (trailing leg must survive the
+    // best-ask re-check below).
+    const oracleInFlight = hasUmaResolutionStatus(c.umaResolutionStatus);
+    const effConfig = oracleInFlight
+      ? {
+          ...config,
+          tailPriceMin: isDisputed ? DISPUTED_PRICE_MIN : ORACLE_PRICE_MIN,
+          tailPriceMax: ORACLE_PRICE_MAX,
+        }
+      : config;
+
+    const analysis = analyzeOrderBook(book, effConfig);
 
     // Skip if no asks on the book at all
-    if (analysis.bestAskPrice == null) continue;
+    if (analysis.bestAskPrice == null) {
+      if (isDisputed) disputedDrops.noAsks += 1;
+      continue;
+    }
 
     const realPrice = analysis.bestAskPrice;
 
     // Re-check: is the real ask price still in the tail zone?
-    if (realPrice < config.tailPriceMin || realPrice > config.tailPriceMax) continue;
+    if (realPrice < effConfig.tailPriceMin || realPrice > effConfig.tailPriceMax) {
+      if (isDisputed) disputedDrops.priceWindow += 1;
+      continue;
+    }
 
     const nearDepthUsd = analysis.nearDepthUsd;
     const slippageBps = analysis.slippageBps;
@@ -454,7 +640,7 @@ export async function runScan(
         (a) =>
           a.price > 0 &&
           a.size > 0 &&
-          a.price <= config.tailPriceMax
+          a.price <= effConfig.tailPriceMax
       )
       .sort((a, b) => a.price - b.price)
       .slice(0, 20);
@@ -498,6 +684,7 @@ export async function runScan(
       umaResolutionStatus: c.umaResolutionStatus ?? null,
       resolvedBy: c.resolvedBy ?? null,
       questionID: c.questionID ?? null,
+      negRiskRequestID: c.negRiskRequestID ?? null,
       resolutionDeadline,
       expectedPayoutDate,
       staleRawEndDate: c.staleRawEndDate,
@@ -507,7 +694,16 @@ export async function runScan(
       timingReasons: c.timingReasons ?? [],
       sportsMarketType: c.sportsMarketType ?? null,
       gameStartTime: c.gameStartTime ?? null,
+      // Trailing leg of a disputed market — the divergence-play shape. The
+      // definitive gate runs after official context is attached (Stage 5a-2).
+      divergenceLeg: isDisputed && realPrice < 0.5,
     });
+  }
+
+  if (disputedDrops.noBook + disputedDrops.noAsks + disputedDrops.priceWindow > 0) {
+    console.log(
+      `[scan] Disputed candidates dropped: ${disputedDrops.noBook} no/stale book, ${disputedDrops.noAsks} no asks, ${disputedDrops.priceWindow} outside price window`
+    );
   }
 
   // ── Stage 5a: Refine UMA oracle-flow markets with on-chain Adapter state ──
@@ -542,6 +738,65 @@ export async function runScan(
       }
     }
     console.log(`[scan] Inspected ${stateMap.size} oracle adapter states`);
+  }
+
+  // ── Stage 5a-2: Official additional-context for disputed opportunities ──
+  // Reads the on-chain context text (not exposed by Gamma), classifies the
+  // implied direction, and integrates it into the decision: the favored side
+  // gets `official_direction_backed`, the side the officials ruled against is
+  // never actionable, refund-clause markets are never actionable.
+  const disputedOpps = opportunities.filter(
+    (o) => o.umaResolutionStatus?.trim().toLowerCase() === "disputed"
+  );
+  if (disputedOpps.length > 0) {
+    console.log(
+      `[scan] Stage 5a-2: Reading official context for ${disputedOpps.length} disputed opportunities...`
+    );
+    await attachOfficialContexts(
+      disputedOpps,
+      disputedByConditionId,
+      Math.min(config.concurrency, 4)
+    );
+    for (const opp of disputedOpps) {
+      applyOfficialContextDecision(opp);
+    }
+
+    // Divergence-leg gate. A trailing leg's net-return number is conditional
+    // on the official direction landing, so the quantitative gates alone must
+    // never promote it. Only a high-confidence official TEXT stance aligned
+    // with this side (leans_*/price_fallback don't qualify — leans labels ran
+    // 3/14 against the market forward, and price fallback always backs the
+    // leading side by construction) keeps its quantitative decision.
+    for (const opp of disputedOpps) {
+      if (opp.divergenceLeg !== true) continue;
+      const ctx = opp.officialContext;
+      const textBacked =
+        ctx != null &&
+        ctx.via === "text" &&
+        ctx.confidence === "high" &&
+        opp.decisionReasons.includes("official_direction_backed");
+      if (textBacked) {
+        if (!opp.decisionReasons.includes("official_divergence_play")) {
+          opp.decisionReasons.push("official_divergence_play");
+        }
+      } else {
+        if (opp.decision === "actionable") opp.decision = "observe";
+        if (!opp.decisionReasons.includes("divergence_leg_needs_text_backing")) {
+          opp.decisionReasons.push("divergence_leg_needs_text_backing");
+        }
+      }
+    }
+
+    const directional = disputedOpps.filter(
+      (o) => o.officialContext != null && isDirectionalStance(o.officialContext.stance)
+    ).length;
+    const refunds = disputedOpps.filter((o) => o.officialContext?.refundClause).length;
+    const divergencePlays = disputedOpps.filter((o) =>
+      o.decisionReasons.includes("official_divergence_play")
+    ).length;
+    console.log(
+      `[scan] Official context attached: ${directional} directional, ${refunds} refund-flagged, ${divergencePlays} divergence plays`
+    );
   }
 
   // ── Stage 5b: Fetch event tags for scored opportunities ──
@@ -586,7 +841,33 @@ export async function runScan(
       return b.stabilityScore - a.stabilityScore;
     });
     const keepN = group.some((g) => g.negRisk === true) ? 1 : 2;
-    deduped.push(...group.slice(0, keepN));
+    const kept = group.slice(0, keepN);
+    // Disputed legs always survive event dedup: the Official Ruling census
+    // must show every leg of every disputed market (a negRisk sibling bucket
+    // with a higher stability score must not evict them), and the divergence
+    // pair (leading + trailing leg) only reads as a pair when both are kept.
+    for (const opp of group.slice(keepN)) {
+      if (opp.umaResolutionStatus?.trim().toLowerCase() === "disputed") {
+        kept.push(opp);
+      }
+    }
+    deduped.push(...kept);
+  }
+
+  // Official Ruling opportunities survive event dedup unconditionally: in a
+  // negRisk event (keepN=1) the officially-backed bucket must not lose its
+  // slot to a sibling tail bucket with a higher stability score.
+  const keptTokenIds = new Set(deduped.map((o) => o.tokenId));
+  for (const opp of opportunities) {
+    if (keptTokenIds.has(opp.tokenId)) continue;
+    if (
+      opp.officialContext != null &&
+      isDirectionalStance(opp.officialContext.stance) &&
+      opp.decisionReasons.includes("official_direction_backed")
+    ) {
+      deduped.push(opp);
+      keptTokenIds.add(opp.tokenId);
+    }
   }
 
   // Final sort: actionable first, then by annualized yield
@@ -609,13 +890,14 @@ export async function runScan(
     durationMs,
     startedAt: new Date(startTime).toISOString(),
     completedAt: new Date().toISOString(),
+    disputeCoverage,
   };
 
   console.log(
     `[scan] Done in ${durationMs}ms: ${scan.actionableCount} actionable, ${scan.observeCount} observe, ${scan.rejectedCount} rejected`
   );
 
-  return { scan, opportunities: deduped };
+  return { scan, opportunities: deduped, onchainEvents };
 }
 
 function buildEmptyResponse(

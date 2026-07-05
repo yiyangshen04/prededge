@@ -47,7 +47,7 @@ function rpcUrls(): string[] {
   ];
 }
 
-function isHex(value: string | null | undefined, bytes: number): value is string {
+export function isHex(value: string | null | undefined, bytes: number): value is string {
   return (
     typeof value === "string" &&
     new RegExp(`^0x[0-9a-fA-F]{${bytes * 2}}$`).test(value)
@@ -95,7 +95,7 @@ function bytes32Ascii(value: string): string {
   return Buffer.from(value, "utf8").toString("hex").padEnd(64, "0");
 }
 
-async function ethCall(to: string, data: string): Promise<string> {
+export async function ethCall(to: string, data: string): Promise<string> {
   let lastError: Error | null = null;
 
   for (const rpc of rpcUrls()) {
@@ -130,7 +130,30 @@ function decodeQuestion(result: string): QuestionData | null {
   if (!result || result === "0x") return null;
   const tupleOffset = Number(uintWord(wordAt(result, 0)));
   const word = (index: number) => wordAt(result, tupleOffset + index * 32);
-  const ancillaryOffset = Number(uintWord(word(11)));
+
+  // Adapter versions lay QuestionData out differently. The dynamic
+  // `ancillaryData` offset is always the last head word, so its value tells
+  // us the head size: V3.1/V4 have a 12-word head (offset 0x180), V2 a
+  // 10-word head (offset 0x140). Reading V2 with V3.1 offsets shifts every
+  // bool one word left — a resolved V2 market then reads as paused
+  // (w7 lands on rewardToken, verified on-chain against market 557759).
+  const V3_HEAD = 12 * 32;
+  const V2_HEAD = 10 * 32;
+  let layout: { manual: number; resolved: number; paused: number; reset: number };
+  let ancillaryOffset: number;
+  if (Number(uintWord(word(11))) === V3_HEAD) {
+    layout = { manual: 4, resolved: 5, paused: 6, reset: 7 };
+    ancillaryOffset = V3_HEAD;
+  } else if (Number(uintWord(word(9))) === V2_HEAD) {
+    // V2 (0x6a9d2226…): requestTimestamp, reward, proposalBond,
+    // emergencyResolutionTimestamp, resolved, paused, reset, rewardToken,
+    // creator, ancillaryData
+    layout = { manual: 3, resolved: 4, paused: 5, reset: 6 };
+    ancillaryOffset = V2_HEAD;
+  } else {
+    return null;
+  }
+
   const ancillaryLength = Number(
     uintWord(wordAt(result, tupleOffset + ancillaryOffset))
   );
@@ -143,10 +166,10 @@ function decodeQuestion(result: string): QuestionData | null {
 
   return {
     requestTimestamp: uintWord(word(0)),
-    manualResolutionTimestamp: uintWord(word(4)),
-    resolved: boolWord(word(5)),
-    paused: boolWord(word(6)),
-    reset: boolWord(word(7)),
+    manualResolutionTimestamp: uintWord(word(layout.manual)),
+    resolved: boolWord(word(layout.resolved)),
+    paused: boolWord(word(layout.paused)),
+    reset: boolWord(word(layout.reset)),
     ancillaryDataHex: `0x${ancillaryData}`,
   };
 }
@@ -291,16 +314,33 @@ async function inspectOracleResolutionState(
   }
 }
 
+/**
+ * The adapter's storage key for a market. For negRisk markets `questionID`
+ * encodes the NegRiskOperator marketId+index and getQuestion/getUpdates
+ * return empty structs — the real key is Gamma's `negRiskRequestID`.
+ * Verified on-chain 2026-07-04 (3/3 neg-risk disputed markets read only
+ * via negRiskRequestID).
+ */
+export function adapterQuestionID(
+  input: Pick<Opportunity, "negRisk" | "negRiskRequestID" | "questionID">
+): string | null {
+  if (input.negRisk === true && isHex(input.negRiskRequestID, 32)) {
+    return input.negRiskRequestID;
+  }
+  return isHex(input.questionID, 32) ? input.questionID : null;
+}
+
 export async function inspectOracleResolutionStates(
   opportunities: Opportunity[],
   concurrency = 4
 ): Promise<Map<string, OracleStateInspection>> {
   const unique = new Map<string, { adapter: string; questionID: string }>();
   for (const opp of opportunities) {
-    if (!isHex(opp.resolvedBy, 20) || !isHex(opp.questionID, 32)) continue;
-    unique.set(`${opp.resolvedBy.toLowerCase()}:${opp.questionID}`, {
+    const qid = adapterQuestionID(opp);
+    if (!isHex(opp.resolvedBy, 20) || !qid) continue;
+    unique.set(`${opp.resolvedBy.toLowerCase()}:${qid}`, {
       adapter: opp.resolvedBy,
-      questionID: opp.questionID,
+      questionID: qid,
     });
   }
 

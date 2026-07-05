@@ -3,6 +3,31 @@ import { GAMMA_API, CLOB_API } from "./config";
 
 const eventTagCache = new Map<string, EventTag[]>();
 
+/** True when the Gamma status-history field records a dispute. Accepts the
+ * raw field shape (JSON-encoded string or array). */
+function statusesHistoryHasDisputed(
+  raw: string | string[] | null | undefined
+): boolean {
+  let list: string[];
+  if (Array.isArray(raw)) {
+    list = raw.map(String);
+  } else if (typeof raw === "string" && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      list = Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      list = [];
+    }
+  } else {
+    list = [];
+  }
+  return list.some((s) => s.trim().toLowerCase() === "disputed");
+}
+
+/** Gamma's server-side page size cap: `limit` values above this are silently
+ * clamped, so pagination must stride by it or it terminates early. */
+const GAMMA_PAGE_CAP = 100;
+
 /**
  * Polymarket API client.
  * All methods are read-only — no authentication needed.
@@ -83,36 +108,63 @@ export class PolymarketClient {
       ascending: String(ascending),
     });
 
-    const data = await this.fetchJson<GammaMarket[] | null>(
-      `${GAMMA_API}/markets?${params}`
-    );
-    return Array.isArray(data) ? data : [];
+    try {
+      const data = await this.fetchJson<GammaMarket[] | null>(
+        `${GAMMA_API}/markets?${params}`
+      );
+      return Array.isArray(data) ? data : [];
+    } catch (err) {
+      // Gamma rejects offsets past ~2000 with 422 (pagination cap added
+      // mid-2026). Treat it as end-of-data so deep scans degrade to the
+      // API's ceiling instead of failing outright.
+      if (err instanceof Error && err.message.includes("HTTP 422")) {
+        return [];
+      }
+      throw err;
+    }
   }
 
   /**
-   * Fetch pages in parallel for a single sort dimension.
+   * Fetch pages in parallel bursts for a single sort dimension.
+   *
+   * Gamma silently caps the page size (currently 100) no matter what `limit`
+   * asks for. The old implementation requested `pageLimit` (500) rows per
+   * page and treated any shorter page as "end of data", so it stopped after
+   * one 100-row page and the whole scan quietly shrank to ~200 markets. We
+   * page by the observed cap instead and keep going until a genuinely short
+   * page signals the end.
    */
   private async fetchMarketsBySort(
     order: string,
     ascending: boolean,
     maxCount: number
   ): Promise<GammaMarket[]> {
-    const { pageLimit } = this.config;
-    const pageCount = Math.ceil(maxCount / pageLimit);
-    const offsets = Array.from({ length: pageCount }, (_, i) => i * pageLimit);
-
-    const pages = await Promise.all(
-      offsets.map((offset) =>
-        this.fetchMarketsPage(pageLimit, offset, order, ascending)
-      )
-    );
-
+    const pageSize = Math.min(this.config.pageLimit, GAMMA_PAGE_CAP);
+    const { concurrency } = this.config;
     const all: GammaMarket[] = [];
-    for (const page of pages) {
-      all.push(...page);
-      if (page.length < pageLimit) break;
+    let offset = 0;
+
+    while (all.length < maxCount) {
+      const remainingPages = Math.ceil((maxCount - all.length) / pageSize);
+      const burst = Math.max(1, Math.min(concurrency, remainingPages));
+      const offsets = Array.from({ length: burst }, (_, i) => offset + i * pageSize);
+      const pages = await Promise.all(
+        offsets.map((o) => this.fetchMarketsPage(pageSize, o, order, ascending))
+      );
+
+      let sawShortPage = false;
+      for (const page of pages) {
+        all.push(...page);
+        if (page.length < pageSize) {
+          sawShortPage = true;
+          break;
+        }
+      }
+      if (sawShortPage) break;
+      offset += burst * pageSize;
     }
-    return all;
+
+    return all.slice(0, maxCount);
   }
 
   /**
@@ -141,6 +193,82 @@ export class PolymarketClient {
     }
 
     return merged;
+  }
+
+  /**
+   * Fetch ALL open markets currently in a given UMA resolution status via
+   * Gamma's `uma_resolution_status` filter. This is the coverage backstop for
+   * the Official Ruling class: disputed markets are few (tens), and the two
+   * sort dimensions of fetchAllMarkets can miss ones that are neither
+   * high-volume nor near-expiry.
+   *
+   * `complete` is false when a page failed (or the offset cap cut us off) —
+   * the caller surfaces that so coverage degradation is auditable instead of
+   * silently shrinking the dispute-flow census.
+   */
+  async fetchMarketsByUmaResolutionStatus(
+    status: string
+  ): Promise<{ markets: GammaMarket[]; complete: boolean }> {
+    const pageSize = Math.min(this.config.pageLimit, GAMMA_PAGE_CAP);
+    const all: GammaMarket[] = [];
+    for (let offset = 0; ; offset += pageSize) {
+      const params = new URLSearchParams({
+        limit: String(pageSize),
+        offset: String(offset),
+        active: "true",
+        closed: "false",
+        uma_resolution_status: status,
+      });
+      let page: GammaMarket[];
+      try {
+        const data = await this.fetchJson<GammaMarket[] | null>(
+          `${GAMMA_API}/markets?${params}`
+        );
+        page = Array.isArray(data) ? data : [];
+      } catch (err) {
+        // Backstop fetch must never sink the whole scan; the main list still
+        // carries most disputed markets — but the shortfall must be visible.
+        console.warn(
+          `[client] uma_resolution_status=${status} backstop failed at offset ${offset}: ${err instanceof Error ? err.message : String(err)}`
+        );
+        return { markets: all, complete: false };
+      }
+      all.push(...page);
+      if (page.length < pageSize) break;
+    }
+    return { markets: all, complete: true };
+  }
+
+  /**
+   * Coverage backstop for the full dispute-flow class ("cohort C"):
+   * - `disputed`: every open market whose CURRENT status is disputed. This
+   *   also covers "reset, waiting for re-proposal" (the single-value field
+   *   stays `disputed` there) and second disputes awaiting the DVM.
+   * - `replay`: markets re-proposed after a dispute reset — their current
+   *   status is back to `proposed` (a ~2h liveness window per round), so the
+   *   disputed query can't see them. Gamma has NO server-side filter for
+   *   "history contains disputed" (the plural query param does not exist —
+   *   verified 2026-07-04: it is silently ignored), so we fetch the full
+   *   proposed set (~600-800 rows, well under the offset-2000/422 cap) and
+   *   filter client-side on the umaResolutionStatuses history field.
+   */
+  async fetchDisputeFlowBackstop(): Promise<{
+    disputed: GammaMarket[];
+    replay: GammaMarket[];
+    complete: boolean;
+  }> {
+    const [disputedRes, proposedRes] = await Promise.all([
+      this.fetchMarketsByUmaResolutionStatus("disputed"),
+      this.fetchMarketsByUmaResolutionStatus("proposed"),
+    ]);
+    const replay = proposedRes.markets.filter((m) =>
+      statusesHistoryHasDisputed(m.umaResolutionStatuses)
+    );
+    return {
+      disputed: disputedRes.markets,
+      replay,
+      complete: disputedRes.complete && proposedRes.complete,
+    };
   }
 
   // ── Event Tags ──
@@ -267,17 +395,53 @@ export class PolymarketClient {
   }
 
   /**
+   * Fetch Gamma markets by a list of UMA questionIDs (repeated
+   * `question_ids` params). Used by the on-chain event sweep to map
+   * QuestionReset / AncillaryDataUpdated events back to markets. No
+   * active/closed restriction — an event may belong to a market that
+   * resolved minutes ago, and that is still worth surfacing.
+   */
+  async fetchMarketsByQuestionIds(questionIds: string[]): Promise<GammaMarket[]> {
+    const unique = Array.from(new Set(questionIds.filter(Boolean)));
+    if (unique.length === 0) return [];
+    const result: GammaMarket[] = [];
+    const seen = new Set<string>();
+    const chunkSize = 20;
+
+    for (let i = 0; i < unique.length; i += chunkSize) {
+      const chunk = unique.slice(i, i + chunkSize);
+      const params = new URLSearchParams();
+      for (const id of chunk) params.append("question_ids", id);
+      params.set("limit", String(chunk.length));
+      try {
+        const data = await this.fetchJson<GammaMarket[] | null>(
+          `${GAMMA_API}/markets?${params}`
+        );
+        for (const market of Array.isArray(data) ? data : []) {
+          if (!market.conditionId || seen.has(market.conditionId)) continue;
+          seen.add(market.conditionId);
+          result.push(market);
+        }
+      } catch {
+        // best-effort mapping; unmatched ids stay visible upstream
+      }
+    }
+    return result;
+  }
+
+  /**
    * Fetch the order book for a single token.
    *
    * CLOB `/book` returns a ms-precision `timestamp` field (sometimes empty
    * for illiquid markets). When it's present and the snapshot is older than
-   * MAX_BOOK_AGE_MS, we treat the result as stale and return null — the
-   * scanner will skip the candidate rather than emit a stale opportunity.
-   * Empty / unparseable timestamps are tolerated (Polymarket returns them
-   * for freshly-created or low-volume markets).
+   * `maxAgeMs`, we treat the result as stale and return null — the scanner
+   * will skip the candidate rather than emit a stale opportunity. Empty /
+   * unparseable timestamps are tolerated (Polymarket returns them for
+   * freshly-created or low-volume markets). Disputed markets trade rarely, so
+   * their snapshots are routinely older than the 60s default — callers pass a
+   * larger `maxAgeMs` for those instead of silently dropping them.
    */
-  async fetchBook(tokenId: string): Promise<OrderBook | null> {
-    const MAX_BOOK_AGE_MS = 60_000;
+  async fetchBook(tokenId: string, maxAgeMs = 60_000): Promise<OrderBook | null> {
     try {
       const params = new URLSearchParams({ token_id: tokenId });
       const data = await this.fetchJson<OrderBook>(
@@ -289,7 +453,7 @@ export class PolymarketClient {
         const ts = Number(tsRaw);
         if (Number.isFinite(ts) && ts > 0) {
           const age = Date.now() - ts;
-          if (age > MAX_BOOK_AGE_MS) return null;
+          if (age > maxAgeMs) return null;
         }
       }
       return data;
@@ -327,7 +491,8 @@ export class PolymarketClient {
    * Fetch order books for multiple tokens concurrently.
    */
   async fetchBooksBatch(
-    tokenIds: string[]
+    tokenIds: string[],
+    maxAgeMs?: number
   ): Promise<Map<string, OrderBook>> {
     const result = new Map<string, OrderBook>();
     const { concurrency } = this.config;
@@ -335,7 +500,7 @@ export class PolymarketClient {
     for (let i = 0; i < tokenIds.length; i += concurrency) {
       const batch = tokenIds.slice(i, i + concurrency);
       const books = await Promise.all(
-        batch.map((id) => this.fetchBook(id))
+        batch.map((id) => this.fetchBook(id, maxAgeMs))
       );
       batch.forEach((id, idx) => {
         if (books[idx]) {

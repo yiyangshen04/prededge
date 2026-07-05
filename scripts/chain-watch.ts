@@ -34,17 +34,23 @@ const TOPIC_ANCILLARY_UPDATED =
   "0x0059e11815211969c0c4aaf3f498b52b6c2f2d14f286275d0862d70de22a836b";
 const GET_QUESTION_SELECTOR = "0x58c039cd";
 
-// publicnode only serves getLogs windows hugging the chain head (~127
-// blocks). A 3-minute cron produces ~90 new blocks per tick, so normal
-// operation fits in one window; after downtime we accept the gap (noted in
-// the email) instead of failing on deep lookback.
-const HEAD_WINDOW = 120;
+// Max lookback after downtime: ~600 blocks ≈ 20 minutes. publicnode only
+// serves getLogs hugging the chain head (~127 blocks), so deeper pages fall
+// through to the fallback RPCs (drpc etc.) that allow ~100-block windows at
+// any depth. Beyond 600 blocks we accept the gap (noted in the email)
+// instead of hammering free tiers with a huge catch-up sweep.
+const HEAD_WINDOW = 600;
 
 function rpcUrls(): string[] {
   const configured = process.env.ONCHAIN_RPC_URLS?.trim();
   if (configured) return configured.split(",").map((u) => u.trim()).filter(Boolean);
+  // 2026-07-05 sufe 直连实测:publicnode 近头快但深窗口要 token;nodies/tenderly
+  // 支持 600 块深回看(HEAD_WINDOW 的依托);1rpc 免费额度小,只作末位兜底。
+  // drpc/polygon-rpc.com/llamarpc/blastapi/blockpi/ankr 均不可用或需 key。
   return [
     "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon-pokt.nodies.app",
+    "https://gateway.tenderly.co/public/polygon",
     "https://1rpc.io/matic",
   ];
 }
@@ -152,20 +158,37 @@ async function main(): Promise<void> {
   }
 
   // Fetch in ≤48-block windows — the strictest free-tier getLogs cap seen
-  // (1rpc allows 50; publicnode ~127 near the head).
+  // (1rpc allows 50; publicnode ~127 near the head). A window that fails on
+  // every RPC stops the sweep, but progress up to it is kept: the swept
+  // range is processed and persisted, the rest retried next tick — so one
+  // bad page no longer voids the whole tick (that's how 12% of blocks got
+  // permanently skipped in the first day of deployment).
   const logs: Array<{ address: string; topics: string[] }> = [];
   const WINDOW = 48;
+  let sweptTo = from - 1;
+  let sweepError: string | null = null;
   for (let start = from; start <= head; start += WINDOW) {
     const end = Math.min(start + WINDOW - 1, head);
-    const page = await rpc<Array<{ address: string; topics: string[] }>>("eth_getLogs", [
-      {
-        fromBlock: `0x${start.toString(16)}`,
-        toBlock: `0x${end.toString(16)}`,
-        address: KNOWN_ADAPTERS,
-        topics: [[TOPIC_QUESTION_RESET, TOPIC_ANCILLARY_UPDATED]],
-      },
-    ]);
-    logs.push(...page);
+    try {
+      const page = await rpc<Array<{ address: string; topics: string[] }>>("eth_getLogs", [
+        {
+          fromBlock: `0x${start.toString(16)}`,
+          toBlock: `0x${end.toString(16)}`,
+          address: KNOWN_ADAPTERS,
+          topics: [[TOPIC_QUESTION_RESET, TOPIC_ANCILLARY_UPDATED]],
+        },
+      ]);
+      logs.push(...page);
+      sweptTo = end;
+    } catch (err) {
+      sweepError = err instanceof Error ? err.message : String(err);
+      break;
+    }
+  }
+  if (sweptTo < from) {
+    // Zero progress — keep old state untouched and exit non-zero so the
+    // heartbeat marker/ping is NOT refreshed for this tick.
+    throw new Error(`sweep made no progress: ${sweepError}`);
   }
 
   // Group events by questionID
@@ -228,7 +251,7 @@ async function main(): Promise<void> {
     return true;
   });
 
-  state.lastBlock = head;
+  state.lastBlock = sweptTo;
   // Bound the notified map (~keep last 500 entries)
   const keys = Object.keys(state.notified);
   if (keys.length > 500) {
@@ -237,7 +260,9 @@ async function main(): Promise<void> {
   saveState(state);
 
   if (notable.length === 0) {
-    console.log(JSON.stringify({ mode: "chain-watch", from, to: head, events: logs.length, notified: 0, gap }));
+    console.log(
+      JSON.stringify({ mode: "chain-watch", from, to: sweptTo, events: logs.length, notified: 0, gap, sweep_error: sweepError ?? undefined })
+    );
     return;
   }
 
@@ -267,7 +292,7 @@ async function main(): Promise<void> {
     .join("\n");
 
   const html = `<div style="font-family:system-ui,sans-serif;max-width:640px">
-    <p>链上监听(纯 RPC 模式,无价格数据)在块 ${from}–${head} 发现:</p>
+    <p>链上监听(纯 RPC 模式,无价格数据)在块 ${from}–${sweptTo} 发现:</p>
     ${gap > 0 ? `<p style="color:#d97706">⚠️ 距上次运行跳过了 ${gap} 个块(停机追赶超出免费 RPC 回看窗口)。</p>` : ""}
     <table style="width:100%;border-collapse:collapse">${rows}</table>
     <p style="font-size:12px;color:#888">直接买入前先在 App 确认盘口价格;分歧机会请核对官方文本与市场方向。</p>
@@ -279,7 +304,16 @@ async function main(): Promise<void> {
 
   await sendMail({ subject, html, text });
   console.log(
-    JSON.stringify({ mode: "chain-watch", from, to: head, events: logs.length, notified: notable.length, directional: directional.length, gap })
+    JSON.stringify({
+      mode: "chain-watch",
+      from,
+      to: sweptTo,
+      events: logs.length,
+      notified: notable.length,
+      directional: directional.length,
+      gap,
+      sweep_error: sweepError ?? undefined,
+    })
   );
 }
 

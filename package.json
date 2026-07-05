@@ -6,17 +6,23 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "scan:notify": "tsx scripts/scan-notify.ts",
+    "mail:test": "tsx scripts/send-test-mail.ts"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
     "next": "16.2.3",
+    "nodemailer": "^9.0.3",
     "react": "19.2.4",
     "react-dom": "19.2.4",
-    "recharts": "^3.8.1"
+    "recharts": "^3.8.1",
+    "tsx": "^4.23.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
+    "@types/nodemailer": "^8.0.1",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",

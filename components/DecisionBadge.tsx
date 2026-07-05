@@ -1,9 +1,12 @@
 "use client";
 
+/** Decision status → tone mapping. Single source of the status color system:
+ * actionable=green, observe=amber, rejected=red. The dot + chip pairing is
+ * what other status-ish chips (coverage, sweep) echo across the dashboard. */
 const styles = {
-  actionable: "bg-accent-green-dim text-accent-green",
-  observe: "bg-accent-amber-dim text-accent-amber",
-  rejected: "bg-accent-red-dim text-accent-red",
+  actionable: "chip chip-green",
+  observe: "chip chip-amber",
+  rejected: "chip chip-red",
 } as const;
 
 export function DecisionBadge({
@@ -12,9 +15,8 @@ export function DecisionBadge({
   decision: "actionable" | "observe" | "rejected";
 }) {
   return (
-    <span
-      className={`inline-block px-2 py-0.5 rounded text-xs font-medium uppercase tracking-wider ${styles[decision]}`}
-    >
+    <span className={styles[decision]}>
+      <span className="chip-dot" />
       {decision}
     </span>
   );

@@ -11,10 +11,10 @@ export function ScanButton({
     <button
       onClick={onClick}
       disabled={loading}
-      className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+      className={`h-9 px-4 rounded-lg text-sm font-medium transition-all ${
         loading
-          ? "bg-bg-card text-text-muted cursor-not-allowed"
-          : "bg-accent-blue text-white hover:bg-accent-blue/80"
+          ? "bg-bg-card border border-border text-text-muted cursor-not-allowed"
+          : "bg-accent-blue text-white shadow-sm hover:brightness-110 active:scale-[0.98]"
       }`}
     >
       {loading ? (

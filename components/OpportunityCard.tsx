@@ -5,12 +5,18 @@ import type { Opportunity } from "@/lib/types";
 import type { LiveMetrics } from "@/lib/liveRecompute";
 import { DecisionBadge } from "./DecisionBadge";
 import { TradeModal } from "./TradeModal";
-import { isHiddenTag } from "@/lib/virtualTags";
+import { isDirectionalStance, isHiddenTag } from "@/lib/virtualTags";
 
 /** Tags in `decision_reasons` that are informational (rendered as a badge
  * at the top of the card) rather than a downgrade cause. We strip them from
  * the "Decision reasons" chip strip at the bottom to avoid double-display. */
-const INFO_REASON_TAGS = new Set(["rewards_incentivized", "model_backed"]);
+const INFO_REASON_TAGS = new Set([
+  "rewards_incentivized",
+  "model_backed",
+  "official_direction_backed",
+  "official_divergence_play",
+  "divergence_leg_needs_text_backing",
+]);
 /** UMA status prefix lives in `decision_reasons` as `oracle_proposed` /
  * `oracle_disputed`. Rendered as a top badge; hidden from the bottom strip. */
 function isOracleReason(r: string): boolean {
@@ -29,6 +35,37 @@ function isOracleSecondDispute(opp: Opportunity): boolean {
     opp.oracleResolutionState === "second_dispute" ||
     opp.decisionReasons?.includes("oracle_second_dispute") === true
   );
+}
+
+/** Divergence-leg detection. `divergenceLeg` isn't persisted to the DB, so
+ * rows loaded via GET must be recognized through the decision_reasons channel
+ * (the same compatibility trick the oracle badges use). */
+export function isDivergencePlay(opp: Opportunity): boolean {
+  return opp.decisionReasons?.includes("official_divergence_play") === true;
+}
+export function isDivergenceUnbacked(opp: Opportunity): boolean {
+  return (
+    opp.decisionReasons?.includes("divergence_leg_needs_text_backing") === true
+  );
+}
+export function isDivergenceLegOpp(opp: Opportunity): boolean {
+  return (
+    opp.divergenceLeg === true ||
+    isDivergencePlay(opp) ||
+    isDivergenceUnbacked(opp)
+  );
+}
+
+/** Badge label for a directional official stance; null for the rest. */
+function officialStanceLabel(stance: string): string | null {
+  if (stance === "YES" || stance === "NO") return `Official → ${stance}`;
+  if (stance === "leans_YES") return "Official ≈ YES";
+  if (stance === "leans_NO") return "Official ≈ NO";
+  if (stance.startsWith("resolve_to_")) {
+    const target = stance.slice("resolve_to_".length).replace(/_/g, " ");
+    return `Official → ${target.toUpperCase()}`;
+  }
+  return null;
 }
 
 /** Compute expiry display from raw endDate for maximum precision */
@@ -72,6 +109,23 @@ function sameTiming(a: string | null | undefined, b: string | null | undefined):
   return !isNaN(at) && !isNaN(bt) && Math.abs(at - bt) < 60_000;
 }
 
+/** Unified card badge: one chip family, tone picks the accent. */
+function Chip({
+  tone,
+  title,
+  children,
+}: {
+  tone: "green" | "amber" | "red" | "blue" | "gold" | "neutral";
+  title?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <span title={title} className={`chip chip-${tone}`}>
+      {children}
+    </span>
+  );
+}
+
 interface OpportunityCardProps {
   opp: Opportunity;
   /** Size-adjusted metrics; card falls back to stored values if absent. */
@@ -93,6 +147,9 @@ export function OpportunityCard({
   const shownNetReturn = live?.netReturnPct ?? opp.netReturnPct;
   const shownSlippageBps = live?.slippageBps ?? opp.slippageBps;
   const shownPrice = live?.avgFillPrice ?? opp.price;
+
+  const divergencePlay = isDivergencePlay(opp);
+  const divergenceUnbacked = isDivergenceUnbacked(opp);
 
   const yieldColor =
     shownAnnualizedYield >= 50
@@ -133,20 +190,24 @@ export function OpportunityCard({
   const buttonStyle = (outcome: string): string => {
     const lower = outcome.toLowerCase();
     if (lower === "yes") {
-      return "bg-accent-green/10 text-accent-green border border-accent-green/30 hover:bg-accent-green/20";
+      return "bg-accent-green/10 text-accent-green border border-accent-green/30 hover:bg-accent-green/20 hover:border-accent-green/50";
     }
     if (lower === "no") {
-      return "bg-accent-red/10 text-accent-red border border-accent-red/30 hover:bg-accent-red/20";
+      return "bg-accent-red/10 text-accent-red border border-accent-red/30 hover:bg-accent-red/20 hover:border-accent-red/50";
     }
-    return "bg-accent-blue/10 text-accent-blue border border-accent-blue/30 hover:bg-accent-blue/20";
+    return "bg-accent-blue/10 text-accent-blue border border-accent-blue/30 hover:bg-accent-blue/20 hover:border-accent-blue/50";
   };
 
   return (
-    <div className="bg-bg-card border border-border rounded-lg p-4 hover:border-accent-blue/40 transition-colors">
-      {/* Header */}
-      <div className="flex items-start justify-between gap-3 mb-3">
-        <div className="flex-1 min-w-0">
-          <h3 className="text-sm font-medium text-text-primary leading-tight line-clamp-2">
+    <div
+      className={`card card-hover p-4 ${divergencePlay ? "card-divergence" : ""}`}
+    >
+      {/* Header. flex-wrap + basis on the title lets a badge-heavy dispute
+          card drop its chip cluster to a second line instead of squeezing
+          the question out of view on narrow screens. */}
+      <div className="flex items-start justify-between gap-x-3 gap-y-1.5 mb-3 flex-wrap">
+        <div className="flex-1 min-w-0 basis-56">
+          <h3 className="text-sm font-medium text-text-primary leading-snug line-clamp-2">
             {opp.question}
           </h3>
           {opp.eventTitle && opp.eventTitle !== opp.question && (
@@ -158,12 +219,28 @@ export function OpportunityCard({
             </div>
           )}
         </div>
-        <div className="flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
+        <div className="flex items-center gap-1.5 flex-wrap justify-end max-w-full">
           {/* Badges derive from either the in-memory Opportunity fields (fresh
               POST /api/scan responses carry them) OR the decision_reasons
               persisted list (the compatibility channel that works across
               storage schemas). `oracleReason` prefix-matches
               `oracle_proposed` / `oracle_disputed` coming through reasons. */}
+          {divergencePlay && (
+            <Chip
+              tone="gold"
+              title="Site-wide top-priority signal: this is the trailing (<0.5) leg of a disputed market AND a high-confidence official TEXT stance backs this side. Historically official-direction calls settled 32/32 the official way."
+            >
+              ★ Divergence Play
+            </Chip>
+          )}
+          {divergenceUnbacked && (
+            <Chip
+              tone="neutral"
+              title="Trailing (<0.5) leg of a disputed market whose payoff depends on the ruling landing this way — but no high-confidence official text backs this side, so it is capped at observe. Not actionable until officials write a directional context."
+            >
+              Divergence · unbacked
+            </Chip>
+          )}
           {(() => {
             const oracleReason = opp.decisionReasons?.find(isOracleReason);
             const normalizedUma = opp.umaResolutionStatus?.trim();
@@ -176,7 +253,8 @@ export function OpportunityCard({
                   ? oracleReason.replace(/^oracle_/, "")
                   : null;
             return uma ? (
-              <span
+              <Chip
+                tone="red"
                 title={
                   secondDispute
                     ? "Re-proposal after the first dispute was disputed again — question has been escalated to UMA DVM full vote (48-72h)."
@@ -184,51 +262,72 @@ export function OpportunityCard({
                       ? "Gamma reports this market as disputed, but chain state shows the adapter request was reset and no active UMA proposal is currently live."
                       : "Gamma reports this market in UMA oracle resolution flow."
                 }
-                className="text-[10px] px-1.5 py-0.5 rounded bg-accent-red/15 text-accent-red border border-accent-red/30 uppercase tracking-wider"
               >
                 Oracle {uma}
-              </span>
+              </Chip>
             ) : null;
           })()}
           {isOracleResetStalled(opp) && (
-            <span
+            <Chip
+              tone="amber"
               title={
                 opp.oracleResolutionDetails ??
                 "First UMA dispute reset this market's adapter request, but the current request has no active proposal and no available price."
               }
-              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
             >
               Oracle Reset
-            </span>
+            </Chip>
           )}
           {isOracleSecondDispute(opp) && (
-            <span
+            <Chip
+              tone="amber"
               title={
                 opp.oracleResolutionDetails ??
                 "Adapter was reset by the first dispute, the re-proposed price was disputed again, and the question is now in UMA DVM full-vote (48-72h). Outcome is no longer locally inferable."
               }
-              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
             >
               Second Dispute
-            </span>
+            </Chip>
+          )}
+          {opp.officialContext &&
+            isDirectionalStance(opp.officialContext.stance) &&
+            officialStanceLabel(opp.officialContext.stance) && (
+              <Chip
+                tone="green"
+                title={
+                  opp.officialContext.via === "price_fallback"
+                    ? "Direction inferred from the extreme price of an already-disputed market — no explicit official text. Weight it lower than a written ruling."
+                    : "Polymarket officials wrote an on-chain additional-context note implying this resolution direction. Historically 32/32 such calls settled the official way."
+                }
+              >
+                {officialStanceLabel(opp.officialContext.stance)}
+              </Chip>
+            )}
+          {opp.officialContext?.refundClause && (
+            <Chip
+              tone="amber"
+              title="The official context mentions refunding losing positions (or a 50/50 split). The opposing side then carries no real risk and the spread is not edge."
+            >
+              Refund Risk
+            </Chip>
           )}
           {(opp.rewardsIncentivized ||
             opp.decisionReasons?.includes("rewards_incentivized")) && (
-            <span
+            <Chip
+              tone="blue"
               title="Polymarket liquidity-rewards program active — top of book is bot-maintained. You can still fill, but the price isn't a mispricing."
-              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-blue/15 text-accent-blue border border-accent-blue/30 uppercase tracking-wider"
             >
               Rewards
-            </span>
+            </Chip>
           )}
           {(opp.negRisk ||
             opp.decisionReasons?.includes("neg_risk_bucket")) && (
-            <span
+            <Chip
+              tone="neutral"
               title="Multi-outcome (negRisk) market — this is one of many mutually-exclusive buckets; a ~0.95 No is a mathematical tail, not a mispricing"
-              className="text-[10px] px-1.5 py-0.5 rounded bg-text-muted/15 text-text-muted border border-text-muted/30 uppercase tracking-wider"
             >
               Multi
-            </span>
+            </Chip>
           )}
           {(() => {
             // Sports non-moneyline markets: spreads/totals/child_moneyline.
@@ -252,12 +351,12 @@ export function OpportunityCard({
                   ? "Totals"
                   : smt.replace(/_/g, " ");
             return (
-              <span
+              <Chip
+                tone="amber"
                 title="Non-moneyline sports wager — outcome labels are team/side names but the price includes point-spread or over/under compensation. Not a moneyline probability."
-                className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
               >
                 {label}
-              </span>
+              </Chip>
             );
           })()}
           {(() => {
@@ -276,75 +375,122 @@ export function OpportunityCard({
             const mins = !isNaN(t) ? (t - new Date().getTime()) / 60_000 : null;
             if (isInPlayReason || (mins != null && mins <= 0)) {
               return (
-                <span
+                <Chip
+                  tone="red"
                   title="gameStartTime has passed — sports are in-play, or a snapshot market's observation window is open. The ask price tracks live data (score, temp, tweet count) and drifts faster than our scan cadence, so this snapshot is stale within minutes."
-                  className="text-[10px] px-1.5 py-0.5 rounded bg-accent-red/15 text-accent-red border border-accent-red/30 uppercase tracking-wider"
                 >
                   In-play
-                </span>
+                </Chip>
               );
             }
             if (mins != null && mins < 60) {
               const label =
                 mins < 60 ? `Kicks in ${Math.ceil(mins)}m` : `Kicks in ${Math.round(mins / 60)}h`;
               return (
-                <span
+                <Chip
+                  tone="amber"
                   title="gameStartTime is imminent. Once it passes, the ask will start tracking live data (game score / observation-window measurements) and this snapshot depth will drift."
-                  className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
                 >
                   {label}
-                </span>
+                </Chip>
               );
             }
             return null;
           })()}
           {opp.staleRawEndDate && (
-            <span
+            <Chip
+              tone="green"
               title="Gamma endDate looked stale, so the scanner used the title/rules/lifecycle data to infer the current event cutoff."
-              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-green/15 text-accent-green border border-accent-green/30 uppercase tracking-wider"
             >
               Corrected
-            </span>
+            </Chip>
           )}
           {opp.recurrentLike && !opp.postponed && (
-            <span
+            <Chip
+              tone="blue"
               title="Recurring or rolled-forward market. The displayed event cutoff is inferred from the current cycle rather than the stale raw Gamma endDate."
-              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-blue/15 text-accent-blue border border-accent-blue/30 uppercase tracking-wider"
             >
               Recurrent
-            </span>
+            </Chip>
           )}
           {opp.postponed && (
-            <span
+            <Chip
+              tone="amber"
               title="Original event date moved after Gamma's raw endDate. Treat this as rescheduled/open rather than awaiting resolution."
-              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
             >
               Rescheduled
-            </span>
+            </Chip>
           )}
           {opp.awaitingResolution && (
-            <span
+            <Chip
+              tone="amber"
               title="Inferred event cutoff has passed, market is still accepting orders, and the book price is highly converged."
-              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-amber/15 text-accent-amber border border-accent-amber/30 uppercase tracking-wider"
             >
               Awaiting
-            </span>
+            </Chip>
           )}
           {opp.modelOverlay && (
-            <span
+            <Chip
+              tone="blue"
               title={`Saylor BTC-weekly model fair value for this outcome: ${(
                 opp.modelOverlay.fairValue * 100
               ).toFixed(0)}% (model P(YES) = ${(
                 opp.modelOverlay.fairValueYes * 100
               ).toFixed(0)}%). The scanner has no probability model of its own; this is the one market where the Saylor predictor supplies a fair value.`}
-              className="text-[10px] px-1.5 py-0.5 rounded bg-accent-blue/15 text-accent-blue border border-accent-blue/30 uppercase tracking-wider"
             >
               Model
-            </span>
+            </Chip>
           )}
           <DecisionBadge decision={opp.decision} />
         </div>
       </div>
+
+      {/* Divergence-play spotlight: official stance vs. market price and the
+          payout multiple if the ruling lands. This is the highest-priority
+          signal on the site, so it gets its own gold block above the metric
+          grid rather than a footnote. */}
+      {divergencePlay && opp.officialContext && (
+        <div className="mb-3 rounded-lg border border-accent-gold/40 bg-accent-gold/10 px-3 py-2.5">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <div className="flex items-center gap-2 text-[11px]">
+              <span className="uppercase tracking-[0.12em] font-semibold text-accent-gold">
+                Divergence Play
+              </span>
+              <span className="text-text-secondary">
+                official text backs this trailing leg
+              </span>
+            </div>
+            <div className="flex items-center gap-2.5 font-mono text-xs">
+              <span
+                className="text-text-primary font-semibold"
+                title="Official on-chain stance and classifier confidence"
+              >
+                {opp.officialContext.stance}
+                <span className="text-text-muted font-normal">
+                  {" "}
+                  · {opp.officialContext.confidence} ({opp.officialContext.via})
+                </span>
+              </span>
+            </div>
+          </div>
+          <div className="mt-1.5 flex items-center gap-2.5 font-mono text-sm flex-wrap">
+            <span className="text-text-secondary text-xs">market prices it</span>
+            <span className="text-text-primary font-semibold">
+              {(shownPrice * 100).toFixed(1)}¢
+            </span>
+            <span className="text-text-muted text-xs">→</span>
+            <span
+              className="text-accent-gold font-bold"
+              title={`Payout multiple if the official direction lands: 1 / ${shownPrice.toFixed(3)}`}
+            >
+              {shownPrice > 0 ? (1 / shownPrice).toFixed(1) : "—"}× payout
+            </span>
+            <span className="text-text-muted text-[11px]">
+              if the ruling lands
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Key metrics grid */}
       <div className="grid grid-cols-3 gap-3 mb-3">
@@ -358,6 +504,7 @@ export function OpportunityCard({
           value={`${shownAnnualizedYield.toFixed(1)}%`}
           className={yieldColor}
           mono
+          emphasize
           sub={
             showBaseline
               ? `baseline @ $200: ${opp.annualizedYieldPct.toFixed(1)}%`
@@ -371,7 +518,7 @@ export function OpportunityCard({
         />
       </div>
 
-      <div className="grid grid-cols-4 gap-3 mb-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
         {(() => {
           const eventDeadline = opp.eventDeadline ?? opp.endDate;
           const payoutDeadline =
@@ -424,9 +571,9 @@ export function OpportunityCard({
           "model_contradicts_market"
         );
         return (
-          <div className="mb-3 rounded border border-accent-blue/30 bg-accent-blue/5 px-3 py-2">
+          <div className="mb-3 rounded-lg border border-accent-blue/30 bg-accent-blue/5 px-3 py-2">
             <div className="flex items-center justify-between gap-2 flex-wrap text-[11px]">
-              <span className="uppercase tracking-wider text-text-muted">
+              <span className="uppercase tracking-[0.12em] text-text-muted">
                 Saylor model
               </span>
               <div className="flex items-center gap-2.5 font-mono">
@@ -451,9 +598,7 @@ export function OpportunityCard({
                   {edgePositive ? "+" : ""}
                   {m.edgePp.toFixed(1)}pp
                 </span>
-                <span className="px-1.5 py-0.5 rounded bg-bg-input border border-border uppercase tracking-wider text-text-secondary">
-                  {m.recommendation}
-                </span>
+                <span className="chip chip-neutral">{m.recommendation}</span>
               </div>
             </div>
             <div className="text-[10px] text-text-muted mt-1">
@@ -465,8 +610,62 @@ export function OpportunityCard({
         );
       })()}
 
+      {/* Official additional-context block. The on-chain context text is not
+          exposed by Gamma, so this is the only place the user sees what the
+          officials actually wrote and which way it points. */}
+      {opp.officialContext && (() => {
+        const oc = opp.officialContext;
+        const contradicts = opp.decisionReasons.includes(
+          "official_contradicts_side"
+        );
+        return (
+          <div className="mb-3 rounded-lg border border-accent-green/30 bg-accent-green/5 px-3 py-2">
+            <div className="flex items-center justify-between gap-2 flex-wrap text-[11px]">
+              <span className="uppercase tracking-[0.12em] text-text-muted">
+                Official context
+              </span>
+              <div className="flex items-center gap-2.5 font-mono">
+                <span className="text-text-primary">{oc.stance}</span>
+                <span className="chip chip-neutral">
+                  {oc.via === "price_fallback" ? "price fallback" : oc.confidence}
+                </span>
+                {oc.updateCount > 0 && (
+                  <span className="text-text-muted">
+                    {oc.updateCount} update{oc.updateCount === 1 ? "" : "s"}
+                    {oc.lastUpdateAt
+                      ? ` · ${new Date(oc.lastUpdateAt).toLocaleDateString()}`
+                      : ""}
+                  </span>
+                )}
+              </div>
+            </div>
+            {oc.excerpt && (
+              <div className="text-[10px] text-text-secondary mt-1 line-clamp-3">
+                “{oc.excerpt}”
+              </div>
+            )}
+            {(contradicts || oc.refundClause) && (
+              <div className="text-[10px] mt-1">
+                {contradicts && (
+                  <span className="text-accent-red">
+                    Officials implied the opposite side — never buy against the
+                    ruling.{" "}
+                  </span>
+                )}
+                {oc.refundClause && (
+                  <span className="text-accent-amber">
+                    Refund clause present — the spread is not a real risk
+                    transfer.
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {live?.bookDrained && tradeSizeUsd != null && (
-        <div className="mb-3 text-[11px] text-accent-amber bg-accent-amber/10 border border-accent-amber/30 rounded px-2 py-1">
+        <div className="mb-3 text-[11px] text-accent-amber bg-accent-amber/10 border border-accent-amber/30 rounded-lg px-2.5 py-1.5">
           ⚠ Book drained at ${tradeSizeUsd.toLocaleString()} — only $
           {live.investedUsd.toFixed(2)} would fill from the stored snapshot.
           Yield shown reflects the filled amount only.
@@ -480,7 +679,7 @@ export function OpportunityCard({
             <button
               key={outcome}
               onClick={() => setTradeOutcome(outcome)}
-              className={`flex-1 px-3 py-1.5 rounded text-xs font-medium transition-colors ${buttonStyle(outcome)}`}
+              className={`flex-1 px-3 py-1.5 rounded-md text-xs font-medium font-mono transition-colors ${buttonStyle(outcome)}`}
             >
               Buy {outcome.toUpperCase()} @ ${approxPrice(outcome).toFixed(3)}
             </button>
@@ -497,7 +696,7 @@ export function OpportunityCard({
           href={opp.marketUrl}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-accent-blue hover:underline"
+          className="text-accent-blue hover:underline underline-offset-2"
         >
           View on Polymarket &rarr;
         </a>
@@ -512,7 +711,7 @@ export function OpportunityCard({
             .map((tag) => (
               <span
                 key={tag}
-                className="text-[10px] px-1.5 py-0.5 rounded bg-accent-blue/10 text-accent-blue border border-accent-blue/20"
+                className="text-[10px] px-1.5 py-0.5 rounded-md bg-accent-blue/10 text-accent-blue border border-accent-blue/20"
               >
                 {tag}
               </span>
@@ -521,8 +720,9 @@ export function OpportunityCard({
       )}
 
       {/* Decision reasons — excludes informational tags (rewards, neg_risk,
-          oracle_*) that already render as badges at the top of the card and
-          the encoded `deadline:ISO` metadata which feeds the Expiry cell. */}
+          oracle_*, divergence_*) that already render as badges at the top of
+          the card and the encoded `deadline:ISO` metadata which feeds the
+          Expiry cell. */}
       {(() => {
         const shown = opp.decisionReasons.filter(
           (r) =>
@@ -534,16 +734,15 @@ export function OpportunityCard({
             r !== "oracle_second_dispute" &&
             !r.startsWith("deadline:") &&
             !r.startsWith("sports_") &&
-            r !== "model_contradicts_market"
+            r !== "model_contradicts_market" &&
+            r !== "official_contradicts_side" &&
+            r !== "refund_clause"
         );
         if (shown.length === 0) return null;
         return (
           <div className="mt-2 flex flex-wrap gap-1">
             {shown.map((r) => (
-              <span
-                key={r}
-                className="text-[10px] px-1.5 py-0.5 rounded bg-bg-primary text-text-muted border border-border"
-              >
+              <span key={r} className="chip chip-neutral normal-case tracking-normal">
                 {r}
               </span>
             ))}
@@ -577,21 +776,23 @@ function MetricCell({
   value,
   className = "",
   mono = false,
+  emphasize = false,
   sub,
 }: {
   label: string;
   value: string;
   className?: string;
   mono?: boolean;
+  emphasize?: boolean;
   sub?: string;
 }) {
   return (
     <div>
-      <div className="text-[10px] text-text-muted uppercase tracking-wider">
+      <div className="text-[10px] text-text-muted uppercase tracking-[0.12em]">
         {label}
       </div>
       <div
-        className={`text-sm ${mono ? "font-mono" : ""} ${className || "text-text-primary"}`}
+        className={`${emphasize ? "text-base font-semibold" : "text-sm"} ${mono ? "font-mono" : ""} ${className || "text-text-primary"}`}
       >
         {value}
       </div>

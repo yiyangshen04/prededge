@@ -5,16 +5,23 @@ import type { ScanResponse, FilterState, Opportunity } from "@/lib/types";
 import { StatsBar } from "@/components/StatsBar";
 import { ScanButton } from "@/components/ScanButton";
 import { FilterBar } from "@/components/FilterBar";
-import { OpportunityCard } from "@/components/OpportunityCard";
+import { OnchainEventsBar } from "@/components/OnchainEventsBar";
+import {
+  OpportunityCard,
+  isDivergenceLegOpp,
+  isDivergencePlay,
+} from "@/components/OpportunityCard";
 import {
   recomputeAtSize,
   sortWithDecisionPriority,
 } from "@/lib/liveRecompute";
 import {
   AWAITING_RESOLUTION_TAG,
+  OFFICIAL_RULING_TAG,
   ORACLE_RESET_TAG,
   ORACLE_RESOLUTION_TAG,
   ORACLE_SECOND_DISPUTE_TAG,
+  isDirectionalStance,
   isHiddenTag,
   isVirtualTag,
 } from "@/lib/virtualTags";
@@ -32,9 +39,30 @@ function matchesVirtualTag(opp: Opportunity, tag: string): boolean {
       return isOracleResetStalled(opp);
     case ORACLE_SECOND_DISPUTE_TAG:
       return isOracleSecondDispute(opp);
+    case OFFICIAL_RULING_TAG:
+      return isOfficialRulingSection(opp);
     default:
       return false;
   }
+}
+
+/** The Official Ruling class: a disputed market where the official on-chain
+ * context implies a direction AND this opportunity sits on the favored side.
+ * The contradicted side stays in the main list with its demotion badge. */
+function isOfficialRulingPinned(opp: Opportunity): boolean {
+  return (
+    opp.officialContext != null &&
+    isDirectionalStance(opp.officialContext.stance) &&
+    opp.decisionReasons?.includes("official_direction_backed") === true
+  );
+}
+
+/** Everything shown in the pinned Official Ruling section: officially-backed
+ * favored sides PLUS all divergence legs (trailing <0.5 sides of disputed
+ * markets). Divergence legs belong here by default — the text-backed ones are
+ * the site's top-priority signal and the unbacked ones give the pair context. */
+function isOfficialRulingSection(opp: Opportunity): boolean {
+  return isOfficialRulingPinned(opp) || isDivergenceLegOpp(opp);
 }
 
 function hasOracleResolutionStatus(status: string | null | undefined): boolean {
@@ -60,16 +88,21 @@ function isOracleSecondDispute(opp: Opportunity): boolean {
   );
 }
 
-/** Tags excluded by default when the dashboard loads (first visit only) */
+/** Tags excluded by default when the dashboard loads (first visit only).
+ * "Sports" matches via `sportsMarketType` so individual leagues are covered;
+ * Esports/Soccer are listed because not every such market carries the field.
+ * Weather/crypto variants mirror the tag vocabulary seen in scan data. */
 const DEFAULT_EXCLUDED_TAGS = [
-  "Sports",
-  "Weather", "Daily Temperature",
-  "Crypto", "Bitcoin", "Ethereum", "Crypto Prices",
+  "Sports", "Soccer", "Esports",
+  "Weather", "Daily Temperature", "Highest temperature", "Lowest temperature",
+  "Crypto", "Bitcoin", "Ethereum", "Crypto Prices", "XRP", "Solana",
+  "Dogecoin", "Stablecoins", "Daily-Close",
 ];
 
 /** localStorage key for persisting user's tag selections.
- * v2 resets old saved prefs so Sports starts excluded by default. */
-const TAG_PREFS_KEY = "prededge.tagPrefs.v2";
+ * v3 resets old saved prefs so the expanded weather/sports/crypto exclusion
+ * set applies to existing browsers too. */
+const TAG_PREFS_KEY = "prededge.tagPrefs.v3";
 /** localStorage key for persisting the user's trade-size input */
 const TRADE_SIZE_KEY = "prededge.tradeSize.v1";
 /** Default trade size in USD — matches DEFAULT_SCAN_CONFIG.minDepthUsd */
@@ -250,6 +283,7 @@ export default function Dashboard() {
     const oracleSecondDisputeSelected = filters.tags.includes(
       ORACLE_SECOND_DISPUTE_TAG
     );
+    const officialRulingSelected = filters.tags.includes(OFFICIAL_RULING_TAG);
 
     const keep = opps.filter((opp) => {
       if (
@@ -266,7 +300,8 @@ export default function Dashboard() {
           matchesVirtualTag(opp, ORACLE_RESOLUTION_TAG)) ||
         (oracleResetSelected && matchesVirtualTag(opp, ORACLE_RESET_TAG)) ||
         (oracleSecondDisputeSelected &&
-          matchesVirtualTag(opp, ORACLE_SECOND_DISPUTE_TAG));
+          matchesVirtualTag(opp, ORACLE_SECOND_DISPUTE_TAG)) ||
+        (officialRulingSelected && matchesVirtualTag(opp, OFFICIAL_RULING_TAG));
       if (
         !skipExclusions &&
         filters.excludedTags.length > 0 &&
@@ -297,6 +332,35 @@ export default function Dashboard() {
     tradeSizeUsd,
   ]);
 
+  // Pinned "Official Ruling" section: disputed markets where the official
+  // on-chain context implies the direction and this side is the favored one,
+  // plus all divergence legs (see isOfficialRulingSection).
+  // Deliberately bypasses tag filters (the class is rare and high-signal —
+  // a disputed sports market must not vanish behind the default Sports
+  // exclusion); decision/maxDays filtering still applies server-side via GET.
+  const pinned = useMemo(() => {
+    const opps = (data?.opportunities ?? []).filter(isOfficialRulingSection);
+    const withLive = opps.map((opp) => ({
+      opp,
+      live: recomputeAtSize(opp, tradeSizeUsd),
+    }));
+    // Divergence plays (text-backed trailing legs) lead the section — they
+    // are the site-wide top-priority signal; the rest sort by net return.
+    withLive.sort((a, b) => {
+      const aPlay = isDivergencePlay(a.opp) ? 1 : 0;
+      const bPlay = isDivergencePlay(b.opp) ? 1 : 0;
+      if (aPlay !== bPlay) return bPlay - aPlay;
+      return b.live.netReturnPct - a.live.netReturnPct;
+    });
+    return withLive;
+  }, [data?.opportunities, tradeSizeUsd]);
+
+  const mainList = useMemo(() => {
+    if (pinned.length === 0) return sortedFiltered;
+    const pinnedTokenIds = new Set(pinned.map(({ opp }) => opp.tokenId));
+    return sortedFiltered.filter(({ opp }) => !pinnedTokenIds.has(opp.tokenId));
+  }, [sortedFiltered, pinned]);
+
   // Collect all available tags from current data for the filter UI. Virtual
   // tags (e.g. Awaiting Resolution) get prepended if any opportunity in the
   // current dataset matches — otherwise we hide them to avoid dead chips.
@@ -318,7 +382,11 @@ export default function Dashboard() {
   const hasOracleSecondDispute = (data?.opportunities ?? []).some(
     isOracleSecondDispute
   );
+  const hasOfficialRuling = (data?.opportunities ?? []).some(
+    isOfficialRulingSection
+  );
   const availableTags = [
+    ...(hasOfficialRuling ? [OFFICIAL_RULING_TAG] : []),
     ...(hasAwaiting ? [AWAITING_RESOLUTION_TAG] : []),
     ...(hasOracleResolution ? [ORACLE_RESOLUTION_TAG] : []),
     ...(hasOracleReset ? [ORACLE_RESET_TAG] : []),
@@ -327,11 +395,11 @@ export default function Dashboard() {
   ];
 
   return (
-    <div className="max-w-6xl mx-auto px-6 py-6 space-y-6">
+    <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-5">
       {/* Header */}
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div>
-          <h1 className="text-2xl font-semibold text-text-primary">
+          <h1 className="text-2xl font-semibold tracking-tight text-text-primary">
             Tail Sweeping Scanner
           </h1>
           <p className="text-sm text-text-muted mt-1">
@@ -341,11 +409,11 @@ export default function Dashboard() {
         <div className="flex items-center gap-3">
           <label
             htmlFor="trade-size"
-            className="text-xs text-text-muted uppercase tracking-wider"
+            className="text-[10px] text-text-muted uppercase tracking-[0.12em]"
           >
             Trade Size
           </label>
-          <div className="flex items-center bg-bg-input border border-border rounded px-2">
+          <div className="flex items-center h-9 bg-bg-input border border-border rounded-lg px-2 focus-within:border-accent-blue/60 transition-colors">
             <span className="text-text-muted text-sm">$</span>
             <input
               id="trade-size"
@@ -366,7 +434,7 @@ export default function Dashboard() {
 
       {/* Error */}
       {error && (
-        <div className="bg-accent-red-dim/30 border border-accent-red/30 rounded-lg px-4 py-3 text-sm text-accent-red">
+        <div className="bg-accent-red/10 border border-accent-red/30 rounded-lg px-4 py-3 text-sm text-accent-red">
           {error}
         </div>
       )}
@@ -374,32 +442,88 @@ export default function Dashboard() {
       {/* Stats */}
       <StatsBar scan={data?.scan ?? null} />
 
+      {/* On-chain event sweep since the previous scan. Only fresh POST
+          responses carry the field; hidden for runs loaded from the DB. */}
+      <OnchainEventsBar events={data?.onchainEvents} />
+
       {/* Filters */}
       <FilterBar filters={filters} onChange={setFilters} availableTags={availableTags} />
 
       {/* Results */}
       {loading && !data && (
-        <div className="text-center py-20 text-text-muted">
-          <div className="animate-pulse text-lg">Scanning Polymarket...</div>
+        <div className="card px-6 py-20 text-center text-text-muted">
+          <div className="animate-pulse text-lg text-text-secondary">
+            Scanning Polymarket…
+          </div>
           <div className="text-xs mt-2">
             This may take 30-60 seconds (fetching thousands of markets)
           </div>
         </div>
       )}
 
-      {data && sortedFiltered.length === 0 && (
-        <div className="text-center py-12 text-text-muted">
+      {/* Pinned Official Ruling section — the product core. Always shown when
+          present, regardless of tag filters; includes all divergence legs. */}
+      {pinned.length > 0 && (
+        <section className="section-official p-4 sm:p-5 space-y-3">
+          <div>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span className="text-sm font-bold text-accent-gold uppercase tracking-[0.14em]">
+                Official Ruling
+              </span>
+              <span className="chip chip-neutral">
+                {pinned.length} market{pinned.length === 1 ? "" : "s"}
+              </span>
+              {pinned.some(({ opp }) => isDivergencePlay(opp)) && (
+                <span
+                  className="chip chip-gold"
+                  title="At least one trailing leg here is backed by high-confidence official text — the highest-priority signal on the site."
+                >
+                  ★ divergence play live
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-text-muted mt-1.5 max-w-3xl">
+              Disputed markets where Polymarket&apos;s official on-chain context
+              implies the resolution direction — historically 32/32 settled the
+              official way. Divergence legs (the trailing side of a dispute)
+              are pinned here too: gold-framed ones are text-backed and
+              actionable, unbacked ones stay capped at observe. Shown
+              regardless of tag filters.
+            </p>
+          </div>
+          <div className="space-y-3">
+            {pinned.map(({ opp, live }, idx) => (
+              <OpportunityCard
+                key={`pinned-${opp.tokenId}-${idx}`}
+                opp={opp}
+                live={live}
+                tradeSizeUsd={tradeSizeUsd}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {data && pinned.length === 0 && mainList.length === 0 && (
+        <div className="card border-dashed px-6 py-14 text-center text-text-muted text-sm">
           No opportunities match your filters.
         </div>
       )}
 
-      {sortedFiltered.length > 0 && (
+      {mainList.length > 0 && (
         <div className="space-y-3">
-          <div className="text-xs text-text-muted">
-            Showing {sortedFiltered.length} opportunities &middot; Yields
-            computed at ${tradeSizeUsd.toLocaleString()} trade size
+          <div className="text-[11px] text-text-muted px-0.5">
+            Showing{" "}
+            <span className="font-mono text-text-secondary">
+              {mainList.length}
+            </span>{" "}
+            opportunities &middot; Yields computed at{" "}
+            <span className="font-mono text-text-secondary">
+              ${tradeSizeUsd.toLocaleString()}
+            </span>{" "}
+            trade size
           </div>
-          {sortedFiltered.map(({ opp, live }, idx) => (
+          {mainList.map(({ opp, live }, idx) => (
             <OpportunityCard
               key={`${opp.tokenId}-${idx}`}
               opp={opp}

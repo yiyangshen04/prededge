@@ -1,41 +1,71 @@
 @import "tailwindcss";
 
+/* ═══════════════════════════════════════════════════════════════════════
+   PredEdge design tokens
+   Dark is the default terminal-style theme; [data-theme="light"] overrides.
+   Component utility classes (.chip*, .card*, .section-official) live in
+   @layer components so Tailwind utilities can still override them.
+   ═══════════════════════════════════════════════════════════════════════ */
+
 /* ===== Dark theme (default) ===== */
 :root {
-  --bg-primary: #0f1117;
-  --bg-card: #1a1d2e;
-  --bg-card-hover: #222640;
-  --bg-input: #151827;
-  --border: #2a2e42;
-  --text-primary: #e2e8f0;
-  --text-secondary: #94a3b8;
-  --text-muted: #64748b;
-  --accent-green: #22c55e;
-  --accent-green-dim: #166534;
-  --accent-amber: #f59e0b;
-  --accent-amber-dim: #92400e;
-  --accent-red: #ef4444;
-  --accent-red-dim: #991b1b;
-  --accent-blue: #3b82f6;
+  color-scheme: dark;
+
+  --bg-primary: #0a0d13;
+  --bg-card: #11151d;
+  --bg-card-hover: #161c27;
+  --bg-input: #0d1119;
+  --border: #202634;
+  --border-strong: #2d3546;
+
+  --text-primary: #e8ecf4;
+  --text-secondary: #9aa6ba;
+  --text-muted: #64708a;
+
+  --accent-green: #34d399;
+  --accent-green-dim: #10402d;
+  --accent-amber: #fbbf24;
+  --accent-amber-dim: #3e2f0c;
+  --accent-red: #f87171;
+  --accent-red-dim: #481a1e;
+  --accent-blue: #60a5fa;
+  /* Divergence-play signal — the one orange-gold accent in the system */
+  --accent-gold: #e9b64f;
+  --accent-gold-dim: #3c2f10;
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35), 0 6px 20px -12px rgba(0, 0, 0, 0.6);
+  --shadow-card-hover: 0 2px 4px rgba(0, 0, 0, 0.4), 0 10px 28px -12px rgba(0, 0, 0, 0.7);
+  --shadow-pop: 0 12px 40px -12px rgba(0, 0, 0, 0.8);
 }
 
 /* ===== Light theme ===== */
 [data-theme="light"] {
-  --bg-primary: #f8fafc;
+  color-scheme: light;
+
+  --bg-primary: #f4f6f9;
   --bg-card: #ffffff;
-  --bg-card-hover: #f1f5f9;
-  --bg-input: #f1f5f9;
-  --border: #e2e8f0;
-  --text-primary: #0f172a;
-  --text-secondary: #475569;
-  --text-muted: #94a3b8;
-  --accent-green: #16a34a;
-  --accent-green-dim: #dcfce7;
-  --accent-amber: #d97706;
-  --accent-amber-dim: #fef3c7;
-  --accent-red: #dc2626;
-  --accent-red-dim: #fee2e2;
-  --accent-blue: #2563eb;
+  --bg-card-hover: #f8fafc;
+  --bg-input: #f0f3f7;
+  --border: #e3e8ef;
+  --border-strong: #ccd5e1;
+
+  --text-primary: #101623;
+  --text-secondary: #48536a;
+  --text-muted: #8592a8;
+
+  --accent-green: #0d9c6e;
+  --accent-green-dim: #d5f4e7;
+  --accent-amber: #b3730a;
+  --accent-amber-dim: #fdeecd;
+  --accent-red: #d64550;
+  --accent-red-dim: #fbdfe0;
+  --accent-blue: #2e6be6;
+  --accent-gold: #a8730a;
+  --accent-gold-dim: #f8ebc6;
+
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.06), 0 4px 14px -8px rgba(16, 24, 40, 0.1);
+  --shadow-card-hover: 0 2px 4px rgba(16, 24, 40, 0.07), 0 8px 24px -10px rgba(16, 24, 40, 0.16);
+  --shadow-pop: 0 12px 40px -12px rgba(16, 24, 40, 0.28);
 }
 
 @theme inline {
@@ -44,6 +74,7 @@
   --color-bg-card-hover: var(--bg-card-hover);
   --color-bg-input: var(--bg-input);
   --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-text-primary: var(--text-primary);
   --color-text-secondary: var(--text-secondary);
   --color-text-muted: var(--text-muted);
@@ -54,6 +85,8 @@
   --color-accent-red: var(--accent-red);
   --color-accent-red-dim: var(--accent-red-dim);
   --color-accent-blue: var(--accent-blue);
+  --color-accent-gold: var(--accent-gold);
+  --color-accent-gold-dim: var(--accent-gold-dim);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
@@ -62,17 +95,155 @@ body {
   background: var(--bg-primary);
   color: var(--text-primary);
   font-family: var(--font-geist-sans), system-ui, sans-serif;
-  transition: background-color 0.3s ease, color 0.3s ease;
+  transition: background-color 0.25s ease, color 0.25s ease;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Financial numbers: keep digits column-aligned everywhere */
+.font-mono,
+input[type="number"] {
+  font-variant-numeric: tabular-nums;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent-blue) 35%, transparent);
+}
+
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent-blue) 60%, transparent);
+  outline-offset: 1px;
 }
 
 /* Scrollbar styling */
 ::-webkit-scrollbar {
-  width: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--bg-primary);
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 3px;
+  background: var(--border-strong);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+@layer components {
+  /* ── Unified badge/chip system ─────────────────────────────────────────
+     Every informational badge on a card uses .chip + one tone class so the
+     reasons/status vocabulary reads as a single family. */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.14rem 0.45rem;
+    border-radius: 0.375rem;
+    border: 1px solid transparent;
+    font-size: 0.625rem;
+    font-weight: 500;
+    line-height: 1.35;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .chip-dot {
+    width: 0.3rem;
+    height: 0.3rem;
+    border-radius: 9999px;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+  .chip-green {
+    color: var(--accent-green);
+    border-color: color-mix(in srgb, var(--accent-green) 32%, transparent);
+    background: color-mix(in srgb, var(--accent-green) 10%, transparent);
+  }
+  .chip-amber {
+    color: var(--accent-amber);
+    border-color: color-mix(in srgb, var(--accent-amber) 32%, transparent);
+    background: color-mix(in srgb, var(--accent-amber) 10%, transparent);
+  }
+  .chip-red {
+    color: var(--accent-red);
+    border-color: color-mix(in srgb, var(--accent-red) 32%, transparent);
+    background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+  }
+  .chip-blue {
+    color: var(--accent-blue);
+    border-color: color-mix(in srgb, var(--accent-blue) 32%, transparent);
+    background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+  }
+  .chip-gold {
+    color: var(--accent-gold);
+    border-color: color-mix(in srgb, var(--accent-gold) 50%, transparent);
+    background: color-mix(in srgb, var(--accent-gold) 14%, transparent);
+    font-weight: 600;
+  }
+  .chip-neutral {
+    color: var(--text-muted);
+    border-color: var(--border);
+    background: var(--bg-input);
+  }
+
+  /* ── Card shell ──────────────────────────────────────────────────────── */
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 0.75rem;
+    box-shadow: var(--shadow-card);
+    transition: border-color 0.15s ease, box-shadow 0.15s ease,
+      background-color 0.15s ease;
+  }
+  .card-hover:hover {
+    border-color: var(--border-strong);
+    box-shadow: var(--shadow-card-hover);
+  }
+
+  /* Divergence play — the site-wide top-priority signal. Orange-gold frame
+     plus a faint gold wash so it can't be missed in a long list. */
+  .card-divergence {
+    border-color: color-mix(in srgb, var(--accent-gold) 55%, transparent);
+    background: linear-gradient(
+      140deg,
+      color-mix(in srgb, var(--accent-gold) 8%, var(--bg-card)) 0%,
+      var(--bg-card) 55%
+    );
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-gold) 22%, transparent),
+      0 10px 30px -14px color-mix(in srgb, var(--accent-gold) 45%, transparent);
+  }
+  .card-divergence.card-hover:hover {
+    border-color: color-mix(in srgb, var(--accent-gold) 75%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-gold) 35%, transparent),
+      0 12px 36px -14px color-mix(in srgb, var(--accent-gold) 60%, transparent);
+  }
+
+  /* ── Official Ruling pinned section (product core) ───────────────────── */
+  .section-official {
+    position: relative;
+    border-radius: 1rem;
+    border: 1px solid color-mix(in srgb, var(--accent-gold) 32%, var(--border));
+    background: linear-gradient(
+      140deg,
+      color-mix(in srgb, var(--accent-gold) 9%, var(--bg-card)) 0%,
+      color-mix(in srgb, var(--accent-green) 5%, var(--bg-card)) 50%,
+      var(--bg-card) 100%
+    );
+    box-shadow: var(--shadow-card);
+    overflow: hidden;
+  }
+  .section-official::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 2px;
+    background: linear-gradient(
+      90deg,
+      var(--accent-gold),
+      var(--accent-green) 60%,
+      transparent
+    );
+    opacity: 0.7;
+  }
 }

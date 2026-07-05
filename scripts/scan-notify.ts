@@ -64,8 +64,14 @@ function isNotifiable(o: Opportunity): boolean {
   // a. UMA 状态为 disputed 且 decision 为 actionable
   const uma = (o.umaResolutionStatus ?? "").trim().toLowerCase();
   if (uma === "disputed" && o.decision === "actionable") return true;
-  // c. 官方方向背书,且未被拒绝
-  if (reasons.includes("official_direction_backed") && o.decision !== "rejected") {
+  // c. 官方方向背书,且未被拒绝。仅限官方真实文本(via=text):price_fallback
+  // 是无文本时按价格推断的方向,官方并未背书,不配触发"官方方向"邮件
+  // (32/32 战绩只属于官方明确文本口径)。这类市场仍在网站争议区展示。
+  if (
+    reasons.includes("official_direction_backed") &&
+    o.officialContext?.via === "text" &&
+    o.decision !== "rejected"
+  ) {
     return true;
   }
   return false;

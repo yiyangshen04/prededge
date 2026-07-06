@@ -109,17 +109,39 @@ function decodeQuestionWithCreator(
   return { requestTimestamp, creator };
 }
 
+/** Hard ceiling on the decoded array length. A market's official-context log
+ * is a handful of entries; anything near this is a corrupt/hostile RPC
+ * response, and trusting its length word verbatim would spin a near-infinite
+ * loop / OOM. */
+const MAX_UPDATES = 1000;
+
 function decodeUpdates(raw: string): OfficialUpdate[] {
   if (!raw || raw === "0x") return [];
+  const byteLength = (raw.length - 2) / 2;
   const base = Number(uintWord(wordAt(raw, 0)));
+  if (!Number.isFinite(base) || base < 0 || base + 32 > byteLength) return [];
   const length = Number(uintWord(wordAt(raw, base)));
+  if (!Number.isFinite(length) || length < 0 || length > MAX_UPDATES) {
+    throw new Error(`decodeUpdates: implausible array length ${length}`);
+  }
+  // The offset table (length words) must itself fit inside the payload.
+  if (base + 32 + length * 32 > byteLength) {
+    throw new Error("decodeUpdates: offset table exceeds payload");
+  }
   const updates: OfficialUpdate[] = [];
 
   for (let i = 0; i < length; i += 1) {
     const tupleOffset = Number(uintWord(wordAt(raw, base + 32 + i * 32)));
     const tupleBase = base + 32 + tupleOffset;
+    // Each tuple needs at least its two head words (timestamp + text offset).
+    if (!Number.isFinite(tupleOffset) || tupleOffset < 0 || tupleBase + 64 > byteLength) {
+      throw new Error("decodeUpdates: tuple offset out of bounds");
+    }
     const timestamp = Number(uintWord(wordAt(raw, tupleBase)));
     const textOffset = Number(uintWord(wordAt(raw, tupleBase + 32)));
+    if (!Number.isFinite(textOffset) || textOffset < 0 || tupleBase + textOffset + 32 > byteLength) {
+      throw new Error("decodeUpdates: text offset out of bounds");
+    }
     const textBytes = decodeBytes(raw, tupleBase + textOffset);
     updates.push({ timestamp, iso: iso(timestamp), text: textBytes.text });
   }
@@ -164,22 +186,76 @@ export function stanceFromText(text: string | null | undefined): {
   if (/remain open|not enough information|open investigation|clear resolution is reached/.test(lower)) {
     return { stance: "stay_open", confidence: "medium" };
   }
+  // Lazy, boundary-terminated capture. The old greedy `[a-z0-9 ._+-]+` ate the
+  // sentence-final period and any trailing words ("no." → resolve_to_"no."; a
+  // real "No" ruling became an unmatchable resolve_to garbage stance). Capture
+  // up to the first quote / sentence punctuation / newline / end.
   const explicitOutcome = lower.match(
-    /(?:should\s+resolve\s+to|will\s+immediately\s+resolve\s+to)\s+["“]?([a-z0-9 ._+-]+)["”]?/
+    /(?:should\s+resolve\s+to|will(?:\s+immediately)?\s+resolve\s+to|resolves?\s+to|resolved?\s+as)\s+["“']?([a-z0-9][a-z0-9 _+-]{0,60}?)\s*(?:["”']|[.,;:!?\n]|$)/
   );
   if (explicitOutcome?.[1]) {
-    const outcome = explicitOutcome[1].trim().replace(/\s+/g, "_");
-    if (outcome === "yes") return { stance: "YES", confidence: "high" };
-    if (outcome === "no") return { stance: "NO", confidence: "high" };
-    return { stance: `resolve_to_${outcome}`, confidence: "high" };
+    // Guard BEFORE trusting the verb phrase: the widened verb set (bare
+    // "resolves to" / "resolved as") would otherwise turn negated sentences
+    // ("will not resolve to 'Yes'"), conditional rules ("will resolve to
+    // 'Yes' if confirmed") and narrative time references ("has not resolved
+    // as of this update") into high-confidence rulings.
+    const matchIdx = explicitOutcome.index ?? 0;
+    const sentenceStart =
+      Math.max(
+        lower.lastIndexOf(".", matchIdx),
+        lower.lastIndexOf(";", matchIdx),
+        lower.lastIndexOf("!", matchIdx),
+        lower.lastIndexOf("?", matchIdx),
+        lower.lastIndexOf("\n", matchIdx)
+      ) + 1;
+    const relEnd = lower.slice(matchIdx).search(/[.;!?\n]/);
+    const sentence = lower.slice(
+      sentenceStart,
+      relEnd === -1 ? lower.length : matchIdx + relEnd
+    );
+    const preClause = lower.slice(sentenceStart, matchIdx);
+    const negated =
+      /\b(?:not|never|cannot|can'?t|won'?t|wouldn'?t|shouldn'?t|isn'?t|hasn'?t|no longer)\b/.test(preClause);
+    const conditional =
+      /\b(?:if|unless|until|only if|provided that|in the event)\b/.test(sentence);
+    const narrative = /resolved?\s+as\s+of\b/.test(sentence);
+    if (negated || conditional || narrative) {
+      return { stance: "rule_context", confidence: "low" };
+    }
+    const outcome = explicitOutcome[1].replace(/[.,;:!?"'”’]+$/g, "").trim();
+    // Exact yes/no (optionally followed by procedural qualifiers like "once
+    // announced") folds to a direct stance. Any other multi-word label — "no
+    // change", "no deal", a candidate name — must stay a resolve_to_* stance
+    // so alignment is decided against the market's real outcome names instead
+    // of being force-folded into YES/NO (a "No Change" bucket that should WIN
+    // must not be read as stance NO).
+    const folded = outcome.match(
+      /^(yes|no)(?:\s+(?:once|when|upon|after|per|based|following)\b.*)?$/
+    );
+    if (folded) {
+      return folded[1] === "yes"
+        ? { stance: "YES", confidence: "high" }
+        : { stance: "NO", confidence: "high" };
+    }
+    const norm = outcome.replace(/\s+/g, "_");
+    // A ruling names a short outcome label; a 5+ word capture is almost
+    // always a narrative clause the widened verbs snagged ("officials
+    // updated the underlying data…") — keep it out of the directional path.
+    if (norm && outcome.split(/\s+/).length <= 4) {
+      return { stance: `resolve_to_${norm}`, confidence: "high" };
+    }
+    return { stance: "rule_context", confidence: "low" };
   }
   if (/per the rules/.test(lower) && /will resolve to/.test(lower) && /\bif\b/.test(lower)) {
     return { stance: "rule_context", confidence: "low" };
   }
-  if (
-    /qualifies|qualify toward|officially listed|officially announced|qualifying/.test(lower) &&
-    !/does not qualify|do not qualify|do not alone constitute|not qualify|will not qualify|not count|does not count/.test(lower)
-  ) {
+  // Word-bounded qualify test that excludes "disqualif…" (a NO-signal that the
+  // old substring test mis-read as leans_YES) and drops purely procedural
+  // phrasing ("will be officially announced") that carries no direction.
+  const positiveQualify = /(?<![a-z])qualif(?:y|ies|ying)\b|qualify toward|officially listed/;
+  const negatedQualify =
+    /does not qualify|do not qualify|do not alone constitute|not qualify|will not qualify|not count|does not count|not alone meet/;
+  if (positiveQualify.test(lower) && !/disqualif/.test(lower) && !negatedQualify.test(lower)) {
     return { stance: "leans_YES", confidence: "medium" };
   }
   if (
@@ -331,13 +407,31 @@ export function buildOfficialContext(
   // Newest directional text wins (two-stage pattern: boundary note first,
   // ruling appended after the dispute).
   let textStance: { stance: string; confidence: "high" | "medium" | "low" | "none" } | null = null;
+  let directionalIdx = -1;
   for (let i = updates.length - 1; i >= 0; i -= 1) {
     const classified = stanceFromText(updates[i].text);
     if (isDirectionalStance(classified.stance)) {
       textStance = classified;
+      directionalIdx = i;
       break;
     }
   }
+
+  // Walk-back guard: if officials posted a stay_open / dispute_notice AFTER the
+  // chosen directional ruling, they explicitly returned the market to undecided.
+  // The stale ruling must not keep being presented as the current direction —
+  // adopt the later directionless stance instead (which drops official_direction
+  // _backed; a price fallback may still supply a lower-confidence hint).
+  if (textStance && directionalIdx >= 0) {
+    for (let i = updates.length - 1; i > directionalIdx; i -= 1) {
+      const laterStance = stanceFromText(updates[i].text);
+      if (laterStance.stance === "stay_open" || laterStance.stance === "dispute_notice") {
+        textStance = laterStance;
+        break;
+      }
+    }
+  }
+
   if (!textStance && latest) textStance = stanceFromText(latest.text);
 
   const refundClause = detectRefundClause(updates.map((u) => u.text));
@@ -455,7 +549,11 @@ export function applyOfficialContextDecision(opp: Opportunity): void {
   if (isDirectionalStance(ctx.stance)) {
     const alignment = stanceAlignment(ctx.stance, opp.outcome, opp.outcomeTokens);
     if (alignment === "aligned") {
-      if (!reasons.includes("official_direction_backed")) {
+      // A refund clause means the "losing" side is made whole — there is no
+      // edge, so this is NOT an official direction to trade. Suppress the
+      // backing reason entirely so the notifier's rule (c) can't email it as
+      // an "official direction" play.
+      if (!ctx.refundClause && !reasons.includes("official_direction_backed")) {
         reasons.push("official_direction_backed");
       }
     } else if (alignment === "contradicts") {

@@ -47,6 +47,10 @@ const MAX_LOOKBACK_BLOCKS = 129_600; // ~3 days of Polygon blocks (~2s each)
 const DEFAULT_LOOKBACK_BLOCKS = 43_200; // first run / lost cursor: ~1 day
 const SWEEP_CONCURRENCY = 4;
 const KV_CURSOR_KEY = "onchain_events_last_block";
+// Scan/advance only to a confirmed depth. A getLogs window served by a lagging
+// RPC replica (or a shallow reorg) would otherwise return "success but missing
+// tail blocks" while the cursor sails past them — a permanent silent miss.
+const CONFIRMATIONS = 25;
 
 function rpcUrls(): string[] {
   const configured = process.env.ONCHAIN_RPC_URLS?.trim();
@@ -73,15 +77,15 @@ async function rpcRequest<T>(method: string, params: unknown[]): Promise<T> {
   let lastError: Error | null = null;
   for (const rpc of rpcUrls()) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15_000);
+      // AbortSignal.timeout covers the body read too — a plain
+      // controller+clearTimeout fires as soon as headers arrive, so a
+      // slow-drip response could hang res.json() up to undici's ~300s default.
       const res = await fetch(rpc, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-        signal: controller.signal,
+        signal: AbortSignal.timeout(15_000),
       });
-      clearTimeout(timer);
       const json = (await res.json()) as {
         result?: T;
         error?: { message?: string };
@@ -174,10 +178,12 @@ export async function sweepDisputeEvents(
   extraAdapters: string[] = [],
   deps: SweepDeps = defaultDeps()
 ): Promise<{ summary: OnchainEventsSummary; markets: GammaMarket[] }> {
-  const head = Number(await rpcRequest<string>("eth_blockNumber", []));
-  if (!Number.isFinite(head) || head <= 0) {
-    throw new Error(`bad eth_blockNumber result: ${head}`);
+  const rawHead = Number(await rpcRequest<string>("eth_blockNumber", []));
+  if (!Number.isFinite(rawHead) || rawHead <= 0) {
+    throw new Error(`bad eth_blockNumber result: ${rawHead}`);
   }
+  // Scan/advance the cursor only up to a confirmed depth (see CONFIRMATIONS).
+  const head = rawHead - CONFIRMATIONS;
 
   const cursorRaw = deps.getCursor();
   const cursor = cursorRaw != null ? Number(cursorRaw) : NaN;

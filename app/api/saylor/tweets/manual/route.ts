@@ -3,6 +3,7 @@ import { classifyTweet } from "@/lib/saylor/classifier";
 import { mondayOf } from "@/lib/saylor/calendar";
 import { saveSignals, upsertTweet } from "@/lib/saylor/db";
 import { parseManualTweets } from "@/lib/saylor/twitterSource";
+import { enforceRateLimit } from "@/lib/rateLimit";
 
 export const runtime = "nodejs";
 
@@ -13,6 +14,10 @@ export const runtime = "nodejs";
  * resulting signals are persisted against the current Monday's week.
  */
 export async function POST(request: NextRequest) {
+  // Writes classifier signals into the predictor's input DB — rate-limit it
+  // like the other write routes so it can't be spammed from the LAN.
+  const limited = enforceRateLimit(request, "saylor-tweets-manual", 10, 10_000);
+  if (limited) return limited;
   let body: { rawText?: string } = {};
   try {
     body = await request.json();

@@ -76,24 +76,49 @@ export function analyzeOrderBook(
  *
  * For $1 invested you get 1/effectivePrice shares; on a win each share pays
  * $1, so gross ROI is (1 - effectivePrice) / effectivePrice. Fees and
- * transfer costs are a flat fraction of the invested USD, so they subtract
- * directly from the ROI.
+ * transfer costs subtract directly from the ROI.
+ *
+ * Fees follow Fee Structure V2 (2026-03-30): the taker fee is
+ * `shares × rate × p × (1−p)`, which as a fraction of the invested capital
+ * (`shares × p`) is `rate × (1−p)`. Fee-free markets (feesEnabled=false,
+ * takerFeeRate=0) pay nothing; when the market's schedule is unknown
+ * (takerFeeRate null/undefined) we fall back to the flat conservative
+ * `config.feePct` — the pre-V2 approximation, which slightly understates
+ * returns in the tail-price band but never overstates them.
  *
  * This matches TradeModal's `pnlIfWin / investedUsd`, so the scanner card's
  * "Net Return" and the trade preview's "Ann. Yield if Win" now reconcile
  * for the same fill price.
  */
+/**
+ * Taker fee as a fraction of invested capital when buying at `price`:
+ * `rate × (1−price)` under Fee Structure V2 (fee = shares × rate × p × (1−p),
+ * capital = shares × p), or the flat conservative `config.feePct` when the
+ * market's schedule is unknown. Shared by the scanner, live recompute and the
+ * trade modal so every surface prices fees on the same basis.
+ */
+export function takerFeePct(
+  price: number,
+  takerFeeRate: number | null | undefined,
+  config: ScanConfig
+): number {
+  return takerFeeRate != null ? takerFeeRate * (1 - price) : config.feePct;
+}
+
 export function computeNetReturn(
   buyPrice: number,
   slippageBps: number,
-  config: ScanConfig
+  config: ScanConfig,
+  takerFeeRate?: number | null
 ): number {
   if (buyPrice <= 0) return 0;
   const slippagePct = Math.max(0, slippageBps / 10000);
   const effectivePrice = buyPrice + slippagePct;
   if (effectivePrice <= 0 || effectivePrice >= 1) return 0;
   return (
-    (1 - effectivePrice) / effectivePrice - config.feePct - config.transferCostPct
+    (1 - effectivePrice) / effectivePrice -
+    takerFeePct(effectivePrice, takerFeeRate, config) -
+    config.transferCostPct
   );
 }
 

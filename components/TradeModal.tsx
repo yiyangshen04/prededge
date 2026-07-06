@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import type { FillResult, Opportunity } from "@/lib/types";
 import { DEFAULT_SCAN_CONFIG } from "@/lib/polymarket/config";
-import { estimateHoldingDays } from "@/lib/polymarket/scoring";
+import { estimateHoldingDays, takerFeePct } from "@/lib/polymarket/scoring";
 import { effectiveEndDate } from "@/lib/liveRecompute";
 
 interface Props {
@@ -101,8 +101,14 @@ export function TradeModal({
   const payoutIfWin = fill ? fill.shares : 0;
   // Deduct fees + transfer cost to match the scanner's netReturnPct definition.
   // Without this, the scanner would show e.g. 2.55% net while the modal shows
-  // 3.09% gross for the same trade — confusing users.
-  const feeCost = investedUsd * DEFAULT_SCAN_CONFIG.feePct;
+  // 3.09% gross for the same trade — confusing users. Fees use the market's
+  // real Fee Structure V2 rate (takerFeeRate) when known, flat fallback else —
+  // the same basis computeNetReturn uses.
+  const avgFillPrice =
+    fill && fill.shares > 0 ? investedUsd / fill.shares : opportunity.price;
+  const feeCost =
+    investedUsd *
+    takerFeePct(avgFillPrice, opportunity.takerFeeRate, DEFAULT_SCAN_CONFIG);
   const transferCost = investedUsd * DEFAULT_SCAN_CONFIG.transferCostPct;
   const grossPnlIfWin = fill ? payoutIfWin - investedUsd : 0;
   const pnlIfWin = fill ? grossPnlIfWin - feeCost - transferCost : 0;
@@ -123,9 +129,12 @@ export function TradeModal({
   if (confirmed && fill) {
     const invested = usdAmount - fill.remainingUsd;
     const grossPnlSuccess = fill.shares - invested;
+    const avgPriceSuccess =
+      fill.shares > 0 ? invested / fill.shares : opportunity.price;
     const feesSuccess =
       invested *
-      (DEFAULT_SCAN_CONFIG.feePct + DEFAULT_SCAN_CONFIG.transferCostPct);
+      (takerFeePct(avgPriceSuccess, opportunity.takerFeeRate, DEFAULT_SCAN_CONFIG) +
+        DEFAULT_SCAN_CONFIG.transferCostPct);
     const pnlIfWinSuccess = grossPnlSuccess - feesSuccess;
     return (
       <div

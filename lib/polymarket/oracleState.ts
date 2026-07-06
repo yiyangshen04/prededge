@@ -40,11 +40,23 @@ const TWO_255 = BIG_ONE << BigInt(255);
 const TWO_256 = BIG_ONE << BigInt(256);
 
 function rpcUrls(): string[] {
-  const configured = process.env.POLYGON_RPC_URL?.trim();
-  return [
-    ...(configured ? [configured] : []),
+  // Read the SAME env var the rest of the deployment configures
+  // (ONCHAIN_RPC_URLS, comma-separated) so on-chain reads use the operator's
+  // tuned RPC list instead of silently falling back to the hardcoded public
+  // defaults. POLYGON_RPC_URL (single URL) is still honored for back-compat.
+  // Configured URLs go first; the hardcoded defaults remain as last-resort
+  // fallbacks. De-duplicated to avoid hitting the same endpoint twice.
+  const fromList = (process.env.ONCHAIN_RPC_URLS ?? "")
+    .split(",")
+    .map((u) => u.trim())
+    .filter(Boolean);
+  const single = process.env.POLYGON_RPC_URL?.trim();
+  const ordered = [
+    ...fromList,
+    ...(single ? [single] : []),
     ...DEFAULT_POLYGON_RPCS,
   ];
+  return [...new Set(ordered)];
 }
 
 export function isHex(value: string | null | undefined, bytes: number): value is string {
@@ -100,6 +112,11 @@ export async function ethCall(to: string, data: string): Promise<string> {
 
   for (const rpc of rpcUrls()) {
     try {
+      // AbortSignal.timeout bounds the whole call (headers AND body). Without
+      // it, a proxy black-hole (connection established, no response) would
+      // hang each endpoint up to undici's ~300s default — and with several
+      // serial ethCalls per disputed market that stalls the entire scan tick
+      // long enough for flock to skip the next cron round.
       const res = await fetch(rpc, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -109,6 +126,7 @@ export async function ethCall(to: string, data: string): Promise<string> {
           method: "eth_call",
           params: [{ to, data }, "latest"],
         }),
+        signal: AbortSignal.timeout(10_000),
       });
       const json = (await res.json()) as {
         result?: string;

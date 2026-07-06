@@ -20,13 +20,27 @@
  * Env: ONCHAIN_RPC_URLS (comma-sep; default publicnode+1rpc), MAIL_* (mailer.ts),
  *      CHAIN_WATCH_STATE (default data/chain-watch-state.json)
  */
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { readFileSync } from "fs";
 import path from "path";
 import { sendMail } from "./mailer";
 import { ethCall } from "../lib/polymarket/oracleState";
 import { getOfficialUpdates, stanceFromText, detectRefundClause } from "../lib/polymarket/officialContext";
 import { isDirectionalStance } from "../lib/virtualTags";
 import { KNOWN_ADAPTERS } from "../lib/polymarket/onchainEvents";
+import { writeFileAtomic } from "../lib/fsAtomic";
+
+/** Full HTML entity escape for any chain-sourced string spliced into email
+ * body HTML. Market titles/context text come from permissionless on-chain
+ * ancillary data (any third party controls them), so they must be escaped or
+ * a creator can inject arbitrary HTML / phishing links into the alert. */
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 const TOPIC_QUESTION_RESET =
   "0x7981b5832932948db4e32a4a16a0f44b2ce7ff088574afb9364b313f70f82e8f";
@@ -34,12 +48,35 @@ const TOPIC_ANCILLARY_UPDATED =
   "0x0059e11815211969c0c4aaf3f498b52b6c2f2d14f286275d0862d70de22a836b";
 const GET_QUESTION_SELECTOR = "0x58c039cd";
 
-// Max lookback after downtime: ~600 blocks ≈ 20 minutes. publicnode only
-// serves getLogs hugging the chain head (~127 blocks), so deeper pages fall
-// through to the fallback RPCs (drpc etc.) that allow ~100-block windows at
-// any depth. Beyond 600 blocks we accept the gap (noted in the email)
-// instead of hammering free tiers with a huge catch-up sweep.
-const HEAD_WINDOW = 600;
+// Max lookback after downtime: ~3600 blocks ≈ 2 hours. publicnode only serves
+// getLogs hugging the chain head (~127 blocks), so deeper pages fall through to
+// the fallback RPCs (nodies/tenderly) that allow ~100-block windows at any
+// depth. 3600 covers the largest gaps observed in production (2878 blocks);
+// beyond it we accept the gap but ALWAYS email an alert (see gap handling
+// below) so a permanent miss is never silent.
+const HEAD_WINDOW = 3600;
+
+// Confirmation depth: scan and advance the cursor only up to head-CONFIRMATIONS,
+// not the unconfirmed latest head. A getLogs page that lands on a lagging RPC
+// replica (or a shallow reorg) would otherwise return "success but missing the
+// tail blocks" while the cursor sails past them — a permanent silent miss.
+// ~25 blocks ≈ 50s on Polygon; the cost is that much extra notification delay.
+const CONFIRMATIONS = 25;
+
+// Sanity bound: on a non-first run, a single tick's head must not jump more
+// than this past the stored cursor. A multi-chain gateway (e.g. 1rpc) can
+// mis-route and return another chain's much higher block number; without this
+// guard the cursor gets poisoned to that fake head and every later tick reports
+// "no new blocks" while the channel is silently dead.
+const MAX_HEAD_ADVANCE = 200_000; // ~4.8 days of Polygon blocks
+
+// Per-tick sweep cap. A full HEAD_WINDOW catch-up is 75 sequential getLogs
+// pages plus enrichment — that can overrun run-cron's 170s tick timeout, and
+// since the cursor only commits at the end, a killed tick makes NO progress
+// and the catch-up loops forever. Capping the sweep keeps every tick well
+// inside its timeout; the remaining backlog carries to the next ticks
+// (a full 3600-block window clears in 3 ticks ≈ 9 minutes).
+const MAX_BLOCKS_PER_TICK = 1200;
 
 function rpcUrls(): string[] {
   const configured = process.env.ONCHAIN_RPC_URLS?.trim();
@@ -56,18 +93,23 @@ function rpcUrls(): string[] {
 }
 
 async function rpc<T>(method: string, params: unknown[]): Promise<T> {
+  return rpcVia(rpcUrls(), method, params);
+}
+
+async function rpcVia<T>(urls: string[], method: string, params: unknown[]): Promise<T> {
   let lastError: Error | null = null;
-  for (const url of rpcUrls()) {
+  for (const url of urls) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 15_000);
+      // AbortSignal.timeout covers the WHOLE request including the body read —
+      // a plain controller+clearTimeout would fire clearTimeout right after the
+      // headers arrive, leaving res.json() to hang up to undici's ~300s default
+      // on a slow-drip RPC and stalling the whole tick past its cron slot.
       const res = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-        signal: controller.signal,
+        signal: AbortSignal.timeout(15_000),
       });
-      clearTimeout(timer);
       const json = (await res.json()) as { result?: T; error?: { message?: string } };
       if (json.error || json.result === undefined) {
         throw new Error(json.error?.message ?? `empty ${method} result`);
@@ -95,20 +137,30 @@ function statePath(): string {
 }
 
 function loadState(): WatchState {
+  let raw: string;
   try {
-    const raw = JSON.parse(readFileSync(statePath(), "utf8"));
-    return {
-      lastBlock: Number(raw.lastBlock) || 0,
-      notified: raw.notified && typeof raw.notified === "object" ? raw.notified : {},
-    };
+    raw = readFileSync(statePath(), "utf8");
   } catch {
-    return { lastBlock: 0, notified: {} };
+    return { lastBlock: 0, notified: {} }; // first run — file absent
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      lastBlock: Number(parsed.lastBlock) || 0,
+      notified: parsed.notified && typeof parsed.notified === "object" ? parsed.notified : {},
+    };
+  } catch (err) {
+    // File exists but is corrupt (truncated by a crash mid-write). Do NOT
+    // silently reset to block 0 — that would re-scan head-3600 and re-notify.
+    // Loud-fail so the tick exits non-zero and the operator sees it.
+    throw new Error(
+      `chain-watch state file ${statePath()} is corrupt: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 }
 
 function saveState(state: WatchState): void {
-  mkdirSync(path.dirname(statePath()), { recursive: true });
-  writeFileSync(statePath(), JSON.stringify(state, null, 1));
+  writeFileAtomic(statePath(), JSON.stringify(state, null, 1));
 }
 
 // ── On-chain question title ──
@@ -145,10 +197,46 @@ interface Notable {
 }
 
 async function main(): Promise<void> {
+  const tickStartedAt = Date.now();
   const state = loadState();
-  const head = Number(await rpc<string>("eth_blockNumber", []));
-  if (!Number.isFinite(head) || head <= 0) throw new Error(`bad head: ${head}`);
+  const rawHead = Number(await rpc<string>("eth_blockNumber", []));
+  if (!Number.isFinite(rawHead) || rawHead <= 0) throw new Error(`bad head: ${rawHead}`);
 
+  // Sanity: an implausible head jump (multi-chain gateway mis-routing a higher
+  // chain's block number) must not poison the cursor. But a >MAX_HEAD_ADVANCE
+  // jump is ALSO what a legitimate multi-day outage looks like — and head only
+  // keeps growing, so a bare throw would deadlock the channel forever. On
+  // violation, cross-check via a second query with the RPC order reversed: two
+  // independent endpoints agreeing means the jump is real (accept it; the
+  // HEAD_WINDOW clamp + gap alert handle the backlog), disagreement means a
+  // rogue gateway (throw, next tick retries). First run (lastBlock=0) exempt.
+  if (state.lastBlock > 0 && rawHead - state.lastBlock > MAX_HEAD_ADVANCE) {
+    const crossHead = Number(
+      await rpcVia<string>([...rpcUrls()].reverse(), "eth_blockNumber", [])
+    );
+    if (!Number.isFinite(crossHead) || Math.abs(crossHead - rawHead) > 5_000) {
+      throw new Error(
+        `implausible head ${rawHead} vs stored lastBlock ${state.lastBlock} (jump ${rawHead - state.lastBlock} > ${MAX_HEAD_ADVANCE}); cross-check head ${crossHead} disagrees — refusing to advance`
+      );
+    }
+    console.warn(
+      `[chain-watch] head jump ${rawHead - state.lastBlock} blocks confirmed by cross-check (${crossHead}) — accepting after long downtime`
+    );
+  }
+
+  // Symmetric low-head guard: a mis-routed head far BELOW the cursor would
+  // otherwise sail through the jump check, land in the "no new blocks" skip
+  // and exit 0 — monitoring stays green while the channel is silently dead.
+  // Loud-fail instead; small negatives (lagging replica within tolerance)
+  // still take the harmless skip path below.
+  if (state.lastBlock > 0 && rawHead < state.lastBlock - 1_000) {
+    throw new Error(
+      `implausible head ${rawHead} far below stored lastBlock ${state.lastBlock}; refusing to treat as "no new blocks"`
+    );
+  }
+
+  // Only scan up to a confirmed depth to avoid reorg/replica-lag silent misses.
+  const head = rawHead - CONFIRMATIONS;
   const idealFrom = state.lastBlock > 0 ? state.lastBlock + 1 : head - HEAD_WINDOW;
   const from = Math.max(idealFrom, head - HEAD_WINDOW);
   const gap = from > idealFrom ? from - idealFrom : 0;
@@ -157,18 +245,35 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Cap the sweep so a catch-up tick still finishes (and commits its cursor)
+  // inside run-cron's tick timeout; the rest of the backlog carries over.
+  const to = Math.min(head, from + MAX_BLOCKS_PER_TICK - 1);
+
   // Fetch in ≤48-block windows — the strictest free-tier getLogs cap seen
   // (1rpc allows 50; publicnode ~127 near the head). A window that fails on
   // every RPC stops the sweep, but progress up to it is kept: the swept
   // range is processed and persisted, the rest retried next tick — so one
   // bad page no longer voids the whole tick (that's how 12% of blocks got
   // permanently skipped in the first day of deployment).
+  // Soft time budgets inside run-cron's 170s SIGTERM: block/page caps bound
+  // the WORK but not the TIME (a black-holed endpoint burns 15s per URL per
+  // page; enrichment burns up to 10s per URL per ethCall). If the tick is
+  // killed before commitState, no progress persists and the same slow range
+  // is retried forever. Budgets guarantee every tick reaches send+commit.
+  const SWEEP_BUDGET_MS = 100_000;
+  const ENRICH_BUDGET_MS = 140_000;
+  const elapsed = () => Date.now() - tickStartedAt;
+
   const logs: Array<{ address: string; topics: string[] }> = [];
   const WINDOW = 48;
   let sweptTo = from - 1;
   let sweepError: string | null = null;
-  for (let start = from; start <= head; start += WINDOW) {
-    const end = Math.min(start + WINDOW - 1, head);
+  for (let start = from; start <= to; start += WINDOW) {
+    if (elapsed() > SWEEP_BUDGET_MS) {
+      sweepError = `sweep stopped at time budget (${SWEEP_BUDGET_MS / 1000}s); resuming next tick`;
+      break;
+    }
+    const end = Math.min(start + WINDOW - 1, to);
     try {
       const page = await rpc<Array<{ address: string; topics: string[] }>>("eth_getLogs", [
         {
@@ -215,8 +320,17 @@ async function main(): Promise<void> {
     byQid.get(qid)!.kinds.add(kind);
   }
 
-  // Enrich each with title + official context read straight from the chain
+  // Enrich each with title + official context read straight from the chain.
+  // Past the time budget the remaining items go out un-enriched (title=null,
+  // stance none) — a degraded but timely alert beats a tick killed by timeout
+  // with nothing sent and no progress committed.
   for (const item of byQid.values()) {
+    if (elapsed() > ENRICH_BUDGET_MS) {
+      console.warn(
+        `[chain-watch] enrichment stopped at time budget (${ENRICH_BUDGET_MS / 1000}s); remaining events notify without title/context`
+      );
+      break;
+    }
     item.title = await fetchQuestionTitle(item.adapter, item.qid);
     try {
       const { updates } = await getOfficialUpdates({ resolvedBy: item.adapter, questionID: item.qid });
@@ -243,23 +357,53 @@ async function main(): Promise<void> {
     }
   }
 
-  // Decide what's notification-worthy and not already notified
+  // Decide what's notification-worthy and not already notified. Fingerprints
+  // are computed but NOT committed to state.notified yet — they're only
+  // persisted after the email actually goes out (at-least-once), so an SMTP
+  // hiccup can't silently swallow a real dispute event.
+  const pendingFingerprints = new Map<string, string>();
   const notable = [...byQid.values()].filter((item) => {
     const fingerprint = `${[...item.kinds].sort().join("+")}:${item.updateCount}:${item.stance}`;
     if (state.notified[item.qid] === fingerprint) return false;
-    state.notified[item.qid] = fingerprint;
+    pendingFingerprints.set(item.qid, fingerprint);
     return true;
   });
 
-  state.lastBlock = sweptTo;
-  // Bound the notified map (~keep last 500 entries)
-  const keys = Object.keys(state.notified);
-  if (keys.length > 500) {
-    for (const k of keys.slice(0, keys.length - 500)) delete state.notified[k];
-  }
-  saveState(state);
+  // Commit progress + notified fingerprints, then bound the map. Called only
+  // after any required email send has succeeded. delete-then-set moves a
+  // refreshed qid to the END of the key order — a plain overwrite keeps its
+  // old position, and the prune below would then evict the fingerprint we
+  // just wrote (insertion-order prune must behave like least-recently-used).
+  const commitState = () => {
+    for (const [qid, fp] of pendingFingerprints) {
+      delete state.notified[qid];
+      state.notified[qid] = fp;
+    }
+    state.lastBlock = sweptTo;
+    const keys = Object.keys(state.notified);
+    if (keys.length > 500) {
+      for (const k of keys.slice(0, keys.length - 500)) delete state.notified[k];
+    }
+    saveState(state);
+  };
 
   if (notable.length === 0) {
+    // No new events: advance the cursor durably first (this progress must not
+    // be lost), then best-effort alert on any permanently-skipped gap. The
+    // skipped blocks are already gone, so a failed gap alert must not block
+    // cursor progress or re-fire forever.
+    commitState();
+    if (gap > 0) {
+      try {
+        await sendMail({
+          subject: `[PredEdge 链上] ⚠️ 永久漏扫 ${gap} 个块`,
+          html: `<div style="font-family:system-ui,sans-serif;max-width:640px"><p style="color:#d97706">⚠️ chain-watch 停机追赶超出回看窗口(${HEAD_WINDOW} 块),块 ${idealFrom}–${from - 1}(共 ${gap} 个)未被扫描且不可回补。若此区间有争议事件,可能已漏报。</p><p style="font-size:12px;color:#888">建议核对 Polymarket 争议区,或考虑接入更深回看能力的付费 RPC。</p></div>`,
+          text: `chain-watch 永久漏扫 ${gap} 个块(${idealFrom}–${from - 1});停机超出回看窗口 ${HEAD_WINDOW}。`,
+        });
+      } catch (err) {
+        console.error(`[chain-watch] gap alert send failed (gap=${gap}): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     console.log(
       JSON.stringify({ mode: "chain-watch", from, to: sweptTo, events: logs.length, notified: 0, gap, sweep_error: sweepError ?? undefined })
     );
@@ -278,15 +422,15 @@ async function main(): Promise<void> {
         .map((k) => (k === "reset" ? "争议重置(QuestionReset)" : "官方context更新"))
         .join(" + ");
       const stanceLine = isDirectionalStance(n.stance)
-        ? `<b style="color:#d97706">官方方向: ${n.stance} (${n.confidence})</b>`
-        : `立场: ${n.stance} (${n.confidence})`;
+        ? `<b style="color:#d97706">官方方向: ${escapeHtml(n.stance)} (${escapeHtml(n.confidence)})</b>`
+        : `立场: ${escapeHtml(n.stance)} (${escapeHtml(n.confidence)})`;
       return `<tr>
         <td style="padding:8px;border-bottom:1px solid #333">
-          <div style="font-weight:600">${n.title ?? n.qid}</div>
+          <div style="font-weight:600">${escapeHtml(n.title ?? n.qid)}</div>
           <div style="font-size:12px;color:#888">${kindLabel} · updates=${n.updateCount}${n.refundClause ? " · ⚠️refund条款" : ""}</div>
           <div style="margin-top:4px">${stanceLine}</div>
-          ${n.excerpt ? `<div style="font-size:12px;color:#aaa;margin-top:4px">"${n.excerpt.replace(/</g, "&lt;")}"</div>` : ""}
-          <div style="margin-top:4px"><a href="${searchUrl}">在 Polymarket 搜索</a> · qid ${n.qid.slice(0, 10)}…</div>
+          ${n.excerpt ? `<div style="font-size:12px;color:#aaa;margin-top:4px">"${escapeHtml(n.excerpt)}"</div>` : ""}
+          <div style="margin-top:4px"><a href="${searchUrl}">在 Polymarket 搜索</a> · qid ${escapeHtml(n.qid.slice(0, 10))}…</div>
         </td></tr>`;
     })
     .join("\n");
@@ -302,7 +446,12 @@ async function main(): Promise<void> {
     .map((n) => `${n.title ?? n.qid} | ${[...n.kinds].join("+")} | stance=${n.stance}(${n.confidence})${n.refundClause ? " REFUND" : ""}`)
     .join("\n");
 
+  // At-least-once: send FIRST. If this throws, we fall through to the top-level
+  // catch → exit 1 → state is NOT committed → next tick re-scans the same range
+  // (cursor unchanged) and retries. A duplicate email on a later success is the
+  // accepted trade-off; a permanently-lost dispute alert is not.
   await sendMail({ subject, html, text });
+  commitState();
   console.log(
     JSON.stringify({
       mode: "chain-watch",

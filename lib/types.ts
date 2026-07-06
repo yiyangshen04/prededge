@@ -12,7 +12,9 @@ export interface ScanConfig {
   maxMarkets: number;
   /** Page size for Gamma API pagination */
   pageLimit: number;
-  /** Trading fee as a fraction (e.g. 0.002 = 0.2%) */
+  /** Fallback trading fee as a fraction (e.g. 0.002 = 0.2%). Only used when a
+   * market's Gamma feeSchedule is unknown — otherwise scoring uses the
+   * per-market Fee Structure V2 rate (see computeNetReturn). */
   feePct: number;
   /** On-chain transfer cost as a fraction */
   transferCostPct: number;
@@ -85,6 +87,21 @@ export interface GammaMarket {
   /** Maximum spread (in cents × 100, i.e. bps) a maker can quote and still
    * earn rewards. Shown alongside rewardsMinSize for context. */
   rewardsMaxSpread?: number;
+  /** Fee Structure V2 (2026-03-30): whether this market charges taker fees.
+   * `false` = fee-free (e.g. Geopolitics/World Events); `true` = charged per
+   * feeSchedule. Absent on some rows — treat as unknown, not free. */
+  feesEnabled?: boolean;
+  /** Fee bucket name, e.g. "crypto_fees_v2", "sports_fees_v2". Informational. */
+  feeType?: string | null;
+  /** Authoritative per-market fee schedule from Gamma. The actual taker fee is
+   * `shares × rate × p × (1−p)` (takerOnly) — the stale CLOB
+   * maker/taker_base_fee=1000bps field is NOT the real fee. */
+  feeSchedule?: {
+    rate?: number;
+    exponent?: number;
+    takerOnly?: boolean;
+    rebateRate?: number;
+  } | null;
   /** True for "one of many mutually-exclusive outcomes" markets (e.g. each
    * temperature bucket in a Multi-Strikes weather event). We collapse them
    * to one opportunity per event so a single 11-bucket market doesn't
@@ -209,6 +226,10 @@ export interface TailCandidate {
   clobBuyPrice: number | null;
   volume24hr: number;
   liquidity: number;
+  /** Effective taker fee rate from the market's Gamma feeSchedule: 0 for
+   * fee-free markets, the schedule rate (0.03–0.07) for charged ones, null
+   * when unknown (scoring then falls back to the flat config.feePct). */
+  takerFeeRate: number | null;
   description: string;
   /** All outcomes to token IDs for this market (e.g. {"Yes":"0x..","No":"0x.."}) */
   outcomeTokens: Record<string, string>;
@@ -424,6 +445,12 @@ export interface Opportunity {
    * this side (reason `official_divergence_play`); otherwise it is capped at
    * observe (reason `divergence_leg_needs_text_backing`). */
   divergenceLeg?: boolean;
+  /** Effective taker fee rate from the market's Gamma feeSchedule (0 =
+   * fee-free market, 0.03–0.07 = charged category, null/absent = unknown →
+   * consumers fall back to the flat config.feePct). Carried on the
+   * opportunity so live recompute / trade preview use the SAME fee basis as
+   * the scanner's netReturnPct instead of silently disagreeing with it. */
+  takerFeeRate?: number | null;
 }
 
 // ── Paper Trading ──
@@ -490,6 +517,12 @@ export interface ScanRun {
     replayCount: number;
     complete: boolean;
   } | null;
+  /** True when order-book fetches failed for a disputed candidate, or the
+   * overall book-fetch failure rate was high. The opportunity set may be
+   * missing candidates that were never actually evaluated — distinct from a
+   * clean "no opportunities" scan. Consumers (scan-notify) surface it instead
+   * of reporting a silent success. Absent on older persisted runs. */
+  booksIncomplete?: boolean;
 }
 
 // ── Combined response from scan API ──

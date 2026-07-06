@@ -20,11 +20,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { runScan } from "../lib/polymarket/scanner";
 import { DEFAULT_SCAN_CONFIG } from "../lib/polymarket/config";
-import type { Opportunity, ScanResponse } from "../lib/types";
+import type { Opportunity, ScanResponse, ScanRun } from "../lib/types";
 import { renderOpportunitiesEmail, sendMail } from "./mailer";
+import { writeFileAtomic } from "../lib/fsAtomic";
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const STATE_FILE = path.join(PROJECT_ROOT, "data", "notify-state.json");
+
+/** Reserved notify-state key (not a tokenId) tracking whether we last alerted
+ * on a coverage degradation, so the degraded email is edge-triggered (once per
+ * episode) instead of every 30-minute tick. */
+const COVERAGE_KEY = "__coverage__";
 const GAMMA_PROBE_URL = "https://gamma-api.polymarket.com/markets?limit=1";
 const GAMMA_PROBE_TIMEOUT_MS = 10_000;
 
@@ -64,13 +70,19 @@ function isNotifiable(o: Opportunity): boolean {
   // a. UMA 状态为 disputed 且 decision 为 actionable
   const uma = (o.umaResolutionStatus ?? "").trim().toLowerCase();
   if (uma === "disputed" && o.decision === "actionable") return true;
-  // c. 官方方向背书,且未被拒绝。仅限官方真实文本(via=text):price_fallback
-  // 是无文本时按价格推断的方向,官方并未背书,不配触发"官方方向"邮件
-  // (32/32 战绩只属于官方明确文本口径)。这类市场仍在网站争议区展示。
+  // c. 官方方向背书。仅限官方真实文本(via=text):price_fallback 是无文本时按
+  // 价格推断的方向,官方并未背书,不配触发"官方方向"邮件(32/32 战绩只属于官方
+  // 明确文本口径)。此处不再要求 decision!==rejected:一个官方已背书、但因盘口
+  // 薄(insufficient_depth / excessive_slippage / net_return_below_threshold)
+  // 被量化硬拒的领先腿,恰恰是最该知会的机会——邮件里照常显示 decision 供人工
+  // 判断能否小额吃进。refund_clause / official_contradicts_side 的市场经
+  // officialContext 修复后已不再携带 official_direction_backed,天然排除在外。
+  // 排除 divergenceLeg:被拒的落后腿只配走规则 b 的分歧闸门(要求 high 置信),
+  // 否则中置信 leans 文本会让 0.1x 的 trailing 腿以"官方背书"名义漏进邮件。
   if (
     reasons.includes("official_direction_backed") &&
     o.officialContext?.via === "text" &&
-    o.decision !== "rejected"
+    o.divergenceLeg !== true
   ) {
     return true;
   }
@@ -82,6 +94,14 @@ function isNotifiable(o: Opportunity): boolean {
 interface NotifyStateEntry {
   lastDecision: string;
   lastStance: string | null;
+  /** officialContext.via at last notify. Included in the change test so a
+   * price_fallback → official-text (via=text) upgrade re-notifies even when the
+   * stance string is unchanged — that upgrade is the highest-value transition
+   * (the 32/32 official-text cohort) and must not be silently suppressed. */
+  lastVia?: string | null;
+  /** officialContext.confidence at last notify — a medium→high upgrade on the
+   * same stance is also worth re-surfacing. */
+  lastConfidence?: string | null;
   notifiedAt: string;
 }
 
@@ -106,16 +126,45 @@ function loadState(): NotifyState {
 }
 
 function saveState(state: NotifyState): void {
-  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + "\n", "utf8");
+  // Atomic write: a crash mid-write must not leave a truncated JSON that the
+  // next run parses as empty and then re-emails every already-notified market.
+  writeFileAtomic(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
 }
 
-/** 新 tokenId,或 decision / officialContext.stance 相对上次通知发生变化。 */
+/** 折叠 decision 到通知档位:rejected 与 observe 同档。规则 c 放行 rejected 后,
+ * 盘口在深度/滑点阈值附近徘徊会让 decision 在 rejected↔observe 间反复翻转,
+ * 每次翻转都算"变化"会在 48-72h 争议期里积累几十封重复邮件;真正值得重发的
+ * 只有跨 actionable 边界的变化。 */
+function decisionTier(decision: string): string {
+  return decision === "actionable" ? "actionable" : "sub_actionable";
+}
+
+const CONFIDENCE_RANK: Record<string, number> = { none: 0, low: 1, medium: 2, high: 3 };
+
+/**
+ * 新 tokenId,或相对上次通知发生了值得重发的变化:
+ * - decision 跨 actionable 边界(双向:进场/离场都值得知道);
+ * - stance 字符串变化(双向:方向翻转是最重要的信号);
+ * - via / confidence 仅在**升级**时触发(price_fallback→text、置信度上升)。
+ *   降级多半是 RPC 瞬断导致官方文本暂时读不到(text→price_fallback 回落),
+ *   双向比较会在瞬断恢复后再触发一次,成对发出无信息量的重复邮件;
+ * - 旧版状态条目没有 lastVia/lastConfidence 字段("lastVia" in prev 为 false),
+ *   跳过升级比较,避免升级部署后第一轮把所有已通知机会重发一遍。
+ */
 function isNewOrChanged(state: NotifyState, o: Opportunity): boolean {
   const prev = state[o.tokenId];
   if (!prev) return true;
-  const stance = o.officialContext?.stance ?? null;
-  return prev.lastDecision !== o.decision || (prev.lastStance ?? null) !== stance;
+  if (decisionTier(prev.lastDecision) !== decisionTier(o.decision)) return true;
+  if ((prev.lastStance ?? null) !== (o.officialContext?.stance ?? null)) return true;
+  if ("lastVia" in prev) {
+    const viaUpgraded =
+      o.officialContext?.via === "text" && prev.lastVia !== "text";
+    const confUpgraded =
+      (CONFIDENCE_RANK[o.officialContext?.confidence ?? "none"] ?? 0) >
+      (CONFIDENCE_RANK[prev.lastConfidence ?? "none"] ?? 0);
+    if (viaUpgraded || confUpgraded) return true;
+  }
+  return false;
 }
 
 // ── 主流程 ──
@@ -154,7 +203,7 @@ async function main(): Promise<void> {
   );
 
   if (toNotify.length === 0) {
-    console.log("[scan-notify] 无新内容(全部已通知过且 decision/stance 未变化),不发邮件。");
+    console.log("[scan-notify] 无新内容(全部已通知过且 decision/stance/via 未变化),不发邮件。");
   } else {
     const email = renderOpportunitiesEmail(toNotify, scan);
     const { messageId } = await sendMail(email);
@@ -166,11 +215,18 @@ async function main(): Promise<void> {
       state[o.tokenId] = {
         lastDecision: o.decision,
         lastStance: o.officialContext?.stance ?? null,
+        lastVia: o.officialContext?.via ?? null,
+        lastConfidence: o.officialContext?.confidence ?? null,
         notifiedAt,
       };
     }
     saveState(state);
   }
+
+  // 覆盖降级告警(边沿触发,一次降级只发一封):争议普查页失败
+  // (disputeCoverage.complete=false)或订单簿抓取失败(booksIncomplete)意味着本
+  // 轮机会集可能缺失真实候选——不能静默显示"扫描正常"。
+  await handleCoverageDegradation(scan, state);
 
   // cron 日志 grep 用的一行 JSON 摘要
   console.log(
@@ -178,9 +234,50 @@ async function main(): Promise<void> {
       scanId: scan.scanId,
       opportunities: opportunities.length,
       notified: toNotify.length,
+      coverageComplete: scan.disputeCoverage?.complete ?? null,
+      booksIncomplete: scan.booksIncomplete ?? false,
       mode,
     })
   );
+}
+
+/** Edge-triggered coverage-degradation alert. Emails once when coverage goes
+ * healthy→degraded and once on recovery, mirroring the heartbeat pattern so a
+ * persistent degradation doesn't spam every 30-minute tick. */
+async function handleCoverageDegradation(scan: ScanRun, state: NotifyState): Promise<void> {
+  const degraded =
+    scan.disputeCoverage?.complete === false || scan.booksIncomplete === true;
+  const prevDegraded = state[COVERAGE_KEY]?.lastDecision === "degraded";
+  const now = new Date().toISOString();
+
+  if (degraded) {
+    const reasonBits: string[] = [];
+    if (scan.disputeCoverage?.complete === false) reasonBits.push("争议普查分页失败(complete=false)");
+    if (scan.booksIncomplete === true) reasonBits.push("订单簿抓取失败(booksIncomplete)");
+    const reason = reasonBits.join(" + ");
+    console.warn(`[scan-notify] ⚠️ 覆盖降级:${reason} — 本轮机会集可能缺失真实候选。`);
+    if (!prevDegraded) {
+      // at-least-once:只有发信成功才把状态标为 degraded。发信失败时保持旧
+      // 状态,下个 30 分钟 tick 重试——否则首封告警被 SMTP 抖动吞掉后,整个
+      // 降级期(可能数天)就永久静默了,恰好重演 S1 修掉的反模式。
+      try {
+        await sendMail({
+          subject: "[PredEdge] ⚠️ 扫描覆盖降级",
+          html: `<div style="font-family:system-ui,sans-serif;max-width:640px"><h3 style="color:#d97706;margin:0 0 8px">扫描覆盖降级</h3><p>scan <b>${scan.scanId}</b> 检测到:${reason}。</p><p>意味着本轮的机会/通知集<b>可能缺失真实候选</b>(区别于"没有机会")。请留意后续几轮是否恢复;持续降级建议检查 Gamma/CLOB 可达性与 RPC 限流。</p></div>`,
+          text: `扫描覆盖降级 scan=${scan.scanId}:${reason}。本轮机会集可能缺失真实候选。`,
+        });
+        console.log("[scan-notify] 已发送覆盖降级告警邮件。");
+        state[COVERAGE_KEY] = { lastDecision: "degraded", lastStance: null, notifiedAt: now };
+        saveState(state);
+      } catch (err) {
+        console.error(`[scan-notify] 覆盖降级告警邮件发送失败(下轮重试):${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  } else if (prevDegraded) {
+    console.log("[scan-notify] 覆盖已恢复正常。");
+    state[COVERAGE_KEY] = { lastDecision: "ok", lastStance: null, notifiedAt: now };
+    saveState(state);
+  }
 }
 
 main().catch((err) => {

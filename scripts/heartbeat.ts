@@ -16,6 +16,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { sendMail } from "./mailer";
+import { writeFileAtomic } from "../lib/fsAtomic";
 
 const ROOT = path.resolve(__dirname, "..");
 const DATA = path.join(ROOT, "data");
@@ -58,6 +59,12 @@ interface AlertEntry {
 interface HeartbeatState {
   alert: Record<string, AlertEntry>;
   offsets: Record<string, number>;
+  /** st_ino of each log at the time its offset was recorded. When the log is
+   * rotated (tail -c ... > tmp && mv changes the inode) the byte offset is
+   * meaningless against the new file, so a changed inode forces a from-0
+   * reread instead of the offset-vs-size heuristic (which mis-fires when the
+   * rotated file is smaller than the old offset). */
+  logInodes: Record<string, number>;
   lastDigestAt: string | null;
 }
 
@@ -67,16 +74,16 @@ function loadState(): HeartbeatState {
     return {
       alert: raw.alert && typeof raw.alert === "object" ? raw.alert : {},
       offsets: raw.offsets && typeof raw.offsets === "object" ? raw.offsets : {},
+      logInodes: raw.logInodes && typeof raw.logInodes === "object" ? raw.logInodes : {},
       lastDigestAt: typeof raw.lastDigestAt === "string" ? raw.lastDigestAt : null,
     };
   } catch {
-    return { alert: {}, offsets: {}, lastDigestAt: null };
+    return { alert: {}, offsets: {}, logInodes: {}, lastDigestAt: null };
   }
 }
 
 function saveState(state: HeartbeatState): void {
-  fs.mkdirSync(DATA, { recursive: true });
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 1) + "\n", "utf8");
+  writeFileAtomic(STATE_FILE, JSON.stringify(state, null, 1) + "\n");
 }
 
 // ── 工具 ──
@@ -158,6 +165,56 @@ async function watch(): Promise<void> {
     }
   }
 
+  // Degradation check for chain-watch: it exits 0 (marker stays fresh) even
+  // when only the first block window of each tick succeeds, so a marker-mtime
+  // check alone never goes "down" while the cursor silently falls behind and
+  // starts permanently skipping blocks. Inspect recent tick summaries for
+  // persistent partial failures (sweep_error) or accumulating gap.
+  {
+    const chainCh = CHANNELS[0];
+    const DEG_KEY = "chain-watch-degraded";
+    const recent = tailLines(chainCh.log, 12).filter((l) => l.startsWith("{"));
+    let samples = 0;
+    let sweepErrs = 0;
+    let gapSum = 0;
+    let gapTicks = 0;
+    for (const l of recent) {
+      try {
+        const j = JSON.parse(l);
+        if (j.mode !== "chain-watch") continue;
+        samples += 1;
+        if (j.sweep_error) sweepErrs += 1;
+        const g = Number(j.gap) || 0;
+        gapSum += g;
+        if (g > 0) gapTicks += 1;
+      } catch {
+        // non-JSON line — ignore
+      }
+    }
+    // gap 要求至少 2 个 tick 都出现:停机后的首个追赶 tick 会一次性记录一个大
+    // gap(chain-watch 自己已就此发过 gap 告警),那是已结束的历史事件;只有多个
+    // tick 连续产生 gap 才说明"正在持续漏扫"。sweep_error 保持原判据。
+    const degraded = samples >= 5 && (sweepErrs >= 5 || (gapTicks >= 2 && gapSum > 300));
+    const prevDegraded = state.alert[DEG_KEY]?.status === "down";
+    const degChannel: Channel = { ...chainCh, key: DEG_KEY };
+    if (degraded && !prevDegraded) {
+      events.push({
+        ch: { ...degChannel, label: "chain-watch(持续部分失败 / 漏块)" },
+        kind: "down",
+        detail: `进程仍在运行(exit 0)但最近 ${samples} 个 tick 中 ${sweepErrs} 个部分失败,累计 gap ${gapSum} 块 —— 正在持续漏扫,监控 mtime 检查无法发现。`,
+      });
+      state.alert[DEG_KEY] = { status: "down", since: new Date().toISOString() };
+    } else if (!degraded && prevDegraded) {
+      events.push({
+        ch: { ...degChannel, label: "chain-watch(部分失败已恢复)" },
+        kind: "recovered",
+        detail: "部分失败 / 漏块累积已恢复正常。",
+      });
+      state.alert[DEG_KEY] = { status: "ok", since: new Date().toISOString() };
+    }
+    summary[DEG_KEY] = degraded ? `degraded(${sweepErrs}/${samples} 部分失败, gap累计 ${gapSum})` : "ok";
+  }
+
   if (events.length > 0) {
     const downs = events.filter((e) => e.kind === "down");
     const subject =
@@ -213,18 +270,31 @@ interface ScanStats {
   lastNotified: number | null;
 }
 
-/** 从上次 offset 读新增日志;文件被周日截断(offset > size)时从头重读。 */
-function readNewLog(file: string, offset: number): { content: string; nextOffset: number } {
+/**
+ * Read new log bytes since the last offset. Rotation-aware: if the file's inode
+ * changed since we recorded the offset (weekly `tail -c ... > tmp && mv`), the
+ * old byte offset points into unrelated content, so we reread from 0. The plain
+ * `offset > size` guard alone silently mis-aligns when the rotated file is
+ * smaller than the old offset in a way that isn't a clean truncation.
+ */
+function readNewLog(
+  file: string,
+  offset: number,
+  prevIno: number | undefined
+): { content: string; nextOffset: number; ino: number | null } {
   try {
-    const size = fs.statSync(file).size;
-    const from = offset > size ? 0 : offset;
+    const stat = fs.statSync(file);
+    const size = stat.size;
+    const ino = stat.ino;
+    const rotated = prevIno != null && ino !== prevIno;
+    const from = rotated || offset > size ? 0 : offset;
     const fd = fs.openSync(file, "r");
     const buf = Buffer.alloc(size - from);
     fs.readSync(fd, buf, 0, size - from, from);
     fs.closeSync(fd);
-    return { content: buf.toString("utf8"), nextOffset: size };
+    return { content: buf.toString("utf8"), nextOffset: size, ino };
   } catch {
-    return { content: "", nextOffset: 0 };
+    return { content: "", nextOffset: 0, ino: null };
   }
 }
 
@@ -277,8 +347,16 @@ async function daily(): Promise<void> {
   const now = new Date();
   const periodFrom = state.lastDigestAt ? fmtTime(new Date(state.lastDigestAt)) : "日志起点";
 
-  const chainLog = readNewLog(CHANNELS[0].log, state.offsets["chain-watch"] ?? 0);
-  const scanLog = readNewLog(CHANNELS[1].log, state.offsets["scan-notify"] ?? 0);
+  const chainLog = readNewLog(
+    CHANNELS[0].log,
+    state.offsets["chain-watch"] ?? 0,
+    state.logInodes["chain-watch"]
+  );
+  const scanLog = readNewLog(
+    CHANNELS[1].log,
+    state.offsets["scan-notify"] ?? 0,
+    state.logInodes["scan-notify"]
+  );
   const cs = chainStats(chainLog.content);
   const ss = scanStats(scanLog.content);
 
@@ -329,6 +407,8 @@ async function daily(): Promise<void> {
   // 发信成功后才推进 offset — 失败则本区间下次日报补上
   state.offsets["chain-watch"] = chainLog.nextOffset;
   state.offsets["scan-notify"] = scanLog.nextOffset;
+  if (chainLog.ino != null) state.logInodes["chain-watch"] = chainLog.ino;
+  if (scanLog.ino != null) state.logInodes["scan-notify"] = scanLog.ino;
   state.lastDigestAt = now.toISOString();
   saveState(state);
   console.log(JSON.stringify({ mode: "heartbeat-daily", at: now.toISOString(), chain: cs, scan: ss }));

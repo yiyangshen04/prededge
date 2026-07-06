@@ -96,6 +96,28 @@ function candidateIsDisputed(candidate: TailCandidate): boolean {
   return candidate.umaResolutionStatus?.trim().toLowerCase() === "disputed";
 }
 
+/**
+ * Effective taker fee rate under Fee Structure V2 (2026-03-30), from Gamma's
+ * authoritative per-market fields. Returns 0 for fee-free markets
+ * (feesEnabled=false), the schedule rate (0.03–0.07) for charged ones, and
+ * null when the fields are absent or implausible — scoring then falls back to
+ * the flat conservative config.feePct instead of assuming free.
+ */
+export function takerFeeRateOf(market: GammaMarket): number | null {
+  if (market.feesEnabled === false) return 0;
+  const rate = market.feeSchedule?.rate;
+  if (
+    market.feesEnabled === true &&
+    typeof rate === "number" &&
+    Number.isFinite(rate) &&
+    rate >= 0 &&
+    rate <= 0.2
+  ) {
+    return rate;
+  }
+  return null;
+}
+
 function isOracleResolutionCandidate(candidate: TailCandidate): boolean {
   return hasUmaResolutionStatus(candidate.umaResolutionStatus);
 }
@@ -195,11 +217,15 @@ const ORACLE_PRICE_MAX = 0.9999;
 const DISPUTED_PRICE_MIN = 0.0001;
 
 /**
- * Disputed markets trade rarely, so their CLOB book snapshots are routinely
- * older than the 60s default staleness cutoff. Dropping them would silently
- * shrink the Official Ruling class, so they get a wider window instead.
+ * Disputed markets awaiting the DVM routinely go far longer than 10 minutes
+ * with no trade, so any minutes-scale staleness cutoff silently drops
+ * sparse-but-valid disputed books (the exact Official Ruling class we most
+ * want to keep). We use a day-scale window: within a scan cycle the book is
+ * still the best available snapshot, and Stage 5 re-checks the real best ask
+ * against the price window anyway. Beyond a day the market has almost always
+ * resolved and been filtered out upstream.
  */
-const DISPUTED_BOOK_MAX_AGE_MS = 10 * 60_000;
+const DISPUTED_BOOK_MAX_AGE_MS = 24 * 60 * 60_000;
 
 /**
  * Minimum outcome price for an `endDate < now` market to count as truly
@@ -395,14 +421,18 @@ export async function runScan(
       // Disputed markets additionally keep the TRAILING leg (two-leg
       // collection): if officials back the side trading at 0.08, that leg is
       // the actual opportunity and must reach the book/context stages.
+      // Disputed markets bypass the Gamma reference-price pre-filter entirely.
+      // When a disputed book is single-sided/cleared, Gamma's outcomePrices
+      // snapshot can pin to exactly [1, 0] — which would evict BOTH legs (1 >
+      // 0.9999 and 0 < 0.0001) and drop the whole market from the census. The
+      // real best ask is re-checked against the price window in Stage 5, so we
+      // let every disputed leg through here regardless of the stale reference.
       const isDisputedMarket = umaResolutionStatus === "disputed";
-      const priceMin = isDisputedMarket
-        ? DISPUTED_PRICE_MIN
-        : oracleInFlight
-          ? ORACLE_PRICE_MIN
-          : config.tailPriceMin;
-      const priceMax = oracleInFlight ? ORACLE_PRICE_MAX : config.tailPriceMax;
-      if (price < priceMin || price > priceMax) continue;
+      if (!isDisputedMarket) {
+        const priceMin = oracleInFlight ? ORACLE_PRICE_MIN : config.tailPriceMin;
+        const priceMax = oracleInFlight ? ORACLE_PRICE_MAX : config.tailPriceMax;
+        if (price < priceMin || price > priceMax) continue;
+      }
 
       candidates.push({
         conditionId: market.conditionId,
@@ -421,6 +451,7 @@ export async function runScan(
         clobBuyPrice: null,
         volume24hr: vol,
         liquidity: liq,
+        takerFeeRate: takerFeeRateOf(market),
         description: market.description ?? "",
         outcomeTokens,
         awaitingResolution: timing.awaitingResolution,
@@ -472,7 +503,7 @@ export async function runScan(
   }
 
   if (candidates.length === 0) {
-    return buildEmptyResponse(scanId, markets.length, startTime);
+    return buildEmptyResponse(scanId, markets.length, startTime, disputeCoverage);
   }
 
   // ── Stage 3: Pre-score and select top candidates for book fetching ──
@@ -530,12 +561,27 @@ export async function runScan(
   const normalTokenIds = topCandidates
     .map((c) => c.tokenId)
     .filter((id) => !disputedTokenIds.has(id));
-  const [bookMap, disputedBooks] = await Promise.all([
+  const [normalRes, disputedRes] = await Promise.all([
     client.fetchBooksBatch(normalTokenIds),
     client.fetchBooksBatch([...disputedTokenIds], DISPUTED_BOOK_MAX_AGE_MS),
   ]);
-  for (const [tokenId, book] of disputedBooks) bookMap.set(tokenId, book);
-  console.log(`[scan] Fetched ${bookMap.size} order books`);
+  const bookMap = normalRes.books;
+  for (const [tokenId, book] of disputedRes.books) bookMap.set(tokenId, book);
+
+  // Book-fetch failures ≠ empty books. A disputed candidate whose book fetch
+  // FAILED (timeout/429/blocked) was never evaluated — that's a real
+  // notification gap. Flag it (and any high overall failure rate) so the
+  // scan doesn't report a silent "clean" success with a hole in coverage.
+  const disputedBookFailures = disputedRes.failedTokenIds.size;
+  const totalBookAttempts = normalTokenIds.length + disputedTokenIds.size;
+  const totalBookFailures = normalRes.failedTokenIds.size + disputedRes.failedTokenIds.size;
+  const booksIncomplete =
+    disputedBookFailures > 0 ||
+    (totalBookAttempts > 0 && totalBookFailures / totalBookAttempts > 0.2);
+  console.log(
+    `[scan] Fetched ${bookMap.size} order books (${totalBookFailures}/${totalBookAttempts} fetch failures, ${disputedBookFailures} disputed)` +
+      (booksIncomplete ? " [INCOMPLETE]" : "")
+  );
 
   // ── Stage 5: Score and classify ──
   // All calculations use the REAL best ask price from the order book, not Gamma's reference price
@@ -588,7 +634,12 @@ export async function runScan(
     const nearDepthUsd = analysis.nearDepthUsd;
     const slippageBps = analysis.slippageBps;
 
-    const netReturnPct = computeNetReturn(realPrice, slippageBps, config);
+    const netReturnPct = computeNetReturn(
+      realPrice,
+      slippageBps,
+      config,
+      c.takerFeeRate
+    );
     const eventDeadline = c.eventDeadline ?? c.endDate;
     const resolutionDeadline = c.resolutionDeadline ?? null;
     const expectedPayoutDate =
@@ -697,6 +748,7 @@ export async function runScan(
       // Trailing leg of a disputed market — the divergence-play shape. The
       // definitive gate runs after official context is attached (Stage 5a-2).
       divergenceLeg: isDisputed && realPrice < 0.5,
+      takerFeeRate: c.takerFeeRate,
     });
   }
 
@@ -891,10 +943,12 @@ export async function runScan(
     startedAt: new Date(startTime).toISOString(),
     completedAt: new Date().toISOString(),
     disputeCoverage,
+    booksIncomplete,
   };
 
   console.log(
-    `[scan] Done in ${durationMs}ms: ${scan.actionableCount} actionable, ${scan.observeCount} observe, ${scan.rejectedCount} rejected`
+    `[scan] Done in ${durationMs}ms: ${scan.actionableCount} actionable, ${scan.observeCount} observe, ${scan.rejectedCount} rejected` +
+      (booksIncomplete ? " [BOOKS INCOMPLETE — coverage gap]" : "")
   );
 
   return { scan, opportunities: deduped, onchainEvents };
@@ -903,7 +957,8 @@ export async function runScan(
 function buildEmptyResponse(
   scanId: string,
   marketsScanned: number,
-  startTime: number
+  startTime: number,
+  disputeCoverage: ScanRun["disputeCoverage"] = null
 ): ScanResponse {
   return {
     scan: {
@@ -916,6 +971,11 @@ function buildEmptyResponse(
       durationMs: Date.now() - startTime,
       startedAt: new Date(startTime).toISOString(),
       completedAt: new Date().toISOString(),
+      // A 0-candidate round must still carry the coverage verdict — dropping
+      // it here would let an empty degraded round read as "coverage healthy"
+      // (or fake a recovery) in scan-notify's degradation state machine.
+      disputeCoverage,
+      booksIncomplete: false,
     },
     opportunities: [],
   };

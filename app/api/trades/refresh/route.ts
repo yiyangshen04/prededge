@@ -2,6 +2,8 @@ import { NextRequest } from "next/server";
 import { listOpenPaperTrades, updatePaperTradeResolution } from "@/lib/localDb";
 import { PolymarketClient } from "@/lib/polymarket/client";
 import { DEFAULT_SCAN_CONFIG } from "@/lib/polymarket/config";
+import { takerFeePct } from "@/lib/polymarket/scoring";
+import { takerFeeRateOf } from "@/lib/polymarket/scanner";
 import { enforceRateLimit } from "@/lib/rateLimit";
 
 export const runtime = "nodejs";
@@ -88,10 +90,14 @@ export async function POST(request: NextRequest) {
         // Each share pays $1 on win; deduct fee + transfer cost so this
         // matches TradeModal's pre-trade "P&L if Win" preview. Without
         // this deduction the settled pnl on the Paper Trading page would
-        // be higher than what the modal promised at trade time.
+        // be higher than what the modal promised at trade time. Fee uses the
+        // market's real Fee Structure V2 rate (Gamma feeSchedule is on the
+        // market row we already fetched), flat fallback when unknown.
+        const avgPrice = shares > 0 ? usdAmount / shares : 0;
         const feeCost =
           usdAmount *
-          (DEFAULT_SCAN_CONFIG.feePct + DEFAULT_SCAN_CONFIG.transferCostPct);
+          (takerFeePct(avgPrice, takerFeeRateOf(market), DEFAULT_SCAN_CONFIG) +
+            DEFAULT_SCAN_CONFIG.transferCostPct);
         pnlUsd = shares - usdAmount - feeCost;
       } else {
         status = "lost";

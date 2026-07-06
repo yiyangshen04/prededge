@@ -42,28 +42,29 @@ export class PolymarketClient {
   // ── Internal fetch with retry ──
 
   private async fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-    const { retryCount, retryBackoffMs, timeoutMs } = this.config;
+    const { retryCount, timeoutMs } = this.config;
     let lastError: Error | null = null;
 
     for (let attempt = 1; attempt <= retryCount; attempt++) {
       try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-
+        // AbortSignal.timeout covers the ENTIRE request, body read included.
+        // The previous controller+clearTimeout cleared the timer as soon as the
+        // headers arrived, so a slow-drip body (a rate-limited node returning
+        // headers then stalling) could hang res.json() up to undici's ~300s
+        // default and freeze the whole scan.
         const res = await fetch(url, {
           ...init,
-          signal: controller.signal,
+          signal: AbortSignal.timeout(timeoutMs),
           headers: {
             Accept: "application/json",
             "User-Agent": "prededge-scanner/1.0",
             ...init?.headers,
           },
         });
-        clearTimeout(timer);
 
         if (res.status === 429 || res.status >= 500) {
           if (attempt < retryCount) {
-            await this.sleep(retryBackoffMs * attempt);
+            await this.sleep(this.retryDelayMs(attempt, res));
             continue;
           }
         }
@@ -76,12 +77,34 @@ export class PolymarketClient {
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         if (attempt < retryCount) {
-          await this.sleep(retryBackoffMs * attempt);
+          await this.sleep(this.retryDelayMs(attempt));
         }
       }
     }
 
     throw lastError ?? new Error(`Failed to fetch ${url}`);
+  }
+
+  /**
+   * Backoff for a retry. Honors the server's `Retry-After` header (seconds)
+   * when present — Gamma's 429 windows are seconds long, and the old flat
+   * `backoff * attempt` (<1s total) almost always re-hit the same limit.
+   * Otherwise exponential (base·2^(attempt-1)) with ±25% jitter so a burst of
+   * concurrent pages doesn't retry in lockstep, floored at 1s for 429s.
+   */
+  private retryDelayMs(attempt: number, res?: Response): number {
+    const retryAfter = res?.headers.get("retry-after");
+    if (retryAfter) {
+      const secs = Number(retryAfter);
+      if (Number.isFinite(secs) && secs >= 0) {
+        return Math.min(secs * 1000, 30_000);
+      }
+    }
+    const base = this.config.retryBackoffMs;
+    const floor = res?.status === 429 ? 1000 : 0;
+    const exp = Math.max(floor, base * 2 ** (attempt - 1));
+    const jitter = exp * (0.75 + Math.random() * 0.5);
+    return Math.min(Math.round(jitter), 30_000);
   }
 
   private sleep(ms: number): Promise<void> {
@@ -442,24 +465,48 @@ export class PolymarketClient {
    * larger `maxAgeMs` for those instead of silently dropping them.
    */
   async fetchBook(tokenId: string, maxAgeMs = 60_000): Promise<OrderBook | null> {
+    return (await this.fetchBookResult(tokenId, maxAgeMs)).book;
+  }
+
+  /**
+   * Like fetchBook but distinguishes a genuine fetch FAILURE (timeout, 429
+   * exhausted, connection blocked) from a book that merely came back empty or
+   * stale. The scanner needs this distinction: a stale/empty book is a real
+   * "no opportunity here" signal, but a fetch failure means the candidate was
+   * never actually evaluated — silently dropping those makes a notification gap
+   * look identical to a clean scan. `failed` is true only for the former.
+   */
+  async fetchBookResult(
+    tokenId: string,
+    maxAgeMs = 60_000
+  ): Promise<{ book: OrderBook | null; failed: boolean }> {
+    let data: OrderBook | null;
     try {
       const params = new URLSearchParams({ token_id: tokenId });
-      const data = await this.fetchJson<OrderBook>(
-        `${CLOB_API}/book?${params}`
-      );
-      if (!data) return null;
-      const tsRaw = data.timestamp;
-      if (tsRaw && /^\d+$/.test(tsRaw)) {
-        const ts = Number(tsRaw);
-        if (Number.isFinite(ts) && ts > 0) {
-          const age = Date.now() - ts;
-          if (age > maxAgeMs) return null;
-        }
+      data = await this.fetchJson<OrderBook>(`${CLOB_API}/book?${params}`);
+    } catch (err) {
+      // Deterministic 4xx (except 429) is a real answer, not a failure: a
+      // just-resolved/delisted market's /book returns 404 "no orderbook
+      // exists". Counting that as `failed` would trip booksIncomplete and fire a
+      // false coverage-degradation alert on every scan that races a market
+      // resolution. Only timeouts / connection errors / exhausted 429/5xx
+      // retries count as failed.
+      const status = err instanceof Error ? /^HTTP (\d{3}):/.exec(err.message)?.[1] : null;
+      if (status && status !== "429" && status.startsWith("4")) {
+        return { book: null, failed: false };
       }
-      return data;
-    } catch {
-      return null;
+      return { book: null, failed: true };
     }
+    if (!data) return { book: null, failed: false };
+    const tsRaw = data.timestamp;
+    if (tsRaw && /^\d+$/.test(tsRaw)) {
+      const ts = Number(tsRaw);
+      if (Number.isFinite(ts) && ts > 0) {
+        const age = Date.now() - ts;
+        if (age > maxAgeMs) return { book: null, failed: false }; // stale, not failed
+      }
+    }
+    return { book: data, failed: false };
   }
 
   /**
@@ -493,22 +540,25 @@ export class PolymarketClient {
   async fetchBooksBatch(
     tokenIds: string[],
     maxAgeMs?: number
-  ): Promise<Map<string, OrderBook>> {
-    const result = new Map<string, OrderBook>();
+  ): Promise<{ books: Map<string, OrderBook>; failedTokenIds: Set<string> }> {
+    const books = new Map<string, OrderBook>();
+    const failedTokenIds = new Set<string>();
     const { concurrency } = this.config;
 
     for (let i = 0; i < tokenIds.length; i += concurrency) {
       const batch = tokenIds.slice(i, i + concurrency);
-      const books = await Promise.all(
-        batch.map((id) => this.fetchBook(id, maxAgeMs))
+      const results = await Promise.all(
+        batch.map((id) => this.fetchBookResult(id, maxAgeMs))
       );
       batch.forEach((id, idx) => {
-        if (books[idx]) {
-          result.set(id, books[idx]);
+        if (results[idx].book) {
+          books.set(id, results[idx].book!);
+        } else if (results[idx].failed) {
+          failedTokenIds.add(id);
         }
       });
     }
 
-    return result;
+    return { books, failedTokenIds };
   }
 }

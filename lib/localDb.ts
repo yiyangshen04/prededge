@@ -129,6 +129,7 @@ export function getDb(): DatabaseSync {
 	      game_start_time TEXT,
 	      model_overlay TEXT,
 	      official_context TEXT,
+	      taker_fee_rate REAL,
 	      scanned_at TEXT NOT NULL,
       FOREIGN KEY (scan_id) REFERENCES scan_runs(scan_id) ON DELETE CASCADE
     );
@@ -268,6 +269,7 @@ function ensureOpportunityColumns(database: DatabaseSync) {
     ["question_id", "question_id TEXT"],
     ["model_overlay", "model_overlay TEXT"],
     ["official_context", "official_context TEXT"],
+    ["taker_fee_rate", "taker_fee_rate REAL"],
   ];
 
   for (const [name, ddl] of columns) {
@@ -392,6 +394,7 @@ function opportunityFromRow(row: Record<string, unknown>): Opportunity {
     gameStartTime: row.game_start_time == null ? null : String(row.game_start_time),
     modelOverlay: fromJson<ModelOverlay | null>(row.model_overlay, null),
     officialContext: fromJson<OfficialContext | null>(row.official_context, null),
+    takerFeeRate: row.taker_fee_rate == null ? null : Number(row.taker_fee_rate),
   };
 }
 
@@ -442,6 +445,12 @@ function paperTradeFromRow(row: Record<string, unknown>): PaperTrade {
   };
 }
 
+/** Days of scan history to keep. opportunities follows scan_runs via ON
+ * DELETE CASCADE (PRAGMA foreign_keys=ON at init); odds_snapshots is trimmed
+ * on the same horizon. Without this the two tables are append-only and the
+ * sqlite file grows by hundreds of rows per scan, forever. */
+const SCAN_RETENTION_DAYS = 30;
+
 export function persistScanResult(scan: ScanRun, opportunities: Opportunity[]) {
   withTransaction((database) => {
     database
@@ -463,6 +472,16 @@ export function persistScanResult(scan: ScanRun, opportunities: Opportunity[]) {
         scan.completedAt
       );
 
+    const retentionCutoff = new Date(
+      Date.now() - SCAN_RETENTION_DAYS * 86_400_000
+    ).toISOString();
+    database
+      .prepare(`DELETE FROM scan_runs WHERE started_at < ?`)
+      .run(retentionCutoff);
+    database
+      .prepare(`DELETE FROM odds_snapshots WHERE captured_at < ?`)
+      .run(retentionCutoff);
+
     if (opportunities.length === 0) return;
 
     const scannedAt = scan.completedAt ?? nowIso();
@@ -478,8 +497,8 @@ export function persistScanResult(scan: ScanRun, opportunities: Opportunity[]) {
 	        question_id, resolution_deadline, expected_payout_date,
 	        stale_raw_end_date, recurrent_like, postponed, timing_confidence,
 	        timing_reasons, sports_market_type, game_start_time, model_overlay,
-	        official_context, scanned_at
-	      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	        official_context, taker_fee_rate, scanned_at
+	      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertSnapshot = database.prepare(
       `INSERT INTO odds_snapshots (condition_id, token_id, outcome, price)
@@ -532,6 +551,7 @@ export function persistScanResult(scan: ScanRun, opportunities: Opportunity[]) {
         opp.gameStartTime ?? null,
         toJson(opp.modelOverlay ?? null),
         toJson(opp.officialContext ?? null),
+        opp.takerFeeRate ?? null,
         scannedAt
       );
       insertSnapshot.run(opp.conditionId, opp.tokenId, opp.outcome, opp.price);

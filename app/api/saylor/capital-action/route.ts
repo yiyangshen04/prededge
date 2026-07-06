@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { setCapitalActionFlag } from "@/lib/saylor/db";
+import { enforceRateLimit } from "@/lib/rateLimit";
 
 export const runtime = "nodejs";
 
@@ -12,6 +13,10 @@ export const runtime = "nodejs";
  * for flagged weeks.
  */
 export async function POST(request: NextRequest) {
+  // Flips a week's capital-action flag (blocks BUY signals) — a DB write, so
+  // rate-limit it like the other write routes.
+  const limited = enforceRateLimit(request, "saylor-capital-action", 10, 10_000);
+  if (limited) return limited;
   let body: { weekStart?: string; flagged?: boolean; note?: string } = {};
   try {
     body = await request.json();

@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { PolymarketClient } from "@/lib/polymarket/client";
 import { DEFAULT_SCAN_CONFIG } from "@/lib/polymarket/config";
 import { fillOrder } from "@/lib/polymarket/fills";
+import { enforceRateLimit } from "@/lib/rateLimit";
 
 /**
  * POST /api/trade/preview
@@ -9,6 +10,10 @@ import { fillOrder } from "@/lib/polymarket/fills";
  * Returns: FillResult (no DB writes)
  */
 export async function POST(request: NextRequest) {
+  // Same limiter as the sibling /api/trade route — without it, repeated
+  // previews fan out into unbounded CLOB /book fetches.
+  const limited = enforceRateLimit(request, "trade-preview", 20, 10_000);
+  if (limited) return limited;
   try {
     const body = await request.json();
     const tokenId: string | undefined = body.tokenId;

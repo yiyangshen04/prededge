@@ -111,10 +111,14 @@ export function recomputeAtSize(
   // Pass `bestAsk` as buyPrice to match scanner.ts:196's invocation — computeNetReturn
   // adds slippage on top of buyPrice internally, so passing avgFillPrice (which
   // already includes the size premium) would double-count slippage.
+  // takerFeeRate rides along so the live number stays on the same fee basis as
+  // the scanner's stored netReturnPct (rows persisted before the fee-model
+  // migration lack the field and fall back to the flat config.feePct).
   const netReturn = computeNetReturn(
     bestAsk,
     slippageBps,
-    DEFAULT_SCAN_CONFIG
+    DEFAULT_SCAN_CONFIG,
+    opp.takerFeeRate
   );
   // Mirror scanner.ts: when description parsing found a resolution deadline
   // strictly later than Gamma's endDate, hold days are measured to the

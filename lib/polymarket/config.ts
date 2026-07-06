@@ -13,6 +13,7 @@ export const DEFAULT_SCAN_CONFIG: ScanConfig = {
   feePct: 0.002,
   transferCostPct: 0.0005,
   nearPriceBand: 0.003,
+  dustLevelUsd: 25,
   concurrency: 15,
   timeoutMs: 15000,
   retryCount: 2,

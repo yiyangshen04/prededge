@@ -1,7 +1,10 @@
 import type { OrderBook, ScanConfig } from "../types";
 
 export interface DepthAnalysis {
-  /** Best (lowest) ask price on the order book — the real price you'd pay */
+  /** Anchor ask price: lowest ask whose level notional ≥ dustLevelUsd (falls
+   * back to the raw best ask when every level is dust). This is the price at
+   * which meaningful size actually fills — dust below it is eaten first in
+   * the VWAP walk but doesn't define where depth is measured. */
   bestAskPrice: number | null;
   /** Total USD depth within bestAsk + band */
   nearDepthUsd: number;
@@ -28,9 +31,18 @@ export function analyzeOrderBook(
     return { bestAskPrice: null, nearDepthUsd: 0, slippageBps: 9999, vwapPrice: null };
   }
 
-  const bestAskPrice = asks[0].price;
+  // Anchor at the first non-dust level. A $5–15 dust ask parked a few tenths
+  // of a cent below a real liquidity wall would otherwise become bestAsk,
+  // drag nearCap below the wall, and collapse nearDepthUsd to the dust's own
+  // notional — flipping the market to insufficient_depth until the dust is
+  // eaten, then back (a 30-min entry/exit email oscillation in scan-notify).
+  // When every level is dust the fallback keeps today's behavior: near depth
+  // is genuinely tiny and the insufficient_depth reject is correct.
+  const anchor = asks.find((a) => a.price * a.size >= config.dustLevelUsd);
+  const bestAskPrice = (anchor ?? asks[0]).price;
 
-  // Near-price depth: sum notional of asks within bestAsk + band
+  // Near-price depth: sum notional of asks within anchor + band. Dust below
+  // the anchor is cheaper real liquidity, so it stays in the sum.
   const nearCap = Math.min(config.tailPriceMax, bestAskPrice + config.nearPriceBand);
   const nearDepthUsd = asks
     .filter((a) => a.price <= nearCap)

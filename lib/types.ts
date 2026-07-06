@@ -20,6 +20,12 @@ export interface ScanConfig {
   transferCostPct: number;
   /** Band around buy price to measure near-price depth */
   nearPriceBand: number;
+  /** Ask levels with notional below this (USD) are skipped when picking the
+   * near-price-band anchor (bestAskPrice). They still count toward
+   * nearDepthUsd and the VWAP fill walk — they're real, cheaper liquidity —
+   * but a dust ask parked just below a real liquidity wall must not drag the
+   * band under the wall and collapse the depth reading. */
+  dustLevelUsd: number;
   /** Max concurrent CLOB requests */
   concurrency: number;
   /** Request timeout in ms */

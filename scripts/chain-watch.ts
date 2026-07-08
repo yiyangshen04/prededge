@@ -138,6 +138,7 @@ interface LlmPendingEntry {
   adapter: string;
   kinds: string[];
   title: string | null;
+  description: string | null;
   attempts: number;
   firstSeenAt: number;
 }
@@ -187,20 +188,26 @@ function saveState(state: WatchState): void {
 
 // ── On-chain question title ──
 
-/** Extract the human question title from the adapter's ancillary data
- * ("q: title: <...>, description: ..."). Minimal scan-based decode: find the
- * dynamic bytes field of getQuestion's return that looks like ancillary
- * data (layout differs per adapter version). */
-async function fetchQuestionTitle(adapter: string, qid: string): Promise<string | null> {
+/** Extract the human question title + description (settlement rules) from the
+ * adapter's ancillary data ("q: title: <...>, description: <...> res_data:").
+ * Minimal scan-based decode: find the dynamic bytes field of getQuestion's
+ * return that looks like ancillary data (layout differs per adapter version).
+ * The description feeds the LLM second read — official clarifications often
+ * only make sense against the market's own resolution rules. */
+async function fetchQuestionMeta(
+  adapter: string,
+  qid: string
+): Promise<{ title: string | null; description: string | null }> {
   try {
     const result = await ethCall(adapter, `${GET_QUESTION_SELECTOR}${qid.slice(2)}`);
-    if (!result || result === "0x") return null;
+    if (!result || result === "0x") return { title: null, description: null };
     const hex = result.slice(2);
     const utf8 = Buffer.from(hex, "hex").toString("utf8");
-    const m = utf8.match(/title:\s*([^\n]{4,300}?)(?:,\s*description:|res_data:|$)/);
-    return m ? m[1].trim() : null;
+    const t = utf8.match(/title:\s*([^\n]{4,300}?)(?:,\s*description:|res_data:|$)/);
+    const d = utf8.match(/description:\s*([\s\S]{4,2500}?)(?:\s*market_id:|\s*res_data:|$)/);
+    return { title: t ? t[1].trim() : null, description: d ? d[1].trim() : null };
   } catch {
-    return null;
+    return { title: null, description: null };
   }
 }
 
@@ -211,6 +218,10 @@ interface Notable {
   adapter: string;
   kinds: Set<"reset" | "context">;
   title: string | null;
+  /** Market settlement rules from ancillary data — context the LLM second
+   * read needs (official clarifications often only decide the question when
+   * read against the market's own resolution criteria). */
+  description: string | null;
   stance: string;
   confidence: string;
   refundClause: boolean;
@@ -343,6 +354,7 @@ async function main(): Promise<void> {
         adapter: log.address.toLowerCase(),
         kinds: new Set(),
         title: null,
+        description: null,
         stance: "none",
         confidence: "none",
         refundClause: false,
@@ -366,7 +378,9 @@ async function main(): Promise<void> {
       );
       break;
     }
-    item.title = await fetchQuestionTitle(item.adapter, item.qid);
+    const meta = await fetchQuestionMeta(item.adapter, item.qid);
+    item.title = meta.title;
+    item.description = meta.description;
     try {
       const { updates } = await getOfficialUpdates({ resolvedBy: item.adapter, questionID: item.qid });
       item.enriched = true;
@@ -450,6 +464,7 @@ async function main(): Promise<void> {
   const consultLlm = (item: {
     qid: string;
     title: string | null;
+    description: string | null;
     updates: OfficialUpdate[];
     stance: string;
     confidence: string;
@@ -457,6 +472,7 @@ async function main(): Promise<void> {
   }): Promise<LlmStanceVerdict | null> =>
     classifyStanceWithLlm({
       title: item.title,
+      description: item.description,
       updates: item.updates,
       regexStance: { stance: item.stance, confidence: item.confidence },
       cacheKey: `${item.qid}:${item.updateCount}`,
@@ -487,6 +503,7 @@ async function main(): Promise<void> {
         adapter: p.adapter,
         kinds: new Set(p.kinds.filter((k): k is "reset" | "context" => k === "reset" || k === "context")),
         title: p.title,
+        description: p.description ?? null,
         stance: latest.stance,
         confidence: latest.confidence,
         refundClause: detectRefundClause(updates.map((u) => u.text)),
@@ -543,6 +560,7 @@ async function main(): Promise<void> {
         adapter: item.adapter,
         kinds: [...item.kinds],
         title: item.title,
+        description: item.description,
         attempts: 0,
         firstSeenAt: Date.now(),
       };

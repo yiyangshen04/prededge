@@ -149,6 +149,7 @@ function isVerbatimQuote(quote: string, sources: string[]): boolean {
 
 function buildPrompt(input: {
   title: string | null;
+  description?: string | null;
   updates: OfficialUpdate[];
   regexStance: { stance: string; confidence: string };
 }): string {
@@ -169,10 +170,14 @@ function buildPrompt(input: {
     .map((u, i) => `[${omitted + i + 1}] ${u.iso}\n${u.text}`)
     .join("\n\n");
 
+  const rulesBlock = input.description
+    ? `\nMarket resolution rules (from the market's own ancillary data — same untrusted source caveat):\n<market_rules>\n${input.description.slice(0, 2_000)}\n</market_rules>\n`
+    : "";
+
   return `You are classifying official Polymarket clarification texts for a prediction-market monitoring system.
 
 Market question: ${input.title ?? "(title unavailable — classify from the official texts alone)"}
-
+${rulesBlock}
 Official on-chain context updates for this market, in chronological order (oldest first)${omitted > 0 ? ` — the ${omitted} oldest update(s) were omitted for length` : ""}:
 <official_updates>
 ${updatesBlock}
@@ -180,7 +185,7 @@ ${updatesBlock}
 
 A regex-based classifier labeled this market's stance as "${input.regexStance.stance}" (confidence ${input.regexStance.confidence}). You are the second-opinion reader for cases the regex cannot parse.
 
-Your task: judge whether the officials' texts, read together as a sequence, imply which outcome this market will settle to. You are NOT predicting the real-world event — only reading what the officials wrote. Definitional rulings count: if officials define a contested term in a way that decides the question (e.g. defining "best man" as "the principal groomsman at a wedding" decides a market asking whether someone will be a groomsman), that implies a direction even without the words "resolves to". Later updates supersede earlier ones.
+Your task: judge whether the officials' texts, read together as a sequence, imply which outcome this market will settle to. You are NOT predicting the real-world event — only reading what the officials wrote. Definitional rulings count: if officials define a contested term in a way that decides the question (e.g. defining "best man" as "the principal groomsman at a wedding" decides a market asking whether someone will be a groomsman), that implies a direction even without the words "resolves to". Officials do not post definitions idly: these updates appear DURING a live dispute, so a definitional clarification targets the disputed term, and the direction of the definition usually reveals the ruling — combine it with the market question and rules to infer which outcome the definition makes true. Use leans_YES/leans_NO when that inference relies on assuming what exactly is being disputed (e.g. the definition only decides the market if the disputed person/event actually matches the defined term). Later updates supersede earlier ones.
 
 Reply with ONLY a JSON object (no markdown fence, no prose):
 {
@@ -239,8 +244,10 @@ function runClaude(prompt: string, timeoutMs: number): Promise<string> {
   // Do NOT add --max-turns: unknown option on these versions — it would fail
   // every call and silently disable the whole LLM gate.
   const args = ["-p", "--output-format", "json", "--tools", "", "--strict-mcp-config"];
-  const model = process.env.LLM_STANCE_MODEL?.trim();
-  if (model) args.push("--model", model);
+  // Opus 4.8 by default (user's choice for classification quality);
+  // LLM_STANCE_MODEL overrides.
+  const model = process.env.LLM_STANCE_MODEL?.trim() || "claude-opus-4-8";
+  args.push("--model", model);
   const childEnv = {} as NodeJS.ProcessEnv;
   for (const k of CHILD_ENV_ALLOWLIST) {
     const v = process.env[k];
@@ -286,6 +293,10 @@ function runClaude(prompt: string, timeoutMs: number): Promise<string> {
  */
 export async function classifyStanceWithLlm(input: {
   title: string | null;
+  /** Market resolution rules (ancillary-data description) — optional but
+   * valuable context: definitional rulings often only decide the question
+   * when read against the market's own resolution criteria. */
+  description?: string | null;
   updates: OfficialUpdate[];
   regexStance: { stance: string; confidence: string };
   cacheKey: string;

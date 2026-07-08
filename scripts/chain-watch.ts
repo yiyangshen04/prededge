@@ -535,26 +535,33 @@ async function main(): Promise<void> {
     }
   }
 
-  // B. 本轮事件闸门
+  // B. 本轮事件闸门。回测结论(96 信号 train/holdout):正则方向的无偏胜率仅
+  // 63-70%(模板文本假方向是主要亏损源),LLM 复核同向(置信≥medium)的子集
+  // 12/12 全胜且 holdout 19/19 正确拒判噪音——所以正则方向的事件也统一送
+  // LLM 复核:不拦截发信(32/32 口径的哨兵语义保留,LLM 挂了照发),但复核
+  // 结果决定标题分级(🟢双确认 / 🟠LLM拒判警示),让邮箱里直接可分诊。
+  // LLM 侧独立放行的方向判读要求置信 ≥medium(low 是回测里唯一漏网亏损)。
   for (const item of notable) {
-    if (isDirectionalStance(item.stance)) {
+    const hasText = item.updates.length > 0;
+    if (!item.enriched && !hasText) {
+      mailable.push(item); // 规则 3:读取失败 → 降级发信
+      continue;
+    }
+    if (hasText) {
+      if (llmBudgetLeftMs() < LLM_MIN_CALL_MS) {
+        llmSkipped += 1;
+      } else {
+        item.llm = await consultLlm(item);
+      }
+    }
+    const regexDirectional = isDirectionalStance(item.stance);
+    const llmDirectional =
+      item.llm != null && isDirectionalStance(item.llm.stance) && item.llm.confidence !== "low";
+    if (regexDirectional || llmDirectional) {
       mailable.push(item);
       continue;
     }
-    if (item.updates.length === 0) {
-      if (!item.enriched) mailable.push(item); // 规则 3:读取失败 → 降级发信
-      continue;
-    }
-    if (llmBudgetLeftMs() < LLM_MIN_CALL_MS) {
-      llmSkipped += 1;
-    } else {
-      item.llm = await consultLlm(item);
-    }
-    if (item.llm && isDirectionalStance(item.llm.stance)) {
-      mailable.push(item);
-      continue;
-    }
-    if (item.llm == null) {
+    if (hasText && item.llm == null) {
       // 无定论(失败/预算跳过,区别于"LLM 判了但无方向") → 入补判队列
       state.llmPending[item.qid] = {
         adapter: item.adapter,
@@ -633,13 +640,26 @@ async function main(): Promise<void> {
   }
 
   // 标题即分诊:最高优先级事件的 stance·置信度直接进主题行,一眼可判是否
-  // 值得打开。🟠 正则官方方向(32/32 口径) > 🔵 LLM 判读方向 > ⚪ 降级/其他。
+  // 值得打开。回测背书的分级:🟢 双确认(正则方向∧LLM同向,历史 12/12 全胜)
+  // > 🟠 官方方向但 LLM 拒判/未复核(拒判在回测里 = 模板噪音,胜率≈硬币)
+  // > 🔵 LLM 单独判读方向 > ⚪ 降级/其他。
+  const polarity = (stance: string): string => {
+    if (/YES$/i.test(stance)) return "+";
+    if (/NO$/i.test(stance)) return "-";
+    return stance; // resolve_to_* 等:要求字面一致
+  };
   const priorityOf = (n: Notable): { rank: number; label: string } => {
-    if (isDirectionalStance(n.stance)) return { rank: 0, label: `🟠 官方方向 ${n.stance}·${n.confidence}` };
-    if (n.llm && isDirectionalStance(n.llm.stance))
-      return { rank: 1, label: `🔵 LLM判读 ${n.llm.stance}·${n.llm.confidence}` };
-    if (!n.enriched) return { rank: 2, label: `⚪ 降级(文本读取失败)` };
-    return { rank: 3, label: `⚪ ${n.stance}` };
+    const llmDir = n.llm != null && isDirectionalStance(n.llm.stance) && n.llm.confidence !== "low";
+    if (isDirectionalStance(n.stance)) {
+      if (llmDir && polarity(n.llm!.stance) === polarity(n.stance))
+        return { rank: 0, label: `🟢 双确认 ${n.stance}·${n.confidence}` };
+      if (n.llm && !isDirectionalStance(n.llm.stance))
+        return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (LLM拒判⚠)` };
+      return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence}` };
+    }
+    if (llmDir) return { rank: 2, label: `🔵 LLM判读 ${n.llm!.stance}·${n.llm!.confidence}` };
+    if (!n.enriched) return { rank: 3, label: `⚪ 降级(文本读取失败)` };
+    return { rank: 4, label: `⚪ ${n.stance}` };
   };
   mailable.sort((a, b) => priorityOf(a).rank - priorityOf(b).rank);
   const llmBacked = mailable.filter((n) => n.llm && isDirectionalStance(n.llm.stance));

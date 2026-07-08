@@ -67,9 +67,13 @@ function isNotifiable(o: Opportunity): boolean {
   const reasons = o.decisionReasons ?? [];
   // b. 官方分歧形态 — 最高优先,无条件通知
   if (reasons.includes("official_divergence_play")) return true;
-  // a. UMA 状态为 disputed 且 decision 为 actionable
+  // a. UMA 状态为 disputed 且 decision 为 actionable,且净收益 ≥3%(2026-07-08
+  // 收窄:无官方文本背书的纯争议领先腿,历史判卷显示 净收益 2-3% 档恰是期望
+  // 最差的机会面——通知时买价普遍 >0.95、盈亏比 1:20+;3% 地板恰好留下判卷
+  // 认可的 full lid 型有肉机会,挡掉 @0.972 型肉薄通知。带 via=text 官方文本
+  // 的机会不受影响,照走规则 c。)
   const uma = (o.umaResolutionStatus ?? "").trim().toLowerCase();
-  if (uma === "disputed" && o.decision === "actionable") return true;
+  if (uma === "disputed" && o.decision === "actionable" && (o.netReturnPct ?? 0) >= 0.03) return true;
   // c. 官方方向背书。仅限官方真实文本(via=text):price_fallback 是无文本时按
   // 价格推断的方向,官方并未背书,不配触发"官方方向"邮件(32/32 战绩只属于官方
   // 明确文本口径)。此处不再要求 decision!==rejected:一个官方已背书、但因盘口

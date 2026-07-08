@@ -6,10 +6,13 @@
  * Every cron tick (default 3 min) it sweeps QuestionReset +
  * AncillaryDataUpdated events since the last tick, reads the question title
  * and official context straight from the chain, classifies the official
- * stance, and emails when something notification-worthy happened:
- *   - an official context update with a directional stance (highest value —
- *     the 32/32 signal class), or
- *   - a market entering the dispute flow (QuestionReset).
+ * stance, and emails ONLY directional events (2026-07-08 narrowing — 97.3% of
+ * raw dispute events carry no official direction and are not actionable):
+ *   - regex-directional official context (the 32/32 signal class), or
+ *   - regex-directionless text that a headless-Claude second read judges
+ *     directional (catches definitional rulings; via=llm, quoted evidence).
+ * Non-directional events still hit the log line and the notified-state
+ * fingerprints; they come back through the gate when officials add text.
  *
  * No Gamma/CLOB access → no prices, depth, or market URLs; the email carries
  * the question title, the official text excerpt, the classified direction,
@@ -25,6 +28,8 @@ import path from "path";
 import { sendMail } from "./mailer";
 import { ethCall } from "../lib/polymarket/oracleState";
 import { getOfficialUpdates, stanceFromText, detectRefundClause } from "../lib/polymarket/officialContext";
+import type { OfficialUpdate } from "../lib/polymarket/officialContext";
+import { classifyStanceWithLlm, llmCliCallCount, type LlmStanceVerdict } from "../lib/polymarket/llmStance";
 import { isDirectionalStance } from "../lib/virtualTags";
 import { KNOWN_ADAPTERS } from "../lib/polymarket/onchainEvents";
 import { writeFileAtomic } from "../lib/fsAtomic";
@@ -124,10 +129,25 @@ async function rpcVia<T>(urls: string[], method: string, params: unknown[]): Pro
 
 // ── State ──
 
+/** An event whose regex stance was directionless and whose LLM second read
+ * yielded NO verdict (CLI unavailable / timeout / budget-skipped). Its
+ * fingerprint is already committed, so it will never re-enter byQid on its
+ * own — this queue is the only path back to an LLM re-read (e.g. the first
+ * hours after deploy, before CLAUDE_CODE_OAUTH_TOKEN lands in .env). */
+interface LlmPendingEntry {
+  adapter: string;
+  kinds: string[];
+  title: string | null;
+  attempts: number;
+  firstSeenAt: number;
+}
+
 interface WatchState {
   lastBlock: number;
   /** qid → fingerprint of the last notified condition (event kinds + update count + stance). */
   notified: Record<string, string>;
+  /** qid → LLM re-read queue (see LlmPendingEntry). */
+  llmPending: Record<string, LlmPendingEntry>;
 }
 
 function statePath(): string {
@@ -141,13 +161,15 @@ function loadState(): WatchState {
   try {
     raw = readFileSync(statePath(), "utf8");
   } catch {
-    return { lastBlock: 0, notified: {} }; // first run — file absent
+    return { lastBlock: 0, notified: {}, llmPending: {} }; // first run — file absent
   }
   try {
     const parsed = JSON.parse(raw);
     return {
       lastBlock: Number(parsed.lastBlock) || 0,
       notified: parsed.notified && typeof parsed.notified === "object" ? parsed.notified : {},
+      llmPending:
+        parsed.llmPending && typeof parsed.llmPending === "object" ? parsed.llmPending : {},
     };
   } catch (err) {
     // File exists but is corrupt (truncated by a crash mid-write). Do NOT
@@ -194,6 +216,17 @@ interface Notable {
   refundClause: boolean;
   excerpt: string | null;
   updateCount: number;
+  /** Full chronological official-update sequence — kept so the LLM second
+   * reader sees the whole conversation, not just the latest excerpt. */
+  updates: OfficialUpdate[];
+  /** True only when getOfficialUpdates SUCCEEDED for this item. updates=[]
+   * with enriched=false means "text unread" (RPC failure / enrich-budget
+   * skip), which the mail gate must treat differently from "no text exists". */
+  enriched: boolean;
+  /** Second-opinion verdict from headless Claude (via=llm口径, never merged
+   * into the regex stance). Undefined = not consulted, null = consulted but
+   * failed/unavailable. */
+  llm?: LlmStanceVerdict | null;
 }
 
 async function main(): Promise<void> {
@@ -315,6 +348,8 @@ async function main(): Promise<void> {
         refundClause: false,
         excerpt: null,
         updateCount: 0,
+        updates: [],
+        enriched: false,
       });
     }
     byQid.get(qid)!.kinds.add(kind);
@@ -334,7 +369,9 @@ async function main(): Promise<void> {
     item.title = await fetchQuestionTitle(item.adapter, item.qid);
     try {
       const { updates } = await getOfficialUpdates({ resolvedBy: item.adapter, questionID: item.qid });
+      item.enriched = true;
       item.updateCount = updates.length;
+      item.updates = updates;
       item.refundClause = detectRefundClause(updates.map((u) => u.text));
       for (let i = updates.length - 1; i >= 0; i -= 1) {
         const classified = stanceFromText(updates[i].text);
@@ -387,9 +424,164 @@ async function main(): Promise<void> {
     saveState(state);
   };
 
-  if (notable.length === 0) {
-    // No new events: advance the cursor durably first (this progress must not
-    // be lost), then best-effort alert on any permanently-skipped gap. The
+  // ── 发信闸门(2026-07-08 收窄):只有"方向性"事件才配打扰邮箱 ──
+  // 生产判卷(74 事件 4 天)证明 97.3% 的链上争议事件无官方方向且不可执行,
+  // "任何新事件都发信"只产生噪音。收窄后:
+  //   1. 正则判出方向(isDirectionalStance) → 直接放行(32/32 口径的快路径);
+  //   2. 正则无方向但存在官方文本 → 交给 headless Claude 复核完整 update
+  //      时间序(修 Kelce 型"定义式裁定"假阴性),LLM 判出方向才放行,结果标
+  //      via=llm 与正则口径隔离;
+  //   3. 官方文本读取失败/预算跳过(enriched=false) → 降级发信(旧行为):
+  //      cursor 即将永久越过该块,而官方最终裁定往往是市场的最后一个事件,
+  //      静默等于永久漏报;
+  //   4. 链上确实无官方文本(纯 QuestionReset)与 LLM 亦判无方向的 → 只写
+  //      日志不发信。
+  // LLM 无定论(CLI 不可用/超时/预算耗尽) → 该事件按纯正则结果处理(fail-open
+  // 到规则收窄,绝不回到全量发信,也绝不吞掉正则已判出的方向),同时进入持久
+  // llmPending 队列,后续 tick LLM 恢复后补判(如部署初期 token 未配的窗口)。
+  // 所有 notable 无论发信与否都照常 commitState:指纹含 updateCount+stance,
+  // 官方后续再发文本时指纹必变,事件仍会回来重新过闸。
+  const TICK_KILL_MS = 170_000; // run-cron.sh 的 timeout SIGTERM
+  const SEND_MARGIN_MS = 12_000; // 为 sendMail+commitState 保留的尾部余量
+  const LLM_MIN_CALL_MS = 15_000; // 剩余预算低于此值不再发起新调用
+  const llmBudgetLeftMs = () => TICK_KILL_MS - SEND_MARGIN_MS - elapsed();
+  // 单次调用的超时被钳到剩余预算内:一个 149s 才开始的 60s 调用会越过 170s
+  // SIGTERM,把整个 tick(连同待发的正则方向邮件和 commitState)一起杀掉。
+  const consultLlm = (item: {
+    qid: string;
+    title: string | null;
+    updates: OfficialUpdate[];
+    stance: string;
+    confidence: string;
+    updateCount: number;
+  }): Promise<LlmStanceVerdict | null> =>
+    classifyStanceWithLlm({
+      title: item.title,
+      updates: item.updates,
+      regexStance: { stance: item.stance, confidence: item.confidence },
+      cacheKey: `${item.qid}:${item.updateCount}`,
+      timeoutMs: Math.min(60_000, llmBudgetLeftMs()),
+    });
+
+  const mailable: Notable[] = [];
+  let llmSkipped = 0;
+
+  // A. 上轮遗留的 LLM 补判队列:本轮有新事件的 qid 交回正常闸门处理(若又
+  //    失败会重新入队);其余在预算内逐个补判,有定论(无论方向与否)即出队。
+  for (const [qid, p] of Object.entries(state.llmPending)) {
+    if (byQid.has(qid)) {
+      delete state.llmPending[qid];
+      continue;
+    }
+    if (llmBudgetLeftMs() < LLM_MIN_CALL_MS) break;
+    let updates: OfficialUpdate[] = [];
+    try {
+      ({ updates } = await getOfficialUpdates({ resolvedBy: p.adapter, questionID: qid }));
+    } catch {
+      // RPC 瞬断 — 留队,下轮再试(attempts 照常累积,防永久滞留)
+    }
+    if (updates.length > 0) {
+      const latest = stanceFromText(updates[updates.length - 1].text);
+      const revived: Notable = {
+        qid,
+        adapter: p.adapter,
+        kinds: new Set(p.kinds.filter((k): k is "reset" | "context" => k === "reset" || k === "context")),
+        title: p.title,
+        stance: latest.stance,
+        confidence: latest.confidence,
+        refundClause: detectRefundClause(updates.map((u) => u.text)),
+        excerpt: updates[updates.length - 1].text.slice(0, 400),
+        updateCount: updates.length,
+        updates,
+        enriched: true,
+      };
+      if (isDirectionalStance(latest.stance)) {
+        // 补判期间官方追加了方向性文本(罕见,通常伴随新事件走正常闸门)
+        delete state.llmPending[qid];
+        mailable.push(revived);
+        continue;
+      }
+      const verdict = await consultLlm(revived);
+      if (verdict) {
+        delete state.llmPending[qid];
+        if (isDirectionalStance(verdict.stance)) {
+          revived.llm = verdict;
+          mailable.push(revived);
+        }
+        continue;
+      }
+    }
+    p.attempts += 1;
+    if (p.attempts >= 16 || Date.now() - p.firstSeenAt > 48 * 3600_000) {
+      console.warn(`[chain-watch] llmPending ${qid} 放弃补判(attempts=${p.attempts})`);
+      delete state.llmPending[qid];
+    }
+  }
+
+  // B. 本轮事件闸门
+  for (const item of notable) {
+    if (isDirectionalStance(item.stance)) {
+      mailable.push(item);
+      continue;
+    }
+    if (item.updates.length === 0) {
+      if (!item.enriched) mailable.push(item); // 规则 3:读取失败 → 降级发信
+      continue;
+    }
+    if (llmBudgetLeftMs() < LLM_MIN_CALL_MS) {
+      llmSkipped += 1;
+    } else {
+      item.llm = await consultLlm(item);
+    }
+    if (item.llm && isDirectionalStance(item.llm.stance)) {
+      mailable.push(item);
+      continue;
+    }
+    if (item.llm == null) {
+      // 无定论(失败/预算跳过,区别于"LLM 判了但无方向") → 入补判队列
+      state.llmPending[item.qid] = {
+        adapter: item.adapter,
+        kinds: [...item.kinds],
+        title: item.title,
+        attempts: 0,
+        firstSeenAt: Date.now(),
+      };
+    }
+  }
+  // 队列封顶:CLI 长期不可用时不能无界增长(淘汰最老的)
+  {
+    const pendingKeys = Object.keys(state.llmPending);
+    if (pendingKeys.length > 50) {
+      for (const k of pendingKeys.slice(0, pendingKeys.length - 50)) delete state.llmPending[k];
+    }
+  }
+  const suppressedItems = notable.filter((n) => !mailable.includes(n));
+  const suppressed = suppressedItems.length;
+  const degraded = mailable.filter((n) => !n.enriched).length;
+  if (suppressed > 0) {
+    console.log(
+      JSON.stringify({
+        mode: "chain-watch-suppressed",
+        items: suppressedItems.map((i) => ({
+          qid: i.qid.slice(0, 12),
+          title: i.title?.slice(0, 60) ?? null,
+          stance: i.stance,
+          llm:
+            i.llm === undefined
+              ? i.updates.length === 0
+                ? "no_text"
+                : "not_consulted"
+              : i.llm === null
+                ? "unavailable"
+                : i.llm.stance,
+        })),
+      })
+    );
+  }
+
+  if (mailable.length === 0) {
+    // No mailable events: advance the cursor durably first (this progress must
+    // not be lost), then best-effort alert on any permanently-skipped gap. The
     // skipped blocks are already gone, so a failed gap alert must not block
     // cursor progress or re-fire forever.
     commitState();
@@ -405,15 +597,33 @@ async function main(): Promise<void> {
       }
     }
     console.log(
-      JSON.stringify({ mode: "chain-watch", from, to: sweptTo, events: logs.length, notified: 0, gap, sweep_error: sweepError ?? undefined })
+      JSON.stringify({
+        mode: "chain-watch",
+        from,
+        to: sweptTo,
+        events: logs.length,
+        notified: 0,
+        suppressed,
+        llm_cli_calls: llmCliCallCount(),
+        llm_skipped: llmSkipped,
+        llm_pending: Object.keys(state.llmPending).length,
+        gap,
+        sweep_error: sweepError ?? undefined,
+      })
     );
     return;
   }
 
-  const directional = notable.filter((n) => isDirectionalStance(n.stance));
-  const subject = `[PredEdge 链上] ${notable.length} 个争议事件${directional.length > 0 ? ` (${directional.length} 个官方方向!)` : ""}`;
+  const llmBacked = mailable.filter((n) => n.llm && isDirectionalStance(n.llm.stance));
+  const regexDirectional = mailable.filter((n) => isDirectionalStance(n.stance));
+  const subjectBits = [
+    regexDirectional.length > 0 ? `${regexDirectional.length} 官方方向` : "",
+    llmBacked.length > 0 ? `${llmBacked.length} LLM判读` : "",
+    degraded > 0 ? `${degraded} 降级` : "",
+  ].filter(Boolean);
+  const subject = `[PredEdge 链上] ${mailable.length} 个争议事件${subjectBits.length > 0 ? ` (${subjectBits.join(", ")})` : ""}`;
 
-  const rows = notable
+  const rows = mailable
     .map((n) => {
       const searchUrl = n.title
         ? `https://polymarket.com/search?q=${encodeURIComponent(n.title.slice(0, 80))}`
@@ -421,14 +631,25 @@ async function main(): Promise<void> {
       const kindLabel = [...n.kinds]
         .map((k) => (k === "reset" ? "争议重置(QuestionReset)" : "官方context更新"))
         .join(" + ");
+      const degradedTag = !n.enriched
+        ? ` · <b style="color:#d97706">⚠️ 官方文本读取失败(降级通知,方向未知)</b>`
+        : "";
       const stanceLine = isDirectionalStance(n.stance)
         ? `<b style="color:#d97706">官方方向: ${escapeHtml(n.stance)} (${escapeHtml(n.confidence)})</b>`
-        : `立场: ${escapeHtml(n.stance)} (${escapeHtml(n.confidence)})`;
+        : `正则立场: ${escapeHtml(n.stance)} (${escapeHtml(n.confidence)})`;
+      // LLM 判读呈现:与正则并列,明确标 via=llm——这是判读增强,不是 32/32
+      // 口径的官方文本信号,依据引用原文供人工核对。
+      const llmLine = n.llm
+        ? isDirectionalStance(n.llm.stance)
+          ? `<div style="margin-top:2px"><b style="color:#2563eb">LLM 判读: ${escapeHtml(n.llm.stance)} (${escapeHtml(n.llm.confidence)}, via=llm)</b>${n.llm.evidence ? `<div style="font-size:12px;color:#666">依据: "${escapeHtml(n.llm.evidence)}"</div>` : ""}${n.llm.reasoning ? `<div style="font-size:12px;color:#888">${escapeHtml(n.llm.reasoning)}</div>` : ""}</div>`
+          : `<div style="margin-top:2px;font-size:12px;color:#888">LLM 判读: ${escapeHtml(n.llm.stance)} (${escapeHtml(n.llm.confidence)})</div>`
+        : "";
       return `<tr>
         <td style="padding:8px;border-bottom:1px solid #333">
           <div style="font-weight:600">${escapeHtml(n.title ?? n.qid)}</div>
-          <div style="font-size:12px;color:#888">${kindLabel} · updates=${n.updateCount}${n.refundClause ? " · ⚠️refund条款" : ""}</div>
+          <div style="font-size:12px;color:#888">${kindLabel} · updates=${n.updateCount}${n.refundClause ? " · ⚠️refund条款" : ""}${degradedTag}</div>
           <div style="margin-top:4px">${stanceLine}</div>
+          ${llmLine}
           ${n.excerpt ? `<div style="font-size:12px;color:#aaa;margin-top:4px">"${escapeHtml(n.excerpt)}"</div>` : ""}
           <div style="margin-top:4px"><a href="${searchUrl}">在 Polymarket 搜索</a> · qid ${escapeHtml(n.qid.slice(0, 10))}…</div>
         </td></tr>`;
@@ -436,14 +657,18 @@ async function main(): Promise<void> {
     .join("\n");
 
   const html = `<div style="font-family:system-ui,sans-serif;max-width:640px">
-    <p>链上监听(纯 RPC 模式,无价格数据)在块 ${from}–${sweptTo} 发现:</p>
+    <p>链上监听(纯 RPC 模式,无价格数据)在块 ${from}–${sweptTo} 发现方向性争议事件:</p>
     ${gap > 0 ? `<p style="color:#d97706">⚠️ 距上次运行跳过了 ${gap} 个块(停机追赶超出免费 RPC 回看窗口)。</p>` : ""}
     <table style="width:100%;border-collapse:collapse">${rows}</table>
-    <p style="font-size:12px;color:#888">直接买入前先在 App 确认盘口价格;分歧机会请核对官方文本与市场方向。</p>
+    ${suppressed > 0 ? `<p style="font-size:12px;color:#888">另有 ${suppressed} 个无方向争议事件已按收窄策略静默(仅记日志)。</p>` : ""}
+    <p style="font-size:12px;color:#888">直接买入前先在 App 确认盘口价格;LLM 判读(via=llm)是文本解读增强,非官方文本口径(32/32)本身,请核对引用原文。</p>
   </div>`;
 
-  const text = notable
-    .map((n) => `${n.title ?? n.qid} | ${[...n.kinds].join("+")} | stance=${n.stance}(${n.confidence})${n.refundClause ? " REFUND" : ""}`)
+  const text = mailable
+    .map((n) => {
+      const llmBit = n.llm && isDirectionalStance(n.llm.stance) ? ` llm=${n.llm.stance}(${n.llm.confidence})` : "";
+      return `${n.title ?? n.qid} | ${[...n.kinds].join("+")} | stance=${n.stance}(${n.confidence})${llmBit}${n.refundClause ? " REFUND" : ""}`;
+    })
     .join("\n");
 
   // At-least-once: send FIRST. If this throws, we fall through to the top-level
@@ -458,8 +683,13 @@ async function main(): Promise<void> {
       from,
       to: sweptTo,
       events: logs.length,
-      notified: notable.length,
-      directional: directional.length,
+      notified: mailable.length,
+      suppressed,
+      degraded,
+      llm_cli_calls: llmCliCallCount(),
+      llm_skipped: llmSkipped,
+      llm_backed: llmBacked.length,
+      llm_pending: Object.keys(state.llmPending).length,
       gap,
       sweep_error: sweepError ?? undefined,
     })

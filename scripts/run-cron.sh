@@ -35,7 +35,8 @@ if [ -n "$PROXY_PORT" ]; then
 fi
 # Node fetch 只在此开关下才读 HTTP(S)_PROXY(Node >= 24)
 export NODE_USE_ENV_PROXY=1
-export PATH="$HOME/opt/node/bin:$PATH"
+# ~/.local/bin: claude CLI(LLM 判读,lib/polymarket/llmStance.ts 经 PATH 解析)
+export PATH="$HOME/opt/node/bin:$HOME/.local/bin:$PATH"
 cd "$HOME/prededge" || exit 1
 
 # Node 版本自检:NODE_USE_ENV_PROXY 只在 Node>=24 生效,低版本会静默忽略代理、

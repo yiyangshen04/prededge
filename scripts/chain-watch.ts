@@ -14,10 +14,14 @@
  * Non-directional events still hit the log line and the notified-state
  * fingerprints; they come back through the gate when officials add text.
  *
- * No Gamma/CLOB access → no prices, depth, or market URLs; the email carries
- * the question title, the official text excerpt, the classified direction,
- * and a Polymarket search link. State (block cursor + notified set) lives in
- * a JSON file so this script needs no sqlite and no Next.js runtime.
+ * Prices/depth (改进 I1, 2026-07-08): mailable items get a best-effort
+ * executability annotation — qid→conditionId→Gamma→CLOB book via the box's
+ * proxy — because the 15-month backtest showed 87% of directional alerts had
+ * no $100 of real liquidity. The annotation is enrichment only: every
+ * Gamma/CLOB failure degrades to the plain alert (title, official excerpt,
+ * classified direction, search link). State (block cursor + notified set +
+ * digest queue) lives in a JSON file; sqlite is used only opportunistically
+ * for paper-trade registration (I6) and skipped where unavailable.
  *
  * Run: npx tsx scripts/chain-watch.ts
  * Env: ONCHAIN_RPC_URLS (comma-sep; default publicnode+1rpc), MAIL_* (mailer.ts),
@@ -30,6 +34,7 @@ import { ethCall } from "../lib/polymarket/oracleState";
 import { getOfficialUpdates, stanceFromText, detectRefundClause } from "../lib/polymarket/officialContext";
 import type { OfficialUpdate } from "../lib/polymarket/officialContext";
 import { classifyStanceWithLlm, llmCliCallCount, type LlmStanceVerdict } from "../lib/polymarket/llmStance";
+import { checkExecutability, type ExecCheck } from "../lib/polymarket/execCheck";
 import { isDirectionalStance } from "../lib/virtualTags";
 import { KNOWN_ADAPTERS } from "../lib/polymarket/onchainEvents";
 import { writeFileAtomic } from "../lib/fsAtomic";
@@ -82,6 +87,28 @@ const MAX_HEAD_ADVANCE = 200_000; // ~4.8 days of Polygon blocks
 // inside its timeout; the remaining backlog carries to the next ticks
 // (a full 3600-block window clears in 3 ticks ≈ 9 minutes).
 const MAX_BLOCKS_PER_TICK = 1200;
+
+// ── 改进 I2/I5/I7 的常量 ──
+
+/** V2 adapter (KNOWN_ADAPTERS 注释里的第 5 个):官方 context 只写 storage、
+ * 不发 AncillaryDataUpdated —— 事件驱动的盲区(回测 96 信号中 5 个,5.2%)。
+ * QuestionReset 在 V2 上照常发,所以用它把 qid 收进轮询名单。 */
+const V2_ADAPTER = "0x6a9d222616c90fca5754cd1333cfd9b7fb6a4f74";
+const V2_WATCH_TTL_MS = 14 * 24 * 3600_000;
+const V2_WATCH_MAX = 40;
+const V2_POLLS_PER_TICK = 3;
+
+/** 洪水限流(I2):最近 6h 即时发出的方向性条目数超过阈值(2026-06 世界杯月
+ * 单日峰值 320 个信号),非肥尾条目转入汇总队列。 */
+const FLOOD_WINDOW_MS = 6 * 3600_000;
+const FLOOD_MAX = Number(process.env.CHAIN_WATCH_FLOOD_MAX) || 12;
+
+/** 汇总队列(I2/I5)冲洗条件:攒满 40 条,或最老条目滞留超过 6h。 */
+const DIGEST_MAX_AGE_MS = 6 * 3600_000;
+const DIGEST_MAX_SIZE = 40;
+
+/** 每 tick 最多做几个盘口核查(I1) —— 每个约 2-4 次代理往返。 */
+const EXEC_ANNOTATE_MAX = 6;
 
 function rpcUrls(): string[] {
   const configured = process.env.ONCHAIN_RPC_URLS?.trim();
@@ -143,12 +170,44 @@ interface LlmPendingEntry {
   firstSeenAt: number;
 }
 
+/** I7: a V2-adapter question being polled for storage-only context updates. */
+interface V2WatchEntry {
+  adapter: string;
+  updateCount: number;
+  firstSeenAt: number;
+  lastPolledAt: number;
+}
+
+/** I2/I5: a directional event held back from immediate mail, awaiting the
+ * periodic digest. The queue is the durable record — its fingerprint is
+ * committed the moment it is queued, so a queued item never re-enters the
+ * gate; losing the queue would lose the event, hence it lives in state. */
+interface DigestEntry {
+  qid: string;
+  title: string | null;
+  label: string;
+  stance: string;
+  llmStance: string | null;
+  bestAsk: number | null;
+  askUsd: number | null;
+  marketUrl: string | null;
+  /** Why it was digested: "flood" (I2 批量裁定限流) or "blue_no_edge" (I5 🔵收窄). */
+  reason: string;
+  at: number;
+}
+
 interface WatchState {
   lastBlock: number;
   /** qid → fingerprint of the last notified condition (event kinds + update count + stance). */
   notified: Record<string, string>;
   /** qid → LLM re-read queue (see LlmPendingEntry). */
   llmPending: Record<string, LlmPendingEntry>;
+  /** qid → V2 storage-poll watchlist (see V2WatchEntry). */
+  v2Watch: Record<string, V2WatchEntry>;
+  /** Held-back directional events awaiting the digest mail. */
+  digestQueue: DigestEntry[];
+  /** Epoch-ms timestamps of immediately-mailed directional items (flood detector). */
+  mailLog: number[];
 }
 
 function statePath(): string {
@@ -162,7 +221,8 @@ function loadState(): WatchState {
   try {
     raw = readFileSync(statePath(), "utf8");
   } catch {
-    return { lastBlock: 0, notified: {}, llmPending: {} }; // first run — file absent
+    // first run — file absent
+    return { lastBlock: 0, notified: {}, llmPending: {}, v2Watch: {}, digestQueue: [], mailLog: [] };
   }
   try {
     const parsed = JSON.parse(raw);
@@ -171,6 +231,9 @@ function loadState(): WatchState {
       notified: parsed.notified && typeof parsed.notified === "object" ? parsed.notified : {},
       llmPending:
         parsed.llmPending && typeof parsed.llmPending === "object" ? parsed.llmPending : {},
+      v2Watch: parsed.v2Watch && typeof parsed.v2Watch === "object" ? parsed.v2Watch : {},
+      digestQueue: Array.isArray(parsed.digestQueue) ? parsed.digestQueue : [],
+      mailLog: Array.isArray(parsed.mailLog) ? parsed.mailLog.filter((t: unknown) => Number.isFinite(t)) : [],
     };
   } catch (err) {
     // File exists but is corrupt (truncated by a crash mid-write). Do NOT
@@ -238,6 +301,9 @@ interface Notable {
    * into the regex stance). Undefined = not consulted, null = consulted but
    * failed/unavailable. */
   llm?: LlmStanceVerdict | null;
+  /** I1 executability annotation. Undefined = not attempted, null = attempted
+   * but Gamma/CLOB unreachable or market unmapped (fail-open). */
+  exec?: ExecCheck | null;
 }
 
 async function main(): Promise<void> {
@@ -405,6 +471,80 @@ async function main(): Promise<void> {
       }
     } catch {
       // context unreadable — still notify on the reset event itself
+    }
+  }
+
+  // ── I7: V2 storage 轮询兜底 ──
+  // V2 adapter 只写 storage 不发 AncillaryDataUpdated。凡在 V2 上见过事件的
+  // qid 进入 v2Watch;每 tick 轮询最旧的几个,getUpdates 数量增加即视为一次
+  // context 事件,合入 byQid 走同一套闸门与指纹去重。14 天 TTL,40 条上限。
+  const nowMs = Date.now();
+  for (const item of byQid.values()) {
+    if (item.adapter !== V2_ADAPTER) continue;
+    const prev = state.v2Watch[item.qid];
+    state.v2Watch[item.qid] = {
+      adapter: item.adapter,
+      updateCount: Math.max(item.updateCount, prev?.updateCount ?? 0),
+      firstSeenAt: prev?.firstSeenAt ?? nowMs,
+      lastPolledAt: nowMs,
+    };
+  }
+  for (const [qid, w] of Object.entries(state.v2Watch)) {
+    if (nowMs - w.firstSeenAt > V2_WATCH_TTL_MS) delete state.v2Watch[qid];
+  }
+  {
+    const keys = Object.keys(state.v2Watch);
+    if (keys.length > V2_WATCH_MAX) {
+      for (const k of keys.slice(0, keys.length - V2_WATCH_MAX)) delete state.v2Watch[k];
+    }
+  }
+  let v2Polled = 0;
+  const v2ToPoll = Object.entries(state.v2Watch)
+    .filter(([qid]) => !byQid.has(qid))
+    .sort((a, b) => a[1].lastPolledAt - b[1].lastPolledAt)
+    .slice(0, V2_POLLS_PER_TICK);
+  for (const [qid, w] of v2ToPoll) {
+    if (elapsed() > ENRICH_BUDGET_MS) break;
+    w.lastPolledAt = Date.now();
+    try {
+      const { updates } = await getOfficialUpdates({ resolvedBy: w.adapter, questionID: qid });
+      v2Polled += 1;
+      if (updates.length <= w.updateCount) continue;
+      w.updateCount = updates.length;
+      const meta = await fetchQuestionMeta(w.adapter, qid);
+      const item: Notable = {
+        qid,
+        adapter: w.adapter,
+        kinds: new Set(["context"]),
+        title: meta.title,
+        description: meta.description,
+        stance: "none",
+        confidence: "none",
+        refundClause: detectRefundClause(updates.map((u) => u.text)),
+        excerpt: null,
+        updateCount: updates.length,
+        updates,
+        enriched: true,
+      };
+      for (let i = updates.length - 1; i >= 0; i -= 1) {
+        const classified = stanceFromText(updates[i].text);
+        if (isDirectionalStance(classified.stance)) {
+          item.stance = classified.stance;
+          item.confidence = classified.confidence;
+          item.excerpt = updates[i].text.slice(0, 400);
+          break;
+        }
+      }
+      if (item.excerpt == null && updates.length > 0) {
+        const latest = updates[updates.length - 1];
+        const classified = stanceFromText(latest.text);
+        item.stance = classified.stance;
+        item.confidence = classified.confidence;
+        item.excerpt = latest.text.slice(0, 400);
+      }
+      byQid.set(qid, item);
+    } catch {
+      // RPC 瞬断 — lastPolledAt 已推进,下轮轮询别的条目,此条稍后重试
     }
   }
 
@@ -604,11 +744,212 @@ async function main(): Promise<void> {
     );
   }
 
-  if (mailable.length === 0) {
-    // No mailable events: advance the cursor durably first (this progress must
-    // not be lost), then best-effort alert on any permanently-skipped gap. The
-    // skipped blocks are already gone, so a failed gap alert must not block
-    // cursor progress or re-fire forever.
+  // ── I1: 盘口可执行性注解 ──
+  // 回测实锤:87% 的方向性通知在信号后 2h 内连 $100 真实成交都没有。发信前
+  // 对前几项做 Gamma/CLOB 核查(经代理,fail-open),把"能不能买、什么价、多深"
+  // 直接写进邮件,并供 I3/I5 的分级与路由使用。
+  let execChecked = 0;
+  for (const item of mailable.slice(0, EXEC_ANNOTATE_MAX)) {
+    if (llmBudgetLeftMs() < 10_000) break;
+    const effStance = isDirectionalStance(item.stance)
+      ? item.stance
+      : item.llm && isDirectionalStance(item.llm.stance)
+        ? item.llm.stance
+        : null;
+    if (!effStance) continue;
+    item.exec = await checkExecutability({ adapter: item.adapter, qid: item.qid, stance: effStance });
+    execChecked += 1;
+  }
+
+  // 标题即分诊:最高优先级事件的 stance·置信度直接进主题行,一眼可判是否
+  // 值得打开。回测背书的分级(15 个月/2,182 信号/954 次判读):
+  //   🟢🔥 肥尾候选(双确认∧争议中/深价位,全部利润的来源,+21.3%/笔档内)
+  // > 🟢 双确认(其余,含尾价 carry)
+  // > 🟠 官方方向但 LLM 拒判/无定论/边界澄清(拒判≈硬币;无定论 -67.4% 最毒)
+  // > 🔵 LLM 单独判读(95% 胜率但 -0.1%/笔,人工研判素材)> ⚪ 降级。
+  const polarity = (stance: string): string => {
+    if (/YES$/i.test(stance)) return "+";
+    if (/NO$/i.test(stance)) return "-";
+    return stance; // resolve_to_* 等:要求字面一致
+  };
+  // I4 规则层:LLM 判"事件未决"(eventStatus=pending)而方向来自 leans_*(资格/
+  // 边界式推断)→ 不给 🟢。回测里 🟢 档全部 7 笔 -100% 都是"未决事件的边界/资格
+  // 澄清被误读成方向"。只降标签、照发邮件,肥尾告警本身不丢;LLM_BOUNDARY_GUARD=off
+  // 可关闭(A/B 用)。
+  const boundaryGuardOn = (process.env.LLM_BOUNDARY_GUARD ?? "").trim().toLowerCase() !== "off";
+  const boundaryPending = (n: Notable): boolean =>
+    boundaryGuardOn &&
+    n.llm?.eventStatus === "pending" &&
+    (/^leans_/i.test(n.llm.stance) || /^leans_/i.test(n.stance));
+  const priorityOf = (n: Notable): { rank: number; label: string } => {
+    const llmDir = n.llm != null && isDirectionalStance(n.llm.stance) && n.llm.confidence !== "low";
+    if (isDirectionalStance(n.stance)) {
+      if (llmDir && polarity(n.llm!.stance) === polarity(n.stance)) {
+        if (boundaryPending(n))
+          return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (⚠️边界澄清·事件未决)` };
+        // I3 🟢 内部再分级:入场价离 1 越远(市场重仓反向)越像肥尾;尾价 ≥0.97
+        // 只是薄利 carry。无盘口数据时退化为"是否处于争议(reset)"判断。
+        const ask = n.exec?.bestAsk ?? null;
+        if ((ask != null && ask <= 0.9) || (ask == null && n.kinds.has("reset")))
+          return { rank: 0, label: `🟢🔥 肥尾候选 ${n.stance}·${n.confidence}` };
+        if (ask != null && ask >= 0.97)
+          return { rank: 0, label: `🟢 双确认 ${n.stance}·${n.confidence} (尾价carry)` };
+        return { rank: 0, label: `🟢 双确认 ${n.stance}·${n.confidence}` };
+      }
+      if (n.llm && !isDirectionalStance(n.llm.stance))
+        return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (LLM拒判⚠)` };
+      return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence}` };
+    }
+    if (llmDir) return { rank: 2, label: `🔵 LLM判读 ${n.llm!.stance}·${n.llm!.confidence}` };
+    if (!n.enriched) return { rank: 3, label: `⚪ 降级(文本读取失败)` };
+    return { rank: 4, label: `⚪ ${n.stance}` };
+  };
+  const isFatTail = (n: Notable): boolean => priorityOf(n).label.includes("肥尾候选");
+
+  // ── I5 🔵收窄 + I2 洪水限流:即时邮件 vs 汇总队列 ──
+  const routeNow = Date.now();
+  state.mailLog = state.mailLog.filter((t) => routeNow - t < FLOOD_WINDOW_MS);
+  const floodActive = state.mailLog.length >= FLOOD_MAX;
+  const immediate: Notable[] = [];
+  const digested: Array<{ n: Notable; reason: string }> = [];
+  for (const n of mailable) {
+    const pr = priorityOf(n);
+    // I5:🔵(纯 LLM 判读)只有"争议中"或"盘口显示有肉且可执行"才配即时打扰。
+    // 回测 🔵 档 95% 胜率却 -0.1%/笔(0.99 薄 carry),模板簇判向率 67% 全不可执行。
+    if (pr.rank === 2) {
+      const hasEdge =
+        n.kinds.has("reset") ||
+        (n.exec != null && n.exec.bestAsk != null && n.exec.bestAsk < 0.97 && n.exec.executable);
+      if (!hasEdge) {
+        digested.push({ n, reason: "blue_no_edge" });
+        continue;
+      }
+    }
+    // I2:批量裁定洪水(2026-06 单月 690 信号/单日峰 320)中,只有肥尾候选与
+    // 降级告警(enriched=false,安全兜底语义不能延迟)保持即时,其余进汇总。
+    if (floodActive && pr.rank <= 2 && !isFatTail(n) && n.enriched) {
+      digested.push({ n, reason: "flood" });
+      continue;
+    }
+    immediate.push(n);
+  }
+  for (const { n, reason } of digested) {
+    state.digestQueue.push({
+      qid: n.qid,
+      title: n.title,
+      label: priorityOf(n).label,
+      stance: n.stance,
+      llmStance: n.llm?.stance ?? null,
+      bestAsk: n.exec?.bestAsk ?? null,
+      askUsd: n.exec?.askUsdNear ?? null,
+      marketUrl: n.exec?.marketUrl ?? null,
+      reason,
+      at: routeNow,
+    });
+  }
+  if (state.digestQueue.length > 100) {
+    state.digestQueue.splice(0, state.digestQueue.length - 100);
+  }
+
+  // ── I6: 🟢 自动登记 paper_trades(前瞻虚拟持仓,再也不用事后重建回测)──
+  // localDb 惰性加载:chain-watch 的承诺是"无 sqlite 也能跑",登记失败只记日志。
+  let paperRegistered = 0;
+  if ((process.env.PAPER_TRADES_AUTO ?? "").trim().toLowerCase() !== "off") {
+    for (const n of mailable) {
+      if (priorityOf(n).rank !== 0) continue;
+      const e = n.exec;
+      if (!e || e.closed || !e.fill100) continue;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const db = require("../lib/localDb") as typeof import("../lib/localDb");
+        if (db.listOpenPaperTrades().some((t) => t.tokenId === e.tokenId)) continue;
+        db.insertPaperTrade({
+          conditionId: e.conditionId,
+          tokenId: e.tokenId,
+          marketQuestion: e.question,
+          outcomeBought: e.outcome,
+          marketUrl: e.marketUrl,
+          endDate: e.endDate,
+          usdAmount: e.fill100.usd,
+          shares: e.fill100.shares,
+          avgFillPrice: e.fill100.avgPrice,
+          worstFillPrice: e.fill100.worstPrice,
+          fills: e.fill100.fills,
+        });
+        paperRegistered += 1;
+      } catch (err) {
+        console.warn(
+          `[chain-watch] paper trade 登记失败(${n.qid.slice(0, 10)}): ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+  }
+
+  // ── I2: 汇总队列冲洗(攒满 DIGEST_MAX_SIZE 条,或最老条目滞留超 6h)──
+  // 独立于即时邮件的 best-effort:失败保留队列下轮重试,绝不阻塞 cursor 推进。
+  const flushDigest = async (): Promise<void> => {
+    const q = state.digestQueue;
+    if (q.length === 0) return;
+    const oldest = Math.min(...q.map((d) => d.at));
+    if (q.length < DIGEST_MAX_SIZE && Date.now() - oldest < DIGEST_MAX_AGE_MS) return;
+    const items = q.slice(0, 60);
+    const digestRows = items
+      .map(
+        (d) => `<tr><td style="padding:4px 8px;border-bottom:1px solid #eee;font-size:13px">
+      ${escapeHtml(d.title ?? d.qid)}<br>
+      <span style="font-size:12px;color:#888">${escapeHtml(d.label)} · ${
+        d.bestAsk != null ? `价${d.bestAsk.toFixed(3)} · 深$${Math.round(d.askUsd ?? 0)}` : "盘口未核对"
+      } · ${new Date(d.at).toISOString().slice(5, 16)}Z${
+        d.marketUrl ? ` · <a href="${d.marketUrl}">市场</a>` : ""
+      }</span>
+    </td></tr>`
+      )
+      .join("\n");
+    try {
+      await sendMail({
+        subject: `[PredEdge链上] 📦 低优先级方向事件汇总 ${items.length} 项`,
+        html: `<div style="font-family:system-ui,sans-serif;max-width:640px"><p>洪水限流(I2)/🔵收窄(I5)期间积累的方向性事件,汇总如下(未即时打扰):</p><table style="width:100%;border-collapse:collapse">${digestRows}</table></div>`,
+        text: items.map((d) => `${d.title ?? d.qid} | ${d.label} | ask=${d.bestAsk ?? "?"} 深$${d.askUsd ?? "?"}`).join("\n"),
+      });
+      state.digestQueue = q.slice(items.length);
+      saveState(state);
+    } catch (err) {
+      console.error(
+        `[chain-watch] digest 发送失败(队列保留,下轮重试): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  };
+
+  const logSummary = (notified: number) => {
+    console.log(
+      JSON.stringify({
+        mode: "chain-watch",
+        from,
+        to: sweptTo,
+        events: logs.length,
+        notified,
+        queued_digest: digested.length,
+        digest_queue: state.digestQueue.length,
+        flood: floodActive || undefined,
+        suppressed,
+        degraded,
+        exec_checked: execChecked,
+        paper_registered: paperRegistered || undefined,
+        v2_watch: Object.keys(state.v2Watch).length || undefined,
+        v2_polled: v2Polled || undefined,
+        llm_cli_calls: llmCliCallCount(),
+        llm_skipped: llmSkipped,
+        llm_backed: mailable.filter((n) => n.llm && isDirectionalStance(n.llm.stance)).length,
+        llm_pending: Object.keys(state.llmPending).length,
+        gap,
+        sweep_error: sweepError ?? undefined,
+      })
+    );
+  };
+
+  if (immediate.length === 0) {
+    // 无需即时邮件(可能全部进了汇总队列):cursor+指纹+队列先落盘(队列就是
+    // digested 条目的持久记录),再 best-effort 处理 gap 告警与队列冲洗。
     commitState();
     if (gap > 0) {
       try {
@@ -621,53 +962,23 @@ async function main(): Promise<void> {
         console.error(`[chain-watch] gap alert send failed (gap=${gap}): ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    console.log(
-      JSON.stringify({
-        mode: "chain-watch",
-        from,
-        to: sweptTo,
-        events: logs.length,
-        notified: 0,
-        suppressed,
-        llm_cli_calls: llmCliCallCount(),
-        llm_skipped: llmSkipped,
-        llm_pending: Object.keys(state.llmPending).length,
-        gap,
-        sweep_error: sweepError ?? undefined,
-      })
-    );
+    await flushDigest();
+    logSummary(0);
     return;
   }
 
-  // 标题即分诊:最高优先级事件的 stance·置信度直接进主题行,一眼可判是否
-  // 值得打开。回测背书的分级:🟢 双确认(正则方向∧LLM同向,历史 12/12 全胜)
-  // > 🟠 官方方向但 LLM 拒判/未复核(拒判在回测里 = 模板噪音,胜率≈硬币)
-  // > 🔵 LLM 单独判读方向 > ⚪ 降级/其他。
-  const polarity = (stance: string): string => {
-    if (/YES$/i.test(stance)) return "+";
-    if (/NO$/i.test(stance)) return "-";
-    return stance; // resolve_to_* 等:要求字面一致
-  };
-  const priorityOf = (n: Notable): { rank: number; label: string } => {
-    const llmDir = n.llm != null && isDirectionalStance(n.llm.stance) && n.llm.confidence !== "low";
-    if (isDirectionalStance(n.stance)) {
-      if (llmDir && polarity(n.llm!.stance) === polarity(n.stance))
-        return { rank: 0, label: `🟢 双确认 ${n.stance}·${n.confidence}` };
-      if (n.llm && !isDirectionalStance(n.llm.stance))
-        return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (LLM拒判⚠)` };
-      return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence}` };
-    }
-    if (llmDir) return { rank: 2, label: `🔵 LLM判读 ${n.llm!.stance}·${n.llm!.confidence}` };
-    if (!n.enriched) return { rank: 3, label: `⚪ 降级(文本读取失败)` };
-    return { rank: 4, label: `⚪ ${n.stance}` };
-  };
-  mailable.sort((a, b) => priorityOf(a).rank - priorityOf(b).rank);
-  const llmBacked = mailable.filter((n) => n.llm && isDirectionalStance(n.llm.stance));
-  const top = mailable[0];
+  immediate.sort((a, b) => priorityOf(a).rank - priorityOf(b).rank);
+  const top = immediate[0];
   const topTitle = (top.title ?? top.qid).slice(0, 48);
-  const subject = `[PredEdge链上] ${priorityOf(top).label} | ${topTitle}${mailable.length > 1 ? ` 等${mailable.length}个` : ""}`;
+  // I1 主题行注解:价与深度直接可见,"深$"不足 $100 挂 ⚠(87% 的通知属于此类)。
+  const topExecBit = top.exec
+    ? top.exec.bestAsk != null
+      ? ` | 价${top.exec.bestAsk.toFixed(2)} 深$${Math.round(top.exec.askUsdNear)}${top.exec.executable ? "" : "⚠"}`
+      : " | 无盘口⚠"
+    : "";
+  const subject = `[PredEdge链上] ${priorityOf(top).label}${topExecBit} | ${topTitle}${immediate.length > 1 ? ` 等${immediate.length}个` : ""}`;
 
-  const rows = mailable
+  const rows = immediate
     .map((n) => {
       const searchUrl = n.title
         ? `https://polymarket.com/search?q=${encodeURIComponent(n.title.slice(0, 80))}`
@@ -685,15 +996,24 @@ async function main(): Promise<void> {
       // 口径的官方文本信号,依据引用原文供人工核对。
       const llmLine = n.llm
         ? isDirectionalStance(n.llm.stance)
-          ? `<div style="margin-top:2px"><b style="color:#2563eb">LLM 判读: ${escapeHtml(n.llm.stance)} (${escapeHtml(n.llm.confidence)}, via=llm)</b>${n.llm.evidence ? `<div style="font-size:12px;color:#666">依据: "${escapeHtml(n.llm.evidence)}"</div>` : ""}${n.llm.reasoning ? `<div style="font-size:12px;color:#888">${escapeHtml(n.llm.reasoning)}</div>` : ""}</div>`
+          ? `<div style="margin-top:2px"><b style="color:#2563eb">LLM 判读: ${escapeHtml(n.llm.stance)} (${escapeHtml(n.llm.confidence)}, via=llm)</b>${n.llm.eventStatus ? `<span style="font-size:12px;color:#888"> · 事件${n.llm.eventStatus === "decided" ? "已决" : n.llm.eventStatus === "pending" ? "未决⚠" : "状态不明"}</span>` : ""}${n.llm.evidence ? `<div style="font-size:12px;color:#666">依据: "${escapeHtml(n.llm.evidence)}"</div>` : ""}${n.llm.reasoning ? `<div style="font-size:12px;color:#888">${escapeHtml(n.llm.reasoning)}</div>` : ""}</div>`
           : `<div style="margin-top:2px;font-size:12px;color:#888">LLM 判读: ${escapeHtml(n.llm.stance)} (${escapeHtml(n.llm.confidence)})</div>`
         : "";
+      // I1 盘口行:能买什么、什么价、多深、直达链接;未核查/失败时如实说明。
+      const execLine = n.exec
+        ? n.exec.bestAsk != null
+          ? `<div style="margin-top:2px;font-size:13px"><b style="color:${n.exec.executable ? "#16a34a" : "#d97706"}">盘口: 买 ${escapeHtml(n.exec.outcome)} @${n.exec.bestAsk.toFixed(3)}${n.exec.bestBid != null ? ` (bid ${n.exec.bestBid.toFixed(3)})` : ""} · 近档深度 $${Math.round(n.exec.askUsdNear)}${n.exec.executable ? "" : " (<$100 难成交)"}</b>${n.exec.fill100 ? ` · $100 市价单均价 ${n.exec.fill100.avgPrice.toFixed(3)}` : ""}${n.exec.marketUrl ? ` · <a href="${n.exec.marketUrl}">直达市场</a>` : ""}</div>`
+          : `<div style="margin-top:2px;font-size:13px;color:#d97706">盘口: 空(当前无卖单)${n.exec.marketUrl ? ` · <a href="${n.exec.marketUrl}">直达市场</a>` : ""}</div>`
+        : n.exec === null
+          ? `<div style="margin-top:2px;font-size:12px;color:#888">盘口未核对(Gamma/CLOB 不可达或市场未匹配)</div>`
+          : "";
       return `<tr>
         <td style="padding:8px;border-bottom:1px solid #333">
           <div style="font-weight:600">${escapeHtml(n.title ?? n.qid)}</div>
           <div style="font-size:12px;color:#888">${kindLabel} · updates=${n.updateCount}${n.refundClause ? " · ⚠️refund条款" : ""}${degradedTag}</div>
           <div style="margin-top:4px">${stanceLine}</div>
           ${llmLine}
+          ${execLine}
           ${n.excerpt ? `<div style="font-size:12px;color:#aaa;margin-top:4px">"${escapeHtml(n.excerpt)}"</div>` : ""}
           <div style="margin-top:4px"><a href="${searchUrl}">在 Polymarket 搜索</a> · qid ${escapeHtml(n.qid.slice(0, 10))}…</div>
         </td></tr>`;
@@ -701,17 +1021,19 @@ async function main(): Promise<void> {
     .join("\n");
 
   const html = `<div style="font-family:system-ui,sans-serif;max-width:640px">
-    <p>链上监听(纯 RPC 模式,无价格数据)在块 ${from}–${sweptTo} 发现方向性争议事件:</p>
+    <p>链上监听在块 ${from}–${sweptTo} 发现方向性争议事件:</p>
     ${gap > 0 ? `<p style="color:#d97706">⚠️ 距上次运行跳过了 ${gap} 个块(停机追赶超出免费 RPC 回看窗口)。</p>` : ""}
     <table style="width:100%;border-collapse:collapse">${rows}</table>
+    ${digested.length > 0 ? `<p style="font-size:12px;color:#888">另有 ${digested.length} 个低优先级方向事件进入汇总队列(当前 ${state.digestQueue.length} 项待汇总)。</p>` : ""}
     ${suppressed > 0 ? `<p style="font-size:12px;color:#888">另有 ${suppressed} 个无方向争议事件已按收窄策略静默(仅记日志)。</p>` : ""}
-    <p style="font-size:12px;color:#888">直接买入前先在 App 确认盘口价格;LLM 判读(via=llm)是文本解读增强,非官方文本口径(32/32)本身,请核对引用原文。</p>
+    <p style="font-size:12px;color:#888">盘口注解为发信时刻快照,下单前请再核对;LLM 判读(via=llm)是文本解读增强,非官方文本口径(32/32)本身,请核对引用原文。</p>
   </div>`;
 
-  const text = mailable
+  const text = immediate
     .map((n) => {
       const llmBit = n.llm && isDirectionalStance(n.llm.stance) ? ` llm=${n.llm.stance}(${n.llm.confidence})` : "";
-      return `${n.title ?? n.qid} | ${[...n.kinds].join("+")} | stance=${n.stance}(${n.confidence})${llmBit}${n.refundClause ? " REFUND" : ""}`;
+      const execBit = n.exec?.bestAsk != null ? ` ask=${n.exec.bestAsk.toFixed(3)} depth$${Math.round(n.exec.askUsdNear)}` : "";
+      return `${n.title ?? n.qid} | ${[...n.kinds].join("+")} | stance=${n.stance}(${n.confidence})${llmBit}${execBit}${n.refundClause ? " REFUND" : ""}`;
     })
     .join("\n");
 
@@ -720,24 +1042,13 @@ async function main(): Promise<void> {
   // (cursor unchanged) and retries. A duplicate email on a later success is the
   // accepted trade-off; a permanently-lost dispute alert is not.
   await sendMail({ subject, html, text });
+  // 洪水检测计数:只统计成功即时发出的方向性条目(rank≤2)。
+  for (const n of immediate) {
+    if (priorityOf(n).rank <= 2) state.mailLog.push(routeNow);
+  }
   commitState();
-  console.log(
-    JSON.stringify({
-      mode: "chain-watch",
-      from,
-      to: sweptTo,
-      events: logs.length,
-      notified: mailable.length,
-      suppressed,
-      degraded,
-      llm_cli_calls: llmCliCallCount(),
-      llm_skipped: llmSkipped,
-      llm_backed: llmBacked.length,
-      llm_pending: Object.keys(state.llmPending).length,
-      gap,
-      sweep_error: sweepError ?? undefined,
-    })
-  );
+  await flushDigest();
+  logSummary(immediate.length);
 }
 
 main().catch((err) => {

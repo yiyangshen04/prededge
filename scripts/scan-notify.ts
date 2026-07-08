@@ -18,8 +18,10 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { runScan } from "../lib/polymarket/scanner";
+import { runScan, takerFeeRateOf } from "../lib/polymarket/scanner";
 import { DEFAULT_SCAN_CONFIG } from "../lib/polymarket/config";
+import { PolymarketClient } from "../lib/polymarket/client";
+import { takerFeePct } from "../lib/polymarket/scoring";
 import type { Opportunity, ScanResponse, ScanRun } from "../lib/types";
 import { renderOpportunitiesEmail, sendMail } from "./mailer";
 import { writeFileAtomic } from "../lib/fsAtomic";
@@ -232,6 +234,9 @@ async function main(): Promise<void> {
   // 轮机会集可能缺失真实候选——不能静默显示"扫描正常"。
   await handleCoverageDegradation(scan, state);
 
+  // I6 后半:结算 chain-watch 自动登记的虚拟持仓(30 分钟节奏,有 Gamma)。
+  await resolveOpenPaperTrades();
+
   // cron 日志 grep 用的一行 JSON 摘要
   console.log(
     JSON.stringify({
@@ -281,6 +286,75 @@ async function handleCoverageDegradation(scan: ScanRun, state: NotifyState): Pro
     console.log("[scan-notify] 覆盖已恢复正常。");
     state[COVERAGE_KEY] = { lastDecision: "ok", lastStance: null, notifiedAt: now };
     saveState(state);
+  }
+}
+
+/**
+ * I6 前瞻登记的结算侧:chain-watch 在 🟢 双确认时写入 paper_trades(status
+ * open),这里每轮扫描后按 Gamma 结算结果关单——语义与 /api/trades/refresh
+ * 完全一致(赢=每股 $1 − 费用/转账成本,输=-本金;closed 但价未定 = 结算窗口
+ * 未完,跳过等下轮)。整体 best-effort:node:sqlite 不可用或 Gamma 抖动都不
+ * 影响扫描主流程。
+ */
+async function resolveOpenPaperTrades(): Promise<void> {
+  let db: typeof import("../lib/localDb");
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    db = require("../lib/localDb") as typeof import("../lib/localDb");
+  } catch {
+    return;
+  }
+  try {
+    const open = db.listOpenPaperTrades();
+    if (open.length === 0) return;
+    const client = new PolymarketClient(DEFAULT_SCAN_CONFIG);
+    const conditionIds = Array.from(new Set(open.map((t) => t.conditionId).filter(Boolean)));
+    const marketMap = await client.fetchMarketsByConditionIds(conditionIds);
+    let resolved = 0;
+    for (const trade of open) {
+      const market = marketMap.get(trade.conditionId);
+      if (!market || !market.closed) continue;
+      let outcomes: string[] = [];
+      let prices: number[] = [];
+      try {
+        outcomes = JSON.parse(market.outcomes).map(String);
+        prices = JSON.parse(market.outcomePrices).map(Number);
+      } catch {
+        continue;
+      }
+      const winnerIdx = prices.findIndex((p) => Number.isFinite(p) && p >= 0.99);
+      if (winnerIdx === -1) continue; // closed 但 UMA 结算未完 — 下轮再看
+      const resolvedOutcome = outcomes[winnerIdx] ?? null;
+      let status: "won" | "lost";
+      let pnlUsd: number;
+      if (resolvedOutcome === trade.outcomeBought) {
+        status = "won";
+        const avgPrice = trade.shares > 0 ? trade.usdAmount / trade.shares : 0;
+        const feeCost =
+          trade.usdAmount *
+          (takerFeePct(avgPrice, takerFeeRateOf(market), DEFAULT_SCAN_CONFIG) +
+            DEFAULT_SCAN_CONFIG.transferCostPct);
+        pnlUsd = trade.shares - trade.usdAmount - feeCost;
+      } else {
+        status = "lost";
+        pnlUsd = -trade.usdAmount;
+      }
+      const ok = db.updatePaperTradeResolution(trade.id, {
+        status,
+        resolvedOutcome,
+        pnlUsd,
+        pnlPct: trade.usdAmount > 0 ? pnlUsd / trade.usdAmount : 0,
+        resolvedAt: new Date().toISOString(),
+      });
+      if (ok) resolved += 1;
+    }
+    if (resolved > 0) {
+      console.log(`[scan-notify] paper trades 结算 ${resolved}/${open.length} 单。`);
+    }
+  } catch (err) {
+    console.warn(
+      `[scan-notify] paper trades 结算失败(下轮重试): ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 }
 

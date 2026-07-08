@@ -192,17 +192,28 @@ export function renderOpportunitiesEmail(
   opps: Opportunity[],
   scan: ScanRun
 ): MailContent {
+  // 标题即分诊:最高优先级机会的形态+方向/净收益直接进主题行。
+  // 🔴 官方分歧(规则 b,小时级窗口) > 🟠 官方文本背书(规则 c,32/32 口径)
+  // > 🟡 纯争议有肉(规则 a,net≥3%)。
+  const oppPriority = (o: Opportunity): { rank: number; label: string } => {
+    const oc = o.officialContext;
+    if (isDivergencePlay(o))
+      return { rank: 0, label: `🔴 分歧${oc ? ` ${oc.stance}·${oc.confidence}` : ""}` };
+    if ((o.decisionReasons ?? []).includes("official_direction_backed") && oc?.via === "text")
+      return { rank: 1, label: `🟠 官方背书 ${oc.stance}·${oc.confidence}` };
+    return { rank: 2, label: `🟡 争议 net${((o.netReturnPct ?? 0) * 100).toFixed(1)}%` };
+  };
   const sorted = [...opps].sort((a, b) => {
-    const d = Number(isDivergencePlay(b)) - Number(isDivergencePlay(a));
+    const d = oppPriority(a).rank - oppPriority(b).rank;
     if (d !== 0) return d;
     return (b.annualizedYieldPct ?? 0) - (a.annualizedYieldPct ?? 0);
   });
 
-  const divergenceCount = sorted.filter(isDivergencePlay).length;
   const now = formatLocalMinute();
+  const top = sorted[0];
   const subject =
-    `[PredEdge] ${sorted.length} 个 UMA 争议机会` +
-    (divergenceCount > 0 ? ` (${divergenceCount} 分歧)` : "") +
+    `[PredEdge] ${oppPriority(top).label} | ${top.question.slice(0, 40)}` +
+    (sorted.length > 1 ? ` 等${sorted.length}个` : "") +
     ` — ${now}`;
 
   const durationSec = Number.isFinite(scan.durationMs)

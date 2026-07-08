@@ -632,14 +632,20 @@ async function main(): Promise<void> {
     return;
   }
 
+  // 标题即分诊:最高优先级事件的 stance·置信度直接进主题行,一眼可判是否
+  // 值得打开。🟠 正则官方方向(32/32 口径) > 🔵 LLM 判读方向 > ⚪ 降级/其他。
+  const priorityOf = (n: Notable): { rank: number; label: string } => {
+    if (isDirectionalStance(n.stance)) return { rank: 0, label: `🟠 官方方向 ${n.stance}·${n.confidence}` };
+    if (n.llm && isDirectionalStance(n.llm.stance))
+      return { rank: 1, label: `🔵 LLM判读 ${n.llm.stance}·${n.llm.confidence}` };
+    if (!n.enriched) return { rank: 2, label: `⚪ 降级(文本读取失败)` };
+    return { rank: 3, label: `⚪ ${n.stance}` };
+  };
+  mailable.sort((a, b) => priorityOf(a).rank - priorityOf(b).rank);
   const llmBacked = mailable.filter((n) => n.llm && isDirectionalStance(n.llm.stance));
-  const regexDirectional = mailable.filter((n) => isDirectionalStance(n.stance));
-  const subjectBits = [
-    regexDirectional.length > 0 ? `${regexDirectional.length} 官方方向` : "",
-    llmBacked.length > 0 ? `${llmBacked.length} LLM判读` : "",
-    degraded > 0 ? `${degraded} 降级` : "",
-  ].filter(Boolean);
-  const subject = `[PredEdge 链上] ${mailable.length} 个争议事件${subjectBits.length > 0 ? ` (${subjectBits.join(", ")})` : ""}`;
+  const top = mailable[0];
+  const topTitle = (top.title ?? top.qid).slice(0, 48);
+  const subject = `[PredEdge链上] ${priorityOf(top).label} | ${topTitle}${mailable.length > 1 ? ` 等${mailable.length}个` : ""}`;
 
   const rows = mailable
     .map((n) => {

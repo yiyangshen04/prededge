@@ -191,7 +191,8 @@ interface DigestEntry {
   bestAsk: number | null;
   askUsd: number | null;
   marketUrl: string | null;
-  /** Why it was digested: "flood" (I2 批量裁定限流) or "blue_no_edge" (I5 🔵收窄). */
+  /** Why it was digested: "flood" (I2 批量裁定限流)、"blue_no_edge" (I5 🔵收窄)
+   * 或 "llm_gave_up" (M4 补判放弃兜底,不再静默丢弃)。 */
   reason: string;
   at: number;
 }
@@ -304,6 +305,12 @@ interface Notable {
   /** I1 executability annotation. Undefined = not attempted, null = attempted
    * but Gamma/CLOB unreachable or market unmapped (fail-open). */
   exec?: ExecCheck | null;
+  /** M3 复判:🟢🔥 候选的第二票与首票极性不一致时存下第二票(降级依据)。
+   * undefined = 未复判或复判同向。bt4 实测同 prompt 方向翻转率 5%/次。 */
+  llmRevoteMismatch?: LlmStanceVerdict;
+  /** M5:同一官方文本(群发到姊妹市场)在本 tick 内出现互相矛盾的
+   * eventStatus — 提示 LLM 对同簇事件状态判读不自洽,人工核对时点。 */
+  esConflict?: boolean;
 }
 
 async function main(): Promise<void> {
@@ -601,21 +608,25 @@ async function main(): Promise<void> {
   const llmBudgetLeftMs = () => TICK_KILL_MS - SEND_MARGIN_MS - elapsed();
   // 单次调用的超时被钳到剩余预算内:一个 149s 才开始的 60s 调用会越过 170s
   // SIGTERM,把整个 tick(连同待发的正则方向邮件和 commitState)一起杀掉。
-  const consultLlm = (item: {
-    qid: string;
-    title: string | null;
-    description: string | null;
-    updates: OfficialUpdate[];
-    stance: string;
-    confidence: string;
-    updateCount: number;
-  }): Promise<LlmStanceVerdict | null> =>
+  const consultLlm = (
+    item: {
+      qid: string;
+      title: string | null;
+      description: string | null;
+      updates: OfficialUpdate[];
+      stance: string;
+      confidence: string;
+      updateCount: number;
+    },
+    // M3 复判用:不同 suffix = 不同缓存键 → 强制真实第二票而非缓存回放
+    cacheKeySuffix = ""
+  ): Promise<LlmStanceVerdict | null> =>
     classifyStanceWithLlm({
       title: item.title,
       description: item.description,
       updates: item.updates,
       regexStance: { stance: item.stance, confidence: item.confidence },
-      cacheKey: `${item.qid}:${item.updateCount}`,
+      cacheKey: `${item.qid}:${item.updateCount}${cacheKeySuffix}`,
       timeoutMs: Math.min(60_000, llmBudgetLeftMs()),
     });
 
@@ -672,6 +683,20 @@ async function main(): Promise<void> {
     if (p.attempts >= 16 || Date.now() - p.firstSeenAt > 48 * 3600_000) {
       console.warn(`[chain-watch] llmPending ${qid} 放弃补判(attempts=${p.attempts})`);
       delete state.llmPending[qid];
+      // M4:放弃 ≠ 静默丢弃。bt4 案例 14c9:被 null 吞掉的恰是"事后官方明写
+      // qualifies for Yes"的最高置信信号。进汇总队列(非即时,不重开噪音闸)。
+      state.digestQueue.push({
+        qid,
+        title: p.title,
+        label: `⚪ LLM 判读失败(${p.attempts >= 16 ? `${p.attempts} 次尝试` : "48h"}后放弃),正则亦无方向 — 建议人工瞄一眼`,
+        stance: "none",
+        llmStance: null,
+        bestAsk: null,
+        askUsd: null,
+        marketUrl: null,
+        reason: "llm_gave_up",
+        at: Date.now(),
+      });
     }
   }
 
@@ -762,20 +787,22 @@ async function main(): Promise<void> {
   }
 
   // 标题即分诊:最高优先级事件的 stance·置信度直接进主题行,一眼可判是否
-  // 值得打开。回测背书的分级(15 个月/2,182 信号/954 次判读):
-  //   🟢🔥 肥尾候选(双确认∧争议中/深价位,全部利润的来源,+21.3%/笔档内)
-  // > 🟢 双确认(其余,含尾价 carry)
-  // > 🟠 官方方向但 LLM 拒判/无定论/边界澄清(拒判≈硬币;无定论 -67.4% 最毒)
-  // > 🔵 LLM 单独判读(95% 胜率但 -0.1%/笔,人工研判素材)> ⚪ 降级。
+  // 值得打开。分级依据 bt4 实测(2026-07-09,v4 全量重放 + 四实验臂):
+  //   🟢 只授"双确认∧LLM conf=high"——该格是唯一跨 prompt 稳健结构
+  //   (v3/v4/A2/A4 四臂交集 17 笔 17/17 全胜,累计 +524%);medium 置信区
+  //   含历史全部 -100% 级灾难,一律降 🟠 展示(M1,邮件照发)。
+  //   🟢🔥 肥尾候选 > 🟢 双确认 > 🟠 官方方向(LLM拒判/中置信/无定论/红旗)
+  // > 🔵 LLM 单独判读 > ⚪ 降级。
   const polarity = (stance: string): string => {
     if (/YES$/i.test(stance)) return "+";
     if (/NO$/i.test(stance)) return "-";
     return stance; // resolve_to_* 等:要求字面一致
   };
-  // I4 规则层:LLM 判"事件未决"(eventStatus=pending)而方向来自 leans_*(资格/
-  // 边界式推断)→ 不给 🟢。回测里 🟢 档全部 7 笔 -100% 都是"未决事件的边界/资格
-  // 澄清被误读成方向"。只降标签、照发邮件,肥尾告警本身不丢;LLM_BOUNDARY_GUARD=off
-  // 可关闭(A/B 用)。
+  // I4 规则层边界闸门(eventStatus=pending ∧ leans_* → 降档)。M6 注:bt4 实测
+  // 该闸门 15 个月仅触发 1 次且拦下的是 +1.0% 赢单——几乎不承担防损职能
+  // (实测全部深亏在 es=decided 侧,由 M1/M2 防守);保留仅作标注语义。
+  // 注意:M1 上线后 off 挡只能 A/B 到 high 置信的 pending∧leans 形态(medium
+  // 已被 M1 无条件降档,不再回到 I4 前的旧行为)。
   const boundaryGuardOn = (process.env.LLM_BOUNDARY_GUARD ?? "").trim().toLowerCase() !== "off";
   const boundaryPending = (n: Notable): boolean =>
     boundaryGuardOn &&
@@ -787,9 +814,27 @@ async function main(): Promise<void> {
       if (llmDir && polarity(n.llm!.stance) === polarity(n.stance)) {
         if (boundaryPending(n))
           return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (⚠️边界澄清·事件未决)` };
+        // M1:🟢 只授 conf=high。bt4 实测 medium 区 = 历史全部 -100% 所在,
+        // 且各臂全档收益差异均来自 medium 区归属(高置信档对 prompt 不敏感)。
+        if (n.llm!.confidence !== "high")
+          return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (双确认·中置信⚠历史灾难区)` };
+        const ask = n.exec?.bestAsk ?? null;
+        // M2 H2 红旗:极端逆共识(方向价 <0.15 = 判读逆着 85%+ 市场共识)且
+        // LLM 非决断句式(leans_*) → 不给 🟢。bt4 实测该形态 4/4 归零,而真肥尾
+        // (Norway@0.164/Khamenei@0.179)入场价均 ≥0.15 且判读为决断级。
+        if (ask != null && ask < 0.15 && /^leans_/i.test(n.llm!.stance))
+          return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (🚩极端逆共识·历史此形态4/4归零)` };
+        // M3:🟢🔥 复判分歧 → 降档(同 prompt 方向翻转率实测 5%/次)。二票反向
+        // 与二票失方向分开表述——标签必须如实,人工分诊靠它。
+        if (n.llmRevoteMismatch)
+          return {
+            rank: 1,
+            label: `🟠 官方方向 ${n.stance}·${n.confidence} (${
+              isDirectionalStance(n.llmRevoteMismatch.stance) ? "复判反向⚠" : "复判失方向⚠"
+            }:二票 ${n.llmRevoteMismatch.stance})`,
+          };
         // I3 🟢 内部再分级:入场价离 1 越远(市场重仓反向)越像肥尾;尾价 ≥0.97
         // 只是薄利 carry。无盘口数据时退化为"是否处于争议(reset)"判断。
-        const ask = n.exec?.bestAsk ?? null;
         if ((ask != null && ask <= 0.9) || (ask == null && n.kinds.has("reset")))
           return { rank: 0, label: `🟢🔥 肥尾候选 ${n.stance}·${n.confidence}` };
         if (ask != null && ask >= 0.97)
@@ -805,6 +850,56 @@ async function main(): Promise<void> {
     return { rank: 4, label: `⚪ ${n.stance}` };
   };
   const isFatTail = (n: Notable): boolean => priorityOf(n).label.includes("肥尾候选");
+  // 肥尾"形态"(双确认∧深价位/争议中,不含 M1/M2/M3 的降档条件):洪水豁免用它
+  // 而非 isFatTail——降档承诺是 label-only,被降档的肥尾形态若因此从即时改走
+  // 6h 汇总,恰恰在批量裁定日延误了灾难形/机会形并存的关键告警(审查修正)。
+  // 置信 low 不算(降档前的旧口径也从不给 low 豁免)。
+  const isFatTailShape = (n: Notable): boolean => {
+    if (!isDirectionalStance(n.stance)) return false;
+    if (!n.llm || !isDirectionalStance(n.llm.stance) || n.llm.confidence === "low") return false;
+    if (polarity(n.llm.stance) !== polarity(n.stance)) return false;
+    const ask = n.exec?.bestAsk ?? null;
+    return (ask != null && ask <= 0.9) || (ask == null && n.kinds.has("reset"));
+  };
+
+  // ── M3:🟢🔥 复判(独立第二票)──
+  // bt4/A5 实测:同 prompt 两次判读方向层翻转率 5%;三票多数杀噪声型误判
+  // (Mutilation)但救不了系统性误读。🟢🔥 月频 ~1.4 笔,二票成本可忽略。
+  // 降档条件(审查修正):二票方向性且极性相反(复判反向),或二票不再方向性
+  // (复判失方向——模型在新采样下主动收回方向,这是信息)。二票同极性一律保持,
+  // 不看二票置信度:弱同意仍是同意,否则"弱同意"会比"复判失败(null,保持原判
+  // 的 fail-open)"更糟,语义倒挂。
+  for (const n of mailable) {
+    if (llmBudgetLeftMs() < LLM_MIN_CALL_MS) break;
+    if (!n.llm || !isFatTail(n)) continue;
+    const second = await consultLlm(n, ":v2");
+    if (second == null) continue;
+    const agrees =
+      isDirectionalStance(second.stance) && polarity(second.stance) === polarity(n.llm.stance);
+    if (!agrees) n.llmRevoteMismatch = second;
+  }
+
+  // ── M5:同簇 eventStatus 一致性 ──
+  // 同一官方文本群发到姊妹市场(bt4 案例 61a1:同文本一个市场判 decided、
+  // 另一个判 pending)。方向可以因市场问题不同而不同,但"事件是否已决"不该
+  // 自相矛盾——检测到即标注,供人工核对时点(不自动改判)。
+  {
+    const esByText = new Map<string, Set<string>>();
+    for (const n of mailable) {
+      const es = n.llm?.eventStatus;
+      if (!es || n.updates.length === 0) continue;
+      const key = n.updates[n.updates.length - 1].text;
+      if (!esByText.has(key)) esByText.set(key, new Set());
+      esByText.get(key)!.add(es);
+    }
+    for (const n of mailable) {
+      if (!n.llm?.eventStatus || n.updates.length === 0) continue;
+      const set = esByText.get(n.updates[n.updates.length - 1].text);
+      // 只有 decided 与 pending 同时出现才是真矛盾;unclear 与谁共存都不算
+      // (unclear=文本没说,不构成对立判断,审查修正)。
+      if (set && set.has("decided") && set.has("pending")) n.esConflict = true;
+    }
+  }
 
   // ── I5 🔵收窄 + I2 洪水限流:即时邮件 vs 汇总队列 ──
   const routeNow = Date.now();
@@ -827,7 +922,7 @@ async function main(): Promise<void> {
     }
     // I2:批量裁定洪水(2026-06 单月 690 信号/单日峰 320)中,只有肥尾候选与
     // 降级告警(enriched=false,安全兜底语义不能延迟)保持即时,其余进汇总。
-    if (floodActive && pr.rank <= 2 && !isFatTail(n) && n.enriched) {
+    if (floodActive && pr.rank <= 2 && !isFatTail(n) && !isFatTailShape(n) && n.enriched) {
       digested.push({ n, reason: "flood" });
       continue;
     }
@@ -996,7 +1091,7 @@ async function main(): Promise<void> {
       // 口径的官方文本信号,依据引用原文供人工核对。
       const llmLine = n.llm
         ? isDirectionalStance(n.llm.stance)
-          ? `<div style="margin-top:2px"><b style="color:#2563eb">LLM 判读: ${escapeHtml(n.llm.stance)} (${escapeHtml(n.llm.confidence)}, via=llm)</b>${n.llm.eventStatus ? `<span style="font-size:12px;color:#888"> · 事件${n.llm.eventStatus === "decided" ? "已决" : n.llm.eventStatus === "pending" ? "未决⚠" : "状态不明"}</span>` : ""}${n.llm.evidence ? `<div style="font-size:12px;color:#666">依据: "${escapeHtml(n.llm.evidence)}"</div>` : ""}${n.llm.reasoning ? `<div style="font-size:12px;color:#888">${escapeHtml(n.llm.reasoning)}</div>` : ""}</div>`
+          ? `<div style="margin-top:2px"><b style="color:#2563eb">LLM 判读: ${escapeHtml(n.llm.stance)} (${escapeHtml(n.llm.confidence)}, via=llm)</b>${n.llm.eventStatus ? `<span style="font-size:12px;color:#888"> · 事件${n.llm.eventStatus === "decided" ? "已决" : n.llm.eventStatus === "pending" ? "未决⚠" : "状态不明"}</span>` : ""}${n.esConflict ? `<span style="font-size:12px;color:#d97706"> · 同簇es不一致⚠(同一官方文本在姊妹市场判出相反事件状态,核对时点)</span>` : ""}${n.llmRevoteMismatch ? `<div style="font-size:12px;color:#d97706">复判二票: ${escapeHtml(n.llmRevoteMismatch.stance)} (${escapeHtml(n.llmRevoteMismatch.confidence)}) — ${isDirectionalStance(n.llmRevoteMismatch.stance) ? "与首票极性相反" : "二票收回方向"},已降档</div>` : ""}${n.llm.evidence ? `<div style="font-size:12px;color:#666">依据: "${escapeHtml(n.llm.evidence)}"</div>` : ""}${n.llm.reasoning ? `<div style="font-size:12px;color:#888">${escapeHtml(n.llm.reasoning)}</div>` : ""}</div>`
           : `<div style="margin-top:2px;font-size:12px;color:#888">LLM 判读: ${escapeHtml(n.llm.stance)} (${escapeHtml(n.llm.confidence)})</div>`
         : "";
       // I1 盘口行:能买什么、什么价、多深、直达链接;未核查/失败时如实说明。

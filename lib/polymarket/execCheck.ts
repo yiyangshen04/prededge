@@ -77,23 +77,33 @@ function parseJsonArray(value: unknown): string[] {
   }
 }
 
+/** 方向 stance 的整串匹配(仅容 leans_ 前缀)。P0-2:原 /YES$/i、/NO$/i 是
+ * 子串后缀匹配,resolve_to_bruno、resolve_to_hayes 之类以 -no/-yes 结尾的
+ * 标签会被劫持到 yes/no 分支,永远到不了 outcome-exact。 */
+const YES_STANCE = /^(?:leans_)?yes$/i;
+const NO_STANCE = /^(?:leans_)?no$/i;
+
+/** 极性归一(标题分诊与复判一致性共用):YES/leans_YES → "+",NO/leans_NO
+ * → "-",其余(含 resolve_to_*)原样返回、要求字面一致 —— 刻意不做
+ * resolve_to 归一化比较:放宽它会扩大 🟢 覆盖面,必须等方向映射正确性在
+ * 生产验证后再单独评估(P0-2 顺序警告)。 */
+export function stancePolarity(stance: string): string {
+  if (YES_STANCE.test(stance)) return "+";
+  if (NO_STANCE.test(stance)) return "-";
+  return stance;
+}
+
 /** Map a directional stance to the outcome side it implies buying. Same
  * decision table the backtest's economics used (dirMethod hard-error rate
- * concentrated in bucket heuristics — those stay lowest-trust downstream). */
+ * concentrated in bucket heuristics — those stay lowest-trust downstream:
+ * 自动执行白名单只放行 yes-side/no-side/outcome-exact,见 chain-watch)。 */
 export function directionalOutcomeIndex(
   stance: string,
   outcomes: string[],
   question: string | null
 ): { index: number; method: ExecCheck["dirMethod"] } | null {
   const lower = outcomes.map((o) => o.toLowerCase().trim());
-  if (/YES$/i.test(stance)) {
-    const i = lower.indexOf("yes");
-    return { index: i >= 0 ? i : 0, method: "yes-side" };
-  }
-  if (/NO$/i.test(stance)) {
-    const i = lower.indexOf("no");
-    return { index: i >= 0 ? i : outcomes.length > 1 ? 1 : 0, method: "no-side" };
-  }
+  // resolve_to_ 前缀必须最先判:它的标签是自由词,先走后缀正则就会被劫持(P0-2)。
   if (stance.startsWith("resolve_to_")) {
     const label = stance.slice("resolve_to_".length).toLowerCase().replace(/_/g, " ").replace(/\s+/g, " ").trim();
     const exact = lower.indexOf(label);
@@ -104,6 +114,17 @@ export function directionalOutcomeIndex(
       if (q.includes(label)) return { index: lower.indexOf("yes"), method: "bucket-contains" };
       return { index: lower.indexOf("no"), method: "bucket-anti" };
     }
+    return null;
+  }
+  // YES/NO 只在市场确实存在同名 outcome 时映射;找不到就返回 null——
+  // fallback 到固定下标 0/1 等于在非 yes/no 市场随机买一边,确定性 -100%。
+  if (YES_STANCE.test(stance)) {
+    const i = lower.indexOf("yes");
+    return i >= 0 ? { index: i, method: "yes-side" } : null;
+  }
+  if (NO_STANCE.test(stance)) {
+    const i = lower.indexOf("no");
+    return i >= 0 ? { index: i, method: "no-side" } : null;
   }
   return null;
 }

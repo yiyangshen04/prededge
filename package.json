@@ -10,6 +10,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "tsx --test tests/*.test.ts",
     "scan:notify": "tsx scripts/scan-notify.ts",
     "mail:test": "tsx scripts/send-test-mail.ts"
   },

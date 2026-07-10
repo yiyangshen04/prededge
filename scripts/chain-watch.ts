@@ -52,7 +52,7 @@ import {
   detectCorrection,
 } from "../lib/polymarket/clarificationSchedule";
 import { classifyStanceWithLlm, llmCliCallCount, type LlmStanceVerdict } from "../lib/polymarket/llmStance";
-import { checkExecutability, type ExecCheck } from "../lib/polymarket/execCheck";
+import { checkExecutability, stancePolarity, type ExecCheck } from "../lib/polymarket/execCheck";
 import { executeSignal, executionMode, type TradeAttempt } from "../lib/polymarket/tradeExecutor";
 import { isDirectionalStance } from "../lib/virtualTags";
 import { KNOWN_ADAPTERS } from "../lib/polymarket/onchainEvents";
@@ -1065,11 +1065,10 @@ async function main(): Promise<void> {
   //   含历史全部 -100% 级灾难,一律降 🟠 展示(M1,邮件照发)。
   //   🟢🔥 肥尾候选 > 🟢 双确认 > 🟠 官方方向(LLM拒判/中置信/无定论/红旗)
   // > 🔵 LLM 单独判读 > ⚪ 降级。
-  const polarity = (stance: string): string => {
-    if (/YES$/i.test(stance)) return "+";
-    if (/NO$/i.test(stance)) return "-";
-    return stance; // resolve_to_* 等:要求字面一致
-  };
+  // P0-2③:与 execCheck 共用同一收紧后的整串正则(原 /YES$/i、/NO$/i 会把
+  // resolve_to_hayes/resolve_to_bruno 劫持成 +/-,「双方判读一致却买反」可达
+  // 🟢 闸门)。resolve_to_* 仍要求字面一致,不做归一化。
+  const polarity = stancePolarity;
   // I4 规则层边界闸门(eventStatus=pending ∧ leans_* → 降档)。M6 注:bt4 实测
   // 该闸门 15 个月仅触发 1 次且拦下的是 +1.0% 赢单——几乎不承担防损职能
   // (实测全部深亏在 es=decided 侧,由 M1/M2 防守);保留仅作标注语义。
@@ -1190,6 +1189,9 @@ async function main(): Promise<void> {
       return `<div style="margin-top:2px;font-size:13px;color:#2563eb">🤖[演练] 将买入 ${escapeHtml(n.exec?.outcome ?? "")} $${t.requestedUsd} @≤${t.limitPrice}(EXEC_MODE=dry,未提交)</div>`;
     if (t.status === "error")
       return `<div style="margin-top:2px;font-size:13px"><b style="color:#dc2626">🤖 自动下单失败: ${escapeHtml(t.reason ?? "未知错误")}</b></div>`;
+    // P0-1④:额度打满等风控状态不再只是灰色小字 —— 这是「引擎停机」级信息。
+    if (t.subjectAlert)
+      return `<div style="margin-top:2px;font-size:13px"><b style="color:#dc2626">🤖 ${escapeHtml(t.subjectAlert)},未下单: ${escapeHtml(t.reason ?? "")}</b></div>`;
     return `<div style="margin-top:2px;font-size:12px;color:#888">🤖 未下单: ${escapeHtml(t.reason ?? "")}</div>`;
   };
   const tradeSubjectBit = (n: Notable): string => {
@@ -1200,6 +1202,7 @@ async function main(): Promise<void> {
     if (t.status === "error") return " 🤖下单失败⚠";
     if (t.status === "none") return " 🤖未成交";
     if (t.status === "dry") return " 🤖dry";
+    if (t.subjectAlert) return ` 🤖${t.subjectAlert}⚠`; // P0-1④:skipped 里的额度告警升到主题级
     return "";
   };
   const tradeTextBit = (n: Notable): string => {
@@ -1348,12 +1351,27 @@ async function main(): Promise<void> {
   // 全部在 executeSignal 内部。fail-open:执行器绝不 throw,任何失败都只是
   // 邮件里多一行结果注解,绝不阻塞告警。P2 更正裁定过闸的 🟢(带🔄注解)照常
   // 执行 —— 与 paper 登记口径保持一致;🔄 展示专用(未过闸)不执行。
+  // P0-2④ 自动执行白名单:只有确定性方向映射可以自动下单。bucket-contains/
+  // bucket-anti 是启发式(execCheck 自认硬错误集中地),只发邮件人工确认。
+  const AUTO_EXEC_DIR_METHODS = new Set<ExecCheck["dirMethod"]>([
+    "yes-side",
+    "no-side",
+    "outcome-exact",
+  ]);
   const maybeExecuteTrade = async (n: Notable): Promise<void> => {
     if (executionMode() === "off" || n.trade !== undefined) return;
     const pr = priorityOf(n);
     if (pr.rank !== 0 || !pr.label.startsWith("🟢")) return;
     const e = n.exec;
     if (!e || e.closed || !e.tokenId) return;
+    if (!AUTO_EXEC_DIR_METHODS.has(e.dirMethod)) {
+      n.trade = {
+        mode: executionMode(),
+        status: "skipped",
+        reason: `方向映射 ${e.dirMethod} 是 bucket 启发式,不自动执行 — 请人工确认后手动下单`,
+      };
+      return;
+    }
     try {
       n.trade = await executeSignal({
         qid: n.qid,
@@ -1367,6 +1385,7 @@ async function main(): Promise<void> {
         llmStance: n.llm?.stance ?? null,
         llmConfidence: n.llm?.confidence ?? null,
         bestAskAtSignal: e.bestAsk,
+        dirMethod: e.dirMethod,
         negRisk: e.negRisk,
         forecastTemplate: n.forecastTemplate === true,
         correction: n.correction === true,

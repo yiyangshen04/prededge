@@ -21,8 +21,11 @@
  *   EXEC_CREDS_JSON      default ~/.prededge/clob-creds.json (L2 creds cache)
  *   EXEC_FUNDER          default 0x3a60750796A52e84DA325B74C5ad5c031f296Db9
  *   EXEC_MAX_ORDER_USD   default 50   (单笔上限)
- *   EXEC_DAILY_MAX_USD   default 150  (UTC 日累计上限,按 requested 计)
- *   EXEC_TOTAL_MAX_USD   default 400  (累计总上限 = 热钱包敞口上限)
+ *   EXEC_DAILY_MAX_USD   default 150  (UTC 日累计上限,按实际成交 filledUsd 计;
+ *                        posted=unknown 保守按 requested。P0-1 修复前按 requested
+ *                        计且零成交/拒单也占额,8 次尝试即打满)
+ *   EXEC_TOTAL_MAX_USD   default 400  (当前未结算持仓上限;已结算市场经 Gamma
+ *                        核销释放,缓存于 ledger 同目录 trade-settled.json)
  *   EXEC_MIN_ORDER_USD   default 5    (低于此值不值得付固定成本)
  *   EXEC_MAX_PRICE       default 0.97 (入场价上限;≥0.97 是尾价 carry,自动模式不吃)
  *   EXEC_MIN_PRICE       default 0.03 (入场价下限;防彩票区)
@@ -34,7 +37,7 @@
 import { readFileSync, existsSync, appendFileSync, writeFileSync, mkdirSync, chmodSync } from "fs";
 import path from "path";
 import { homedir } from "os";
-import { CLOB_API } from "./config";
+import { CLOB_API, GAMMA_API } from "./config";
 
 export type ExecMode = "off" | "dry" | "live";
 
@@ -55,6 +58,8 @@ export interface TradeAttempt {
   /** postOrder 是否已发出(true/false/"unknown" 超时未知)——资金占用按此计。 */
   posted?: boolean | "unknown";
   latencyMs?: number;
+  /** 需要提到邮件主题级的风控状态(如额度打满,P0-1④)。 */
+  subjectAlert?: string;
 }
 
 export interface TradeSignalInput {
@@ -71,6 +76,9 @@ export interface TradeSignalInput {
   llmConfidence?: string | null;
   /** 信号注解时刻的 bestAsk(漂移防护的基准;null = 注解时无盘口)。 */
   bestAskAtSignal: number | null;
+  /** execCheck 的方向映射方法,进 ledger 供事后归因(P0-2⑤)。自动执行的
+   * bucket-* 白名单拦截在 chain-watch 的 maybeExecuteTrade。 */
+  dirMethod?: string;
   negRisk?: boolean;
   forecastTemplate?: boolean;
   correction?: boolean;
@@ -92,6 +100,7 @@ interface LedgerEntry extends TradeAttempt {
   llmStance?: string | null;
   llmConfidence?: string | null;
   signalAsk?: number | null;
+  dirMethod?: string | null;
   probe?: boolean;
   raw?: unknown;
 }
@@ -149,9 +158,76 @@ function appendLedger(ledgerPath: string, entry: LedgerEntry): void {
   appendFileSync(ledgerPath, `${JSON.stringify(entry)}\n`);
 }
 
-/** live 且实际(可能)发出过订单的条目 —— 资金占用与去重的口径。 */
-const committedLive = (e: LedgerEntry): boolean =>
-  e.mode === "live" && !e.probe && (e.posted === true || e.posted === "unknown");
+/** 单条 ledger 记录当前占用的资金(P0-1 额度口径)。
+ * 实际成交按 filledUsd(partial 只占实际成交部分);posted="unknown"
+ * (postOrder 超时,交易所可能已受理)保守按 requestedUsd;FAK 零成交
+ * (status=none)与明确拒单(status=error 且 posted=true)实际花 $0,不占额度
+ * —— 修复前它们按 requestedUsd 终身累计,8 次尝试即打满 totalMax,引擎静默停机。 */
+export const exposedUsd = (
+  e: Pick<LedgerEntry, "mode" | "probe" | "posted" | "filledUsd" | "requestedUsd">
+): number => {
+  if (e.mode !== "live" || e.probe) return 0;
+  if (e.posted === "unknown") return e.requestedUsd ?? 0;
+  if (e.posted !== true) return 0;
+  return e.filledUsd ?? 0;
+};
+
+/** P0-1③:totalMax 的口径是「当前未结算持仓」。按 conditionId 拉 Gamma 判断
+ * 市场是否已结算(closed 或 umaResolutionStatus=resolved),已结算的敞口核销
+ * 释放;结算状态单调不可逆,结果落盘缓存(ledger 同目录 trade-settled.json),
+ * Gamma 打不通或预算耗尽时剩余持仓保守按未结算计。 */
+async function openExposureUsd(
+  ledger: LedgerEntry[],
+  cfg: ReturnType<typeof execConfig>,
+  deadlineMs: number
+): Promise<number> {
+  const open = ledger.filter((e) => exposedUsd(e) > 0);
+  if (open.length === 0) return 0;
+  const cachePath = path.join(path.dirname(cfg.ledger), "trade-settled.json");
+  let settled: Record<string, string> = {};
+  try {
+    settled = JSON.parse(readFileSync(cachePath, "utf8")) as Record<string, string>;
+  } catch {
+    // 首次/缓存损坏:全部重查,查不到的按未结算保守计
+  }
+  const pending = [
+    ...new Set(open.map((e) => e.conditionId).filter((c): c is string => !!c && !settled[c])),
+  ];
+  let dirty = false;
+  for (const cid of pending) {
+    if (Date.now() >= deadlineMs) break; // 预算耗尽:剩余按未结算计,宁少放行不超敞口
+    try {
+      const res = await fetch(`${GAMMA_API}/markets?condition_ids=${cid}&limit=2`, {
+        signal: AbortSignal.timeout(4_000),
+      });
+      if (!res.ok) continue;
+      const arr = (await res.json()) as Array<{
+        conditionId?: string;
+        closed?: boolean;
+        umaResolutionStatus?: string | null;
+      }> | null;
+      const m = (Array.isArray(arr) ? arr : []).find(
+        (x) => x.conditionId?.toLowerCase() === cid.toLowerCase()
+      );
+      if (m && (m.closed === true || m.umaResolutionStatus?.trim().toLowerCase() === "resolved")) {
+        settled[cid] = new Date().toISOString();
+        dirty = true;
+      }
+    } catch {
+      // 单个查询失败:该持仓本次按未结算计,下次再查
+    }
+  }
+  if (dirty) {
+    try {
+      writeFileSync(cachePath, JSON.stringify(settled, null, 1));
+    } catch {
+      // 缓存写失败只是下次重查,不影响本次口径
+    }
+  }
+  return open
+    .filter((e) => !(e.conditionId && settled[e.conditionId]))
+    .reduce((s, e) => s + exposedUsd(e), 0);
+}
 
 // ── CLOB client(进程内单例;chain-watch 每 tick 一个进程)──
 
@@ -241,6 +317,7 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
         llmStance: input.llmStance ?? null,
         llmConfidence: input.llmConfidence ?? null,
         signalAsk: input.bestAskAtSignal,
+        ...(input.dirMethod ? { dirMethod: input.dirMethod } : {}),
         ...(input.probe ? { probe: true } : {}),
         ...a,
         ...(raw !== undefined ? { raw } : {}),
@@ -271,30 +348,49 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
     let dailyLeft = cfg.maxOrderUsd;
     let totalLeft = cfg.maxOrderUsd;
     if (!input.probe) {
+      // 去重只看「有敞口」的条目(P0-1):确认零成交(none)与明确拒单不封锁
+      // token,否则一次 FAK 无对手盘就永久放弃该市场的后续机会。
       const dup = ledger.find(
         (e) =>
           e.tokenId === input.tokenId &&
           !e.probe &&
-          (committedLive(e) || (mode === "dry" && e.mode === "dry" && e.status === "dry"))
+          (exposedUsd(e) > 0 || (mode === "dry" && e.mode === "dry" && e.status === "dry"))
       );
       if (dup) {
         return finish({ mode, status: "skipped", reason: `已对该 token 执行过(${dup.at} ${dup.status})` });
       }
       const today = new Date().toISOString().slice(0, 10);
       const spentToday = ledger
-        .filter((e) => committedLive(e) && e.at?.slice(0, 10) === today)
-        .reduce((s, e) => s + (e.requestedUsd ?? 0), 0);
-      const spentTotal = ledger
-        .filter(committedLive)
-        .reduce((s, e) => s + (e.requestedUsd ?? 0), 0);
+        .filter((e) => e.at?.slice(0, 10) === today)
+        .reduce((s, e) => s + exposedUsd(e), 0);
       if (mode === "live" && spentToday >= cfg.dailyMaxUsd) {
-        return finish({ mode, status: "skipped", reason: `日额度已满($${spentToday.toFixed(0)}/${cfg.dailyMaxUsd})` });
+        return finish({
+          mode,
+          status: "skipped",
+          reason: `日额度已满($${spentToday.toFixed(0)}/${cfg.dailyMaxUsd})`,
+          subjectAlert: "日额度满",
+        });
       }
-      if (mode === "live" && spentTotal >= cfg.totalMaxUsd) {
-        return finish({ mode, status: "skipped", reason: `总敞口已满($${spentTotal.toFixed(0)}/${cfg.totalMaxUsd})` });
+      // totalMax = 当前未结算持仓(P0-1③)。毛敞口未触顶时走快路径(零网络
+      // 调用);触顶才做 Gamma 结算核销,把已结算持仓从口径中释放。
+      let openTotal = ledger.reduce((s, e) => s + exposedUsd(e), 0);
+      if (mode === "live" && openTotal >= cfg.totalMaxUsd) {
+        openTotal = await openExposureUsd(
+          ledger,
+          cfg,
+          Date.now() + Math.min(12_000, Math.max(0, input.budgetMs - 15_000))
+        );
+        if (openTotal >= cfg.totalMaxUsd) {
+          return finish({
+            mode,
+            status: "skipped",
+            reason: `未结算持仓已满($${openTotal.toFixed(0)}/${cfg.totalMaxUsd})`,
+            subjectAlert: "总敞口满",
+          });
+        }
       }
       dailyLeft = Math.max(0, cfg.dailyMaxUsd - spentToday);
-      totalLeft = Math.max(0, cfg.totalMaxUsd - spentTotal);
+      totalLeft = Math.max(0, cfg.totalMaxUsd - openTotal);
     }
 
     // ── 新鲜盘口(信号注解距此可能已过数十秒 LLM 判读)──

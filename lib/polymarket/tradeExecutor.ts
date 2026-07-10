@@ -399,11 +399,14 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       Math.min(30_000, input.budgetMs - 8_000),
       "createMarketOrder"
     );
+    // clob-client-v2 的 http 层从不 throw HTTP 错误:非 2xx 一律返回
+    // {error: string|object, status: number}(2026-07-10 探针单实测)。
     let resp: {
       success?: boolean;
       errorMsg?: string;
+      error?: unknown;
       orderID?: string;
-      status?: string;
+      status?: string | number;
       takingAmount?: string;
       makingAmount?: string;
     };
@@ -431,12 +434,36 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
     const shares = Number(resp?.takingAmount);
     const usd = Number(resp?.makingAmount);
     const haveFill = Number.isFinite(shares) && shares > 0 && Number.isFinite(usd) && usd > 0;
-    if (resp?.success === false || (resp?.errorMsg && !haveFill)) {
+    const errStr =
+      resp?.errorMsg ??
+      (typeof resp?.error === "string"
+        ? resp.error
+        : resp?.error != null
+          ? JSON.stringify(resp.error).slice(0, 200)
+          : undefined);
+    // FAK 零成交即撤:交易所受理(有 orderID)但簿内无对手 —— 语义是"未成交",
+    // 不是运维错误,不计入连续报错熔断(探针实测:error 文案 + status 400 + orderID)。
+    if (!haveFill && errStr && /FAK order/i.test(errStr)) {
+      return finish(
+        {
+          mode,
+          status: "none",
+          reason: `FAK 未成交即撤: ${errStr.slice(0, 120)}`,
+          orderId: resp?.orderID,
+          freshAsk,
+          limitPrice,
+          requestedUsd: orderUsd,
+          posted: true,
+        },
+        resp
+      );
+    }
+    if (resp?.success === false || (errStr && !haveFill)) {
       const attempt = finish(
         {
           mode,
           status: "error",
-          reason: `CLOB 拒单: ${resp?.errorMsg ?? JSON.stringify(resp).slice(0, 200)}`,
+          reason: `CLOB 拒单: ${errStr ?? JSON.stringify(resp).slice(0, 200)}`,
           freshAsk,
           limitPrice,
           requestedUsd: orderUsd,

@@ -53,6 +53,7 @@ import {
 } from "../lib/polymarket/clarificationSchedule";
 import { classifyStanceWithLlm, llmCliCallCount, type LlmStanceVerdict } from "../lib/polymarket/llmStance";
 import { checkExecutability, type ExecCheck } from "../lib/polymarket/execCheck";
+import { executeSignal, executionMode, type TradeAttempt } from "../lib/polymarket/tradeExecutor";
 import { isDirectionalStance } from "../lib/virtualTags";
 import { KNOWN_ADAPTERS } from "../lib/polymarket/onchainEvents";
 import { writeFileAtomic } from "../lib/fsAtomic";
@@ -422,6 +423,9 @@ interface Notable {
   /** P3(bt5/E3b):update 链含定时澄清预告模板 —— green∧该家族 n=13 均
    * −5.5% 且零肥尾(green∧非预告 +47% 含全部肥尾)。label-only 负向注解。 */
   forecastTemplate?: boolean;
+  /** 自动下单结果(EXEC_MODE 控制;undefined = 未尝试)。闸门与 paper 登记
+   * 同语义(🟢∧盘口存在),执行器内部另有价格/额度/去重/kill-switch 风控。 */
+  trade?: TradeAttempt;
 }
 
 /** 从 update 链提取正则立场:优先最新的方向性文本,否则用最新一条的分类。
@@ -1174,6 +1178,38 @@ async function main(): Promise<void> {
     return `⚠ 事件级翻盘风险 ${ask >= 0.95 ? "6.4%" : "9.3%"}(dispute 时点领先侧同向,bt5/E1)`;
   };
 
+  // ── 自动下单结果的呈现(主路径与 P1 快路径共用)──
+  const tradeLineHtml = (n: Notable): string => {
+    const t = n.trade;
+    if (!t) return "";
+    if (t.status === "filled" || t.status === "partial")
+      return `<div style="margin-top:2px;font-size:13px"><b style="color:#16a34a">🤖 已自动买入 ${escapeHtml(n.exec?.outcome ?? "")} $${t.filledUsd?.toFixed(2)}${t.status === "partial" ? `(部分,请求 $${t.requestedUsd}` + ")" : ""} @ 均价 ${t.avgPrice?.toFixed(3)}</b><span style="font-size:12px;color:#888"> · orderId ${escapeHtml((t.orderId ?? "?").slice(0, 12))}… · ${((t.latencyMs ?? 0) / 1000).toFixed(1)}s</span></div>`;
+    if (t.status === "none")
+      return `<div style="margin-top:2px;font-size:13px;color:#d97706">🤖 FAK 提交成功但未成交(限价 ${t.limitPrice} 内无对手盘),已自动撤单</div>`;
+    if (t.status === "dry")
+      return `<div style="margin-top:2px;font-size:13px;color:#2563eb">🤖[演练] 将买入 ${escapeHtml(n.exec?.outcome ?? "")} $${t.requestedUsd} @≤${t.limitPrice}(EXEC_MODE=dry,未提交)</div>`;
+    if (t.status === "error")
+      return `<div style="margin-top:2px;font-size:13px"><b style="color:#dc2626">🤖 自动下单失败: ${escapeHtml(t.reason ?? "未知错误")}</b></div>`;
+    return `<div style="margin-top:2px;font-size:12px;color:#888">🤖 未下单: ${escapeHtml(t.reason ?? "")}</div>`;
+  };
+  const tradeSubjectBit = (n: Notable): string => {
+    const t = n.trade;
+    if (!t) return "";
+    if (t.status === "filled") return ` 🤖已买$${t.filledUsd?.toFixed(0)}`;
+    if (t.status === "partial") return ` 🤖部分$${t.filledUsd?.toFixed(0)}`;
+    if (t.status === "error") return " 🤖下单失败⚠";
+    if (t.status === "none") return " 🤖未成交";
+    if (t.status === "dry") return " 🤖dry";
+    return "";
+  };
+  const tradeTextBit = (n: Notable): string => {
+    const t = n.trade;
+    if (!t) return "";
+    if (t.status === "filled" || t.status === "partial")
+      return ` TRADE:${t.status} $${t.filledUsd} @${t.avgPrice}`;
+    return ` TRADE:${t.status}${t.reason ? `(${t.reason.slice(0, 60)})` : ""}`;
+  };
+
   // ── M3:🟢🔥 复判(独立第二票)──
   // bt4/A5 实测:同 prompt 两次判读方向层翻转率 5%;三票多数杀噪声型误判
   // (Mutilation)但救不了系统性误读。🟢🔥 月频 ~1.4 笔,二票成本可忽略。
@@ -1306,6 +1342,56 @@ async function main(): Promise<void> {
     }
   };
   for (const n of mailable) maybeRegisterPaperTrade(n);
+
+  // ── 自动下单(2026-07-10):与 paper 登记同一闸门(🟢 标签 ∧ 盘口存在),
+  // 风控(EXEC_MODE 三态/kill-switch/单笔/日/总额度/价格带/滑点/去重 ledger)
+  // 全部在 executeSignal 内部。fail-open:执行器绝不 throw,任何失败都只是
+  // 邮件里多一行结果注解,绝不阻塞告警。P2 更正裁定过闸的 🟢(带🔄注解)照常
+  // 执行 —— 与 paper 登记口径保持一致;🔄 展示专用(未过闸)不执行。
+  const maybeExecuteTrade = async (n: Notable): Promise<void> => {
+    if (executionMode() === "off" || n.trade !== undefined) return;
+    const pr = priorityOf(n);
+    if (pr.rank !== 0 || !pr.label.startsWith("🟢")) return;
+    const e = n.exec;
+    if (!e || e.closed || !e.tokenId) return;
+    try {
+      n.trade = await executeSignal({
+        qid: n.qid,
+        tokenId: e.tokenId,
+        conditionId: e.conditionId,
+        outcome: e.outcome,
+        question: e.question,
+        marketUrl: e.marketUrl,
+        label: pr.label,
+        stance: n.stance,
+        llmStance: n.llm?.stance ?? null,
+        llmConfidence: n.llm?.confidence ?? null,
+        bestAskAtSignal: e.bestAsk,
+        negRisk: e.negRisk,
+        forecastTemplate: n.forecastTemplate === true,
+        correction: n.correction === true,
+        budgetMs: wallBudgetLeftMs(),
+      });
+      console.log(
+        JSON.stringify({
+          mode: "chain-watch-trade",
+          qid: n.qid.slice(0, 12),
+          token: e.tokenId.slice(0, 12),
+          status: n.trade.status,
+          reason: n.trade.reason,
+          usd: n.trade.filledUsd ?? n.trade.requestedUsd,
+          avgPrice: n.trade.avgPrice,
+          latencyMs: n.trade.latencyMs,
+        })
+      );
+    } catch (err) {
+      // executeSignal 自身兜底不 throw;这里是双保险
+      console.warn(
+        `[chain-watch] 自动下单异常(${n.qid.slice(0, 10)}): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  };
+  for (const n of mailable) await maybeExecuteTrade(n);
 
   // ── I2: 汇总队列冲洗(攒满 DIGEST_MAX_SIZE 条,或最老条目滞留超 6h)──
   // 独立于即时邮件的 best-effort:失败保留队列下轮重试,绝不阻塞 cursor 推进。
@@ -1516,6 +1602,10 @@ async function main(): Promise<void> {
             set.add(item.llm.eventStatus);
             if (set.has("decided") && set.has("pending")) item.esConflict = true;
           }
+          // 自动下单:快路径是全系统延迟最敏感的时刻(断崖 2-5min),执行先于
+          // 发信;batch 路径同样执行(邮件合并只是通知路由,不是执行路由)。
+          // 邮件失败重试导致的重复检出由执行器 ledger 按 tokenId 去重兜住。
+          await maybeExecuteTrade(item);
           const latencyS = Math.round((Date.now() - e.commitAtMs) / 1000);
           if (fired >= PREARM_FIRE_SOLO_MAX) {
             batchPending.set(qid, { e, item, latencyS });
@@ -1542,7 +1632,7 @@ async function main(): Promise<void> {
               ? `<div style="margin-top:2px;font-size:13px"><b style="color:${item.exec.executable ? "#16a34a" : "#d97706"}">盘口: 买 ${escapeHtml(item.exec.outcome)} @${item.exec.bestAsk.toFixed(3)} · 近档深度 $${Math.round(item.exec.askUsdNear)}</b>${item.exec.fill100 ? ` · $100 市价单均价 ${item.exec.fill100.avgPrice.toFixed(3)}` : ""}${item.exec.marketUrl ? ` · <a href="${item.exec.marketUrl}">直达市场</a>` : ""}</div>`
               : "";
           await sendMail({
-            subject: `[PredEdge链上] ⏰预告兑现 ${pr.label}${execBit} | ${safeSlice(item.title ?? qid, 48)}`,
+            subject: `[PredEdge链上] ⏰预告兑现 ${pr.label}${execBit}${tradeSubjectBit(item)} | ${safeSlice(item.title ?? qid, 48)}`,
             html: `<div style="font-family:system-ui,sans-serif;max-width:640px">
               <p><b>预告澄清承诺兑现</b>:承诺时点 ${new Date(e.commitAtMs).toISOString().slice(0, 16).replace("T", " ")}Z → 快轮询检出 ${latencyS >= 0 ? "+" : ""}${latencyS}s(bt5:入场断崖在 2-5 分钟,此刻是窗口)。</p>
               <div style="font-weight:600">${escapeHtml(item.title ?? qid)}</div>
@@ -1550,11 +1640,12 @@ async function main(): Promise<void> {
               ${item.correction ? `<div style="margin-top:2px;font-size:13px;color:#dc2626"><b>🔄 此文本更正/撤回此前裁定 —— 核对新旧方向后再动。</b></div>` : ""}
               ${llmLine}
               ${execLine}
+              ${tradeLineHtml(item)}
               ${item.excerpt ? `<div style="font-size:12px;color:#aaa;margin-top:4px">"${escapeHtml(item.excerpt)}"</div>` : ""}
               <div style="margin-top:4px"><a href="${searchUrl}">在 Polymarket 搜索</a> · qid ${escapeHtml(qid.slice(0, 10))}…</div>
               <p style="font-size:12px;color:#888">盘口为发信时刻快照;预告模板家族属绿档负收益家族(bt5/E3b),审慎对待。</p>
             </div>`,
-            text: `预告兑现 +${latencyS}s | ${item.title ?? qid} | ${pr.label} | stance=${item.stance}(${item.confidence})${item.llm && isDirectionalStance(item.llm.stance) ? ` llm=${item.llm.stance}(${item.llm.confidence})` : ""}${item.exec?.bestAsk != null ? ` ask=${item.exec.bestAsk.toFixed(3)}` : ""}`,
+            text: `预告兑现 +${latencyS}s | ${item.title ?? qid} | ${pr.label} | stance=${item.stance}(${item.confidence})${item.llm && isDirectionalStance(item.llm.stance) ? ` llm=${item.llm.stance}(${item.llm.confidence})` : ""}${item.exec?.bestAsk != null ? ` ask=${item.exec.bestAsk.toFixed(3)}` : ""}${tradeTextBit(item)}`,
           });
           fired += 1;
           markFired(qid, e, item, pr.rank);
@@ -1583,6 +1674,7 @@ async function main(): Promise<void> {
             return `<tr><td style="padding:4px 8px;border-bottom:1px solid #eee;font-size:13px">
               ${escapeHtml(item.title ?? qid)}<br>
               <span style="font-size:12px;color:#888">${escapeHtml(pr.label)} · +${latencyS}s · stance=${escapeHtml(item.stance)}(${escapeHtml(item.confidence)})${item.llm && isDirectionalStance(item.llm.stance) ? ` · llm=${escapeHtml(item.llm.stance)}` : ""}${item.exec?.bestAsk != null ? ` · 价${item.exec.bestAsk.toFixed(3)} 深$${Math.round(item.exec.askUsdNear)}` : ""}${item.exec?.marketUrl ? ` · <a href="${item.exec.marketUrl}">市场</a>` : ""}</span>
+              ${tradeLineHtml(item)}
             </td></tr>`;
           })
           .join("\n");
@@ -1631,6 +1723,11 @@ async function main(): Promise<void> {
         degraded,
         exec_checked: execChecked,
         paper_registered: paperRegistered || undefined,
+        exec_mode: executionMode() !== "off" ? executionMode() : undefined,
+        trade_attempts: mailable.filter((n) => n.trade).length || undefined,
+        trade_filled:
+          mailable.filter((n) => n.trade && (n.trade.status === "filled" || n.trade.status === "partial"))
+            .length || undefined,
         v2_watch: Object.keys(state.v2Watch).length || undefined,
         v2_polled: v2Polled || undefined,
         pre_armed: Object.keys(state.preArm).length || undefined,
@@ -1675,7 +1772,7 @@ async function main(): Promise<void> {
       ? ` | 价${top.exec.bestAsk.toFixed(2)} 深$${Math.round(top.exec.askUsdNear)}${top.exec.executable ? "" : "⚠"}`
       : " | 无盘口⚠"
     : "";
-  const subject = `[PredEdge链上] ${priorityOf(top).label}${topExecBit} | ${topTitle}${immediate.length > 1 ? ` 等${immediate.length}个` : ""}`;
+  const subject = `[PredEdge链上] ${priorityOf(top).label}${topExecBit}${tradeSubjectBit(top)} | ${topTitle}${immediate.length > 1 ? ` 等${immediate.length}个` : ""}`;
 
   const rows = immediate
     .map((n) => {
@@ -1721,6 +1818,7 @@ async function main(): Promise<void> {
           ${correctionLine}
           ${llmLine}
           ${execLine}
+          ${tradeLineHtml(n)}
           ${riskLine}
           ${n.excerpt ? `<div style="font-size:12px;color:#aaa;margin-top:4px">"${escapeHtml(n.excerpt)}"</div>` : ""}
           <div style="margin-top:4px"><a href="${searchUrl}">在 Polymarket 搜索</a> · qid ${escapeHtml(n.qid.slice(0, 10))}…</div>
@@ -1742,7 +1840,7 @@ async function main(): Promise<void> {
       const llmBit = n.llm && isDirectionalStance(n.llm.stance) ? ` llm=${n.llm.stance}(${n.llm.confidence})` : "";
       const execBit = n.exec?.bestAsk != null ? ` ask=${n.exec.bestAsk.toFixed(3)} depth$${Math.round(n.exec.askUsdNear)}` : "";
       const riskBit = disputeRiskNote(n) ? ` ${disputeRiskNote(n)}` : "";
-      return `${n.title ?? n.qid} | ${[...n.kinds].join("+")} | stance=${n.stance}(${n.confidence})${llmBit}${execBit}${n.correction ? " CORRECTION" : ""}${riskBit}${n.refundClause ? " REFUND" : ""}`;
+      return `${n.title ?? n.qid} | ${[...n.kinds].join("+")} | stance=${n.stance}(${n.confidence})${llmBit}${execBit}${n.correction ? " CORRECTION" : ""}${riskBit}${n.refundClause ? " REFUND" : ""}${tradeTextBit(n)}`;
     })
     .join("\n");
 

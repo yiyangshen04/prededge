@@ -1,5 +1,5 @@
 /**
- * 心跳监控 + 日报 — cron 入口(只读本地文件,除发信外不碰网络)。
+ * 心跳监控 + 日报 — cron 入口。
  *
  * 用法:
  *   npx tsx scripts/heartbeat.ts --watch   每 10 分钟:两条通道超龄则发告警邮件,恢复发恢复邮件
@@ -10,12 +10,25 @@
  * 告警只在状态翻转时发一次(ok→down / down→ok),状态存 data/heartbeat-state.json。
  * 日报统计基于日志字节 offset("自上次日报以来"),周日日志截断后自动归零重来。
  *
+ * §3.1 静默单点探针(2026-07-11):mtime 判活只覆盖"进程死了",四个单点挂掉
+ * 后进程照常 exit 0、监控全绿,系统却已实质停摆:
+ *   探针 0 SMTP    — verify 握手,失败即 exit≠0 → run-cron 不 ping
+ *                    HC_PING_HEARTBEAT → healthchecks.io 从外部拉响(SMTP
+ *                    死了邮件自报是不可能的,这是唯一出路);
+ *   探针 1 kill-switch — trading-halt 文件存在(自动熔断落的)即告警;
+ *   探针 2 Clash   — 经代理探 gamma-api,连续 2 次(≈20min)失败告警;
+ *   探针 3 claude  — 每小时跑一次 claude -p 探针,连续 2 次(≈2h)失败告警
+ *                    (登录态失效时 LLM 判读静默 fail-open,🟢/自动下单闸门
+ *                    整体消失而邮件表面全绿)。
+ *
  * 注意:本机(sufe)整机死亡时本脚本同样死亡 —— 这层只报"进程还在但坏了";
  * "整机被清"必须靠外部 healthchecks.io(见 run-cron.sh 的 HC_PING_*)。
  */
 import fs from "node:fs";
 import path from "node:path";
-import { sendMail } from "./mailer";
+import os from "node:os";
+import { execFile } from "node:child_process";
+import { sendMail, verifySmtp } from "./mailer";
 import { writeFileAtomic } from "../lib/fsAtomic";
 
 const ROOT = path.resolve(__dirname, "..");
@@ -66,6 +79,10 @@ interface HeartbeatState {
    * rotated file is smaller than the old offset). */
   logInodes: Record<string, number>;
   lastDigestAt: string | null;
+  /** §3.1 探针连续失败计数(达到阈值才翻转告警,容忍单次网络抖动)。 */
+  probeFails: Record<string, number>;
+  /** claude 登录态探针的上次执行时刻(小时级节流,每次探针都是一次真调用)。 */
+  lastClaudeProbeAt: string | null;
 }
 
 function loadState(): HeartbeatState {
@@ -76,9 +93,11 @@ function loadState(): HeartbeatState {
       offsets: raw.offsets && typeof raw.offsets === "object" ? raw.offsets : {},
       logInodes: raw.logInodes && typeof raw.logInodes === "object" ? raw.logInodes : {},
       lastDigestAt: typeof raw.lastDigestAt === "string" ? raw.lastDigestAt : null,
+      probeFails: raw.probeFails && typeof raw.probeFails === "object" ? raw.probeFails : {},
+      lastClaudeProbeAt: typeof raw.lastClaudeProbeAt === "string" ? raw.lastClaudeProbeAt : null,
     };
   } catch {
-    return { alert: {}, offsets: {}, logInodes: {}, lastDigestAt: null };
+    return { alert: {}, offsets: {}, logInodes: {}, lastDigestAt: null, probeFails: {}, lastClaudeProbeAt: null };
   }
 }
 
@@ -128,12 +147,159 @@ function tailLines(file: string, n: number): string[] {
   }
 }
 
+// ── §3.1 静默单点探针 ──
+
+const HALT_KEY = "trading-halt";
+const PROXY_KEY = "proxy-gamma";
+const CLAUDE_KEY = "claude-login";
+/** 连续失败达到该次数才翻转 down(容忍单次网络抖动)。 */
+const PROBE_FAIL_THRESHOLD = 2;
+
+function haltFilePath(): string {
+  const p = process.env.EXEC_HALT_FILE?.trim() || "data/trading-halt";
+  return path.isAbsolute(p) ? p : path.join(ROOT, p);
+}
+
+/** Gamma 经代理(heartbeat 在 run-cron 下继承 HTTPS_PROXY+NODE_USE_ENV_PROXY,
+ * 走的正是 scan-notify/盘口注解/自动下单同一条 Clash 路径)。 */
+async function probeGamma(): Promise<boolean> {
+  try {
+    const res = await fetch("https://gamma-api.polymarket.com/markets?limit=1", {
+      signal: AbortSignal.timeout(10_000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** claude CLI 登录态:与 llmStance.runClaude 同一 bin/参数形态/env 白名单的
+ * 最小真实调用(登录态失效只有真调用才暴露)。 */
+function probeClaude(): Promise<{ ok: boolean; detail: string }> {
+  const bin = process.env.CLAUDE_BIN?.trim() || "claude";
+  const model = process.env.LLM_STANCE_MODEL?.trim() || "claude-opus-4-8";
+  const args = ["-p", "--output-format", "json", "--tools", "", "--strict-mcp-config", "--model", model];
+  const allow = [
+    "PATH", "HOME", "SHELL", "USER", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+    "NODE_USE_ENV_PROXY", "TMPDIR", "LANG", "LC_ALL", "TERM",
+  ];
+  const env = {} as NodeJS.ProcessEnv;
+  for (const k of allow) if (process.env[k] !== undefined) env[k] = process.env[k];
+  return new Promise((resolve) => {
+    const child = execFile(
+      bin,
+      args,
+      { timeout: 60_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024, cwd: os.tmpdir(), env },
+      (err, stdout, stderr) => {
+        if (err) {
+          resolve({ ok: false, detail: `${err.message}${stderr ? ` | ${String(stderr).slice(0, 200)}` : ""}` });
+          return;
+        }
+        try {
+          const wrapper = JSON.parse(String(stdout)) as { is_error?: boolean; result?: unknown };
+          if (wrapper?.is_error) {
+            resolve({ ok: false, detail: `is_error: ${String(wrapper.result).slice(0, 200)}` });
+            return;
+          }
+          resolve({ ok: true, detail: "" });
+        } catch {
+          resolve({ ok: false, detail: `非 JSON 输出: ${String(stdout).slice(0, 120)}` });
+        }
+      }
+    );
+    child.stdin?.on("error", () => {});
+    child.stdin?.end("只回复两个字:正常");
+  });
+}
+
 // ── watch 模式:超龄告警 / 恢复通知 ──
 
 async function watch(): Promise<void> {
+  // 探针 0:SMTP。verify 失败即硬失败(exit≠0)—— run-cron 不 ping
+  // HC_PING_HEARTBEAT,由 healthchecks.io 从外部拉响。SMTP 死了后面的一切
+  // 告警邮件都发不出去,继续跑只是自欺。
+  await verifySmtp();
+
   const state = loadState();
   const events: Array<{ ch: Channel; kind: "down" | "recovered"; detail: string }> = [];
   const summary: Record<string, string> = {};
+
+  // 探针事件与通道告警共用同一封翻转邮件;probe 无日志文件(tail 为空)。
+  const pushProbeEvent = (
+    key: string,
+    label: string,
+    down: boolean,
+    downDetail: string,
+    recoverDetail: string
+  ): void => {
+    const prev = state.alert[key]?.status ?? "ok";
+    const ch: Channel = { key, label, markers: [], log: "", staleMinutes: 0 };
+    if (down && prev !== "down") {
+      events.push({ ch, kind: "down", detail: downDetail });
+      state.alert[key] = { status: "down", since: new Date().toISOString() };
+    } else if (!down && prev === "down") {
+      events.push({ ch, kind: "recovered", detail: recoverDetail });
+      state.alert[key] = { status: "ok", since: new Date().toISOString() };
+    }
+    summary[key] = down ? "down" : "ok";
+  };
+
+  // 探针 1:kill-switch 文件。自动熔断(连续错误/连亏/ledger 写失败)只落
+  // 本地文件,不报的话操作员可能几天不知道引擎已停。文件存在与否是确定态,
+  // 不走连续失败阈值。
+  {
+    let haltContent: string | null = null;
+    try {
+      haltContent = fs.readFileSync(haltFilePath(), "utf8").slice(0, 400);
+    } catch {
+      haltContent = null;
+    }
+    pushProbeEvent(
+      HALT_KEY,
+      "自动交易 kill-switch(trading-halt)",
+      haltContent != null,
+      `kill-switch 文件存在,自动交易已全部停止:${haltFilePath()}\n内容:${haltContent || "(空)"}\n人工排查后删除该文件恢复。`,
+      "kill-switch 已移除,自动交易恢复。"
+    );
+  }
+
+  // 探针 2:Clash 代理(经代理访问 gamma-api)。
+  {
+    const ok = await probeGamma();
+    const fails = ok ? 0 : (state.probeFails[PROXY_KEY] ?? 0) + 1;
+    state.probeFails[PROXY_KEY] = fails;
+    // 低于阈值的失败不翻转(保持原状态),单次成功即恢复。
+    const down = fails >= PROBE_FAIL_THRESHOLD || (!ok && state.alert[PROXY_KEY]?.status === "down");
+    pushProbeEvent(
+      PROXY_KEY,
+      "Gamma/代理连通(Clash 单点)",
+      down,
+      `连续 ${fails} 次无法经代理访问 gamma-api —— Clash 大概率已死。scan-notify 整通道、盘口注解、自动下单、结算对账全部依赖它;chain-watch 链上告警(直连 RPC)不受影响。`,
+      "Gamma 经代理已恢复可达。"
+    );
+  }
+
+  // 探针 3:claude CLI 登录态(每小时一次,每次是真调用)。
+  {
+    const last = state.lastClaudeProbeAt ? Date.parse(state.lastClaudeProbeAt) : 0;
+    if (Date.now() - last > 55 * 60_000) {
+      state.lastClaudeProbeAt = new Date().toISOString();
+      const { ok, detail } = await probeClaude();
+      const fails = ok ? 0 : (state.probeFails[CLAUDE_KEY] ?? 0) + 1;
+      state.probeFails[CLAUDE_KEY] = fails;
+      const down = fails >= PROBE_FAIL_THRESHOLD || (!ok && state.alert[CLAUDE_KEY]?.status === "down");
+      pushProbeEvent(
+        CLAUDE_KEY,
+        "claude CLI 登录态(LLM 判读)",
+        down,
+        `连续 ${fails} 次 claude -p 探针失败:${detail || "无输出"}\nLLM 判读正在静默 fail-open —— 🟢 双确认档与自动下单闸门已实质停摆(只发 🟠),邮件表面全绿。ssh sufe 后重新 claude setup-token 并更新 .env 的 CLAUDE_CODE_OAUTH_TOKEN。`,
+        "claude CLI 探针已恢复。"
+      );
+    } else {
+      summary[CLAUDE_KEY] = state.alert[CLAUDE_KEY]?.status ?? "ok";
+    }
+  }
 
   for (const ch of CHANNELS) {
     const last = lastOkAt(ch);

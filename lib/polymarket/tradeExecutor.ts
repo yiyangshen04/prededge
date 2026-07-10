@@ -28,8 +28,17 @@
  *                        核销释放,缓存于 ledger 同目录 trade-settled.json)
  *   EXEC_MIN_ORDER_USD   default 5    (低于此值不值得付固定成本)
  *   EXEC_MAX_PRICE       default 0.97 (入场价上限;≥0.97 是尾价 carry,自动模式不吃)
- *   EXEC_MIN_PRICE       default 0.03 (入场价下限;防彩票区)
- *   EXEC_SLIPPAGE        default 0.03 (限价帽 = 新鲜 ask + slippage;信号价漂移超过它=已重定价,放弃)
+ *   EXEC_MIN_PRICE       default 0.12 (入场价下限;2026-07-10 审计定量裁决:
+ *                        0.03-0.15 彩票区历史 4/4 归零,而真肥尾入场价均 ≥0.15)
+ *   EXEC_SLIPPAGE        default 0.03 (限价帽 = 新鲜 ask + slippage;也是漂移带的下限)
+ *   EXEC_SLIPPAGE_EDGE_FRAC  default 0.15 (上行漂移带按剩余边缩放:容忍
+ *                        max(EXEC_SLIPPAGE, frac×(1−signalAsk));绝对带在 0.16
+ *                        价位是 18% 相对档,肥尾回归途中 0.164→0.20 被拒而
+ *                        0.20 买入仍 +400% —— 实盘低于回测的第一大来源,§2.3)
+ *   EXEC_CRASH_DROP_FRAC default 0.35 (下行守卫:freshAsk 较信号价跌超
+ *                        max(EXEC_SLIPPAGE, frac×signalAsk) = 市场把裁定读成
+ *                        反方向,skip 待人工复核,不当便宜货买)
+ *   EXEC_LOSS_HALT_COUNT default 3    (结算对账连亏 N 笔 → 自动落 halt 文件)
  *   EXEC_SKIP_FORECAST_TEMPLATE  default on(bt5/E3b:预告模板家族绿档均值 −5.5%、零肥尾)
  *   EXEC_HALT_FILE       default data/trading-halt(存在即停;连续 3 次 live error 自动创建)
  *   EXEC_LEDGER          default data/trade-ledger.jsonl
@@ -38,6 +47,7 @@ import { readFileSync, existsSync, appendFileSync, writeFileSync, mkdirSync, chm
 import path from "path";
 import { homedir } from "os";
 import { CLOB_API, GAMMA_API } from "./config";
+import { ethCall } from "./oracleState";
 
 export type ExecMode = "off" | "dry" | "live";
 
@@ -128,8 +138,11 @@ export function execConfig() {
     totalMaxUsd: num("EXEC_TOTAL_MAX_USD", 400),
     minOrderUsd: num("EXEC_MIN_ORDER_USD", 5),
     maxPrice: num("EXEC_MAX_PRICE", 0.97),
-    minPrice: num("EXEC_MIN_PRICE", 0.03),
+    minPrice: num("EXEC_MIN_PRICE", 0.12),
     slippage: num("EXEC_SLIPPAGE", 0.03),
+    slippageEdgeFrac: num("EXEC_SLIPPAGE_EDGE_FRAC", 0.15),
+    crashDropFrac: num("EXEC_CRASH_DROP_FRAC", 0.35),
+    lossHaltCount: num("EXEC_LOSS_HALT_COUNT", 3),
     skipForecastTemplate:
       (process.env.EXEC_SKIP_FORECAST_TEMPLATE ?? "on").trim().toLowerCase() !== "off",
     haltFile: rel(process.env.EXEC_HALT_FILE?.trim() || "data/trading-halt"),
@@ -172,10 +185,189 @@ export const exposedUsd = (
   return e.filledUsd ?? 0;
 };
 
-/** P0-1③:totalMax 的口径是「当前未结算持仓」。按 conditionId 拉 Gamma 判断
- * 市场是否已结算(closed 或 umaResolutionStatus=resolved),已结算的敞口核销
- * 释放;结算状态单调不可逆,结果落盘缓存(ledger 同目录 trade-settled.json),
- * Gamma 打不通或预算耗尽时剩余持仓保守按未结算计。 */
+/** 上行漂移容忍带(§2.3):绝对带在低价位是过窄的相对档 —— 肥尾回归途中
+ * 0.164→0.20 仍 +400% EV 却被 0.03 绝对带拒单。带宽按剩余边(1−signalAsk)
+ * 缩放,高价位退化回绝对带(只放宽低价位,绝不收紧既有行为)。 */
+export const upDriftBand = (signalAsk: number, slippage: number, edgeFrac: number): number =>
+  Math.max(slippage, edgeFrac * (1 - signalAsk));
+
+/** 下行暴跌阈值(§2.3 对称侧):freshAsk 跌破信号价这么多 = 市场把裁定读成了
+ * 反方向,此刻的"便宜"是毒饵 —— skip 待人工复核,不能当折扣照买。 */
+export const crashDropThreshold = (signalAsk: number, slippage: number, dropFrac: number): number =>
+  Math.max(slippage, dropFrac * signalAsk);
+
+/** 更正翻向双腿保护(§7):同 conditionId 已有敞口但 tokenId 不同 = 买对手边,
+ * 两腿结算合计 ≤ $1,确定性锁损。返回冲突的已有持仓条目。 */
+export const findOppositeLeg = <
+  T extends Pick<LedgerEntry, "conditionId" | "tokenId" | "mode" | "probe" | "posted" | "filledUsd" | "requestedUsd">,
+>(
+  ledger: T[],
+  conditionId: string | undefined,
+  tokenId: string
+): T | undefined =>
+  conditionId
+    ? ledger.find((e) => e.conditionId === conditionId && e.tokenId !== tokenId && exposedUsd(e) > 0)
+    : undefined;
+
+/** pUSD(Polymarket V2 抵押品,USDC 语义,6 位小数)。 */
+const PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+
+/** proxy 钱包的 pUSD 可用余额(链上直读,fail-open:RPC 不可达返回 null,
+ * 调用方照常下单,由 CLOB 侧最终把关)。持仓占满现金后每个绿单都会变
+ * error→3 次误熔断,这里提前降为 skipped 告警(§7)。 */
+async function proxyUsdcBalance(funder: string): Promise<number | null> {
+  try {
+    const data = `0x70a08231${funder.toLowerCase().replace(/^0x/, "").padStart(64, "0")}`;
+    const result = await withTimeout(ethCall(PUSD_ADDRESS, data), 8_000, "pUSD balanceOf");
+    return Number(BigInt(result)) / 1e6;
+  } catch {
+    return null;
+  }
+}
+
+// ── 结算缓存(P0-1③ 敞口核销 + P0-4 结算对账共用,ledger 同目录 trade-settled.json)──
+
+/** 缓存值:旧格式是纯 ISO 字符串(仅表示已结算),P0-4 起升级为对象并携带
+ * 已实现盈亏;读取端两种都接受(sufe 上存在旧格式存量,truthy 即已结算)。
+ * 保留键 "_lossHaltAt"(字符串)记录上次连亏熔断时刻,与 conditionId 不冲突。 */
+interface SettledRecord {
+  at: string;
+  question?: string;
+  outcome?: string;
+  /** 我方 outcome 的结算价(赢=1/输=0,Gamma outcomePrices)。 */
+  outcomePrice?: number;
+  costUsd?: number;
+  payoutUsd?: number;
+  /** 已实现盈亏;无法可靠计算(无成交明细/outcome 未匹配/结算价未定型)时
+   * 缺失 —— 缺失条目不进连亏熔断链(错的盈亏比没有盈亏更毒)。 */
+  pnlUsd?: number;
+  won?: boolean;
+  /** 结算邮件已成功发出(markSettlementsNotified 置位)。 */
+  notified?: boolean;
+}
+type SettledCache = Record<string, string | SettledRecord>;
+
+function settledCachePath(cfg: ReturnType<typeof execConfig>): string {
+  return path.join(path.dirname(cfg.ledger), "trade-settled.json");
+}
+
+function loadSettledCache(cfg: ReturnType<typeof execConfig>): SettledCache {
+  try {
+    const parsed = JSON.parse(readFileSync(settledCachePath(cfg), "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {}; // 首次/缓存损坏:全部重查,查不到的按未结算保守计
+  }
+}
+
+function saveSettledCache(cfg: ReturnType<typeof execConfig>, cache: SettledCache): void {
+  try {
+    writeFileSync(settledCachePath(cfg), JSON.stringify(cache, null, 1));
+  } catch {
+    // 缓存写失败只是下次重查,不影响本次口径
+  }
+}
+
+/** 按 Gamma 结算价计算一组同 conditionId 持仓的已实现盈亏。只统计有成交明细
+ * (filledUsd/filledShares)的条目;outcome 在 outcomes 里匹配不上时返回 null
+ * —— 记结算但不记盈亏,宁缺毋错。 */
+export function computeSettlementPnl(
+  entries: Array<Pick<LedgerEntry, "outcome" | "filledUsd" | "filledShares">>,
+  outcomes: string[],
+  outcomePrices: number[]
+): { costUsd: number; payoutUsd: number; pnlUsd: number; won: boolean; outcomePrice: number } | null {
+  const lower = outcomes.map((o) => o.toLowerCase().trim());
+  let cost = 0;
+  let payout = 0;
+  let price: number | null = null;
+  for (const e of entries) {
+    if (!((e.filledUsd ?? 0) > 0) || !((e.filledShares ?? 0) > 0)) continue;
+    const idx = e.outcome ? lower.indexOf(e.outcome.toLowerCase().trim()) : -1;
+    const p = idx >= 0 ? outcomePrices[idx] : NaN;
+    if (!Number.isFinite(p)) return null;
+    cost += e.filledUsd!;
+    payout += e.filledShares! * p;
+    price = p;
+  }
+  if (price == null) return null; // 无成交明细,无盈亏可记
+  return {
+    costUsd: Math.round(cost * 100) / 100,
+    payoutUsd: Math.round(payout * 100) / 100,
+    pnlUsd: Math.round((payout - cost) * 100) / 100,
+    won: payout >= cost,
+    outcomePrice: price,
+  };
+}
+
+interface GammaMarketView {
+  conditionId?: string;
+  closed?: boolean;
+  umaResolutionStatus?: string | null;
+  question?: string;
+  outcomes?: unknown;
+  outcomePrices?: unknown;
+}
+
+async function fetchGammaByCid(cid: string, extraQuery: string): Promise<GammaMarketView | null> {
+  const res = await fetch(`${GAMMA_API}/markets?condition_ids=${cid}${extraQuery}&limit=2`, {
+    signal: AbortSignal.timeout(4_000),
+  });
+  if (!res.ok) return null;
+  const arr = (await res.json()) as GammaMarketView[] | null;
+  return (
+    (Array.isArray(arr) ? arr : []).find((x) => x.conditionId?.toLowerCase() === cid.toLowerCase()) ??
+    null
+  );
+}
+
+/** 单个 conditionId 的结算探测与记账:已结算 → 写入缓存(结算价已定型到
+ * 0/1 时附带已实现盈亏),返回 true;Gamma 打不通或未结算返回 false。
+ * 注意查询策略(2026-07-11 实测):`condition_ids=` 默认对已关闭市场返回空
+ * ——必须带 `closed=true` 才能查到(原 P0-1③ 核销查询因此从未真正命中过,
+ * 已结算敞口实际从不释放);resolved 但尚未 closed 的过渡态走默认查询。 */
+async function probeAndRecordSettlement(
+  cid: string,
+  ledger: LedgerEntry[],
+  cache: SettledCache
+): Promise<boolean> {
+  try {
+    let m = await fetchGammaByCid(cid, "&closed=true");
+    if (!m) {
+      const openView = await fetchGammaByCid(cid, "");
+      if (openView?.umaResolutionStatus?.trim().toLowerCase() === "resolved") m = openView;
+    }
+    if (!m) return false;
+    const parseArr = (v: unknown): string[] => {
+      if (Array.isArray(v)) return v.map(String);
+      try {
+        const p = JSON.parse(String(v));
+        return Array.isArray(p) ? p.map(String) : [];
+      } catch {
+        return [];
+      }
+    };
+    const outcomes = parseArr(m.outcomes);
+    const prices = parseArr(m.outcomePrices).map(Number);
+    const entries = ledger.filter((e) => e.conditionId === cid && exposedUsd(e) > 0);
+    // closed 可先于赔付价定型出现(如 0.999 过渡态);未定型不记盈亏,防污染熔断链
+    const finalized = prices.length > 0 && prices.every((p) => p <= 0.005 || p >= 0.995);
+    const pnl = finalized ? computeSettlementPnl(entries, outcomes, prices) : null;
+    cache[cid] = {
+      at: new Date().toISOString(),
+      question: (m.question ?? entries[0]?.question)?.slice(0, 120),
+      outcome: entries[0]?.outcome,
+      ...(pnl ?? {}),
+      notified: false,
+    };
+    return true;
+  } catch {
+    return false; // 单个查询失败:该持仓本次按未结算计,下次再查
+  }
+}
+
+/** P0-1③:totalMax 的口径是「当前未结算持仓」。按 conditionId 探测 Gamma
+ * 结算状态,已结算的敞口核销释放(顺带记账盈亏,供 P0-4 结算对账通知);
+ * 结算状态单调不可逆,Gamma 打不通或预算耗尽时剩余持仓保守按未结算计。 */
 async function openExposureUsd(
   ledger: LedgerEntry[],
   cfg: ReturnType<typeof execConfig>,
@@ -183,50 +375,144 @@ async function openExposureUsd(
 ): Promise<number> {
   const open = ledger.filter((e) => exposedUsd(e) > 0);
   if (open.length === 0) return 0;
-  const cachePath = path.join(path.dirname(cfg.ledger), "trade-settled.json");
-  let settled: Record<string, string> = {};
-  try {
-    settled = JSON.parse(readFileSync(cachePath, "utf8")) as Record<string, string>;
-  } catch {
-    // 首次/缓存损坏:全部重查,查不到的按未结算保守计
-  }
+  const cache = loadSettledCache(cfg);
   const pending = [
-    ...new Set(open.map((e) => e.conditionId).filter((c): c is string => !!c && !settled[c])),
+    ...new Set(open.map((e) => e.conditionId).filter((c): c is string => !!c && !cache[c])),
   ];
   let dirty = false;
   for (const cid of pending) {
     if (Date.now() >= deadlineMs) break; // 预算耗尽:剩余按未结算计,宁少放行不超敞口
-    try {
-      const res = await fetch(`${GAMMA_API}/markets?condition_ids=${cid}&limit=2`, {
-        signal: AbortSignal.timeout(4_000),
-      });
-      if (!res.ok) continue;
-      const arr = (await res.json()) as Array<{
-        conditionId?: string;
-        closed?: boolean;
-        umaResolutionStatus?: string | null;
-      }> | null;
-      const m = (Array.isArray(arr) ? arr : []).find(
-        (x) => x.conditionId?.toLowerCase() === cid.toLowerCase()
-      );
-      if (m && (m.closed === true || m.umaResolutionStatus?.trim().toLowerCase() === "resolved")) {
-        settled[cid] = new Date().toISOString();
-        dirty = true;
-      }
-    } catch {
-      // 单个查询失败:该持仓本次按未结算计,下次再查
-    }
+    if (await probeAndRecordSettlement(cid, ledger, cache)) dirty = true;
   }
-  if (dirty) {
-    try {
-      writeFileSync(cachePath, JSON.stringify(settled, null, 1));
-    } catch {
-      // 缓存写失败只是下次重查,不影响本次口径
-    }
-  }
+  if (dirty) saveSettledCache(cfg, cache);
   return open
-    .filter((e) => !(e.conditionId && settled[e.conditionId]))
+    .filter((e) => !(e.conditionId && cache[e.conditionId]))
     .reduce((s, e) => s + exposedUsd(e), 0);
+}
+
+// ── P0-4:结算对账 + 连亏熔断 ──
+
+/** 落 kill-switch 文件(自动熔断共用;尽力而为,创建失败只能 loud-log)。 */
+function haltTrading(cfg: Pick<ReturnType<typeof execConfig>, "haltFile">, reason: string): void {
+  try {
+    mkdirSync(path.dirname(cfg.haltFile), { recursive: true });
+    writeFileSync(
+      cfg.haltFile,
+      `auto-halt ${new Date().toISOString()}: ${reason}\n人工排查后删除本文件恢复。\n`
+    );
+    console.error(`[trade-executor] 已自动创建 kill-switch ${cfg.haltFile}: ${reason}`);
+  } catch (err) {
+    console.error(
+      `[trade-executor] kill-switch 创建失败(${err instanceof Error ? err.message : String(err)}),原因: ${reason}`
+    );
+  }
+}
+
+/** 结算链尾部的连亏笔数(按结算检出时间升序看尾巴)。盈亏未知的条目跳过、
+ * 不断链 —— 未知不该稀释「系统性买错」的证据。 */
+export function consecutiveLossTail(records: Array<{ at: string; pnlUsd?: number }>): number {
+  const ordered = [...records].sort((a, b) => a.at.localeCompare(b.at));
+  let n = 0;
+  for (let i = ordered.length - 1; i >= 0; i -= 1) {
+    const pnl = ordered[i].pnlUsd;
+    if (pnl == null) continue;
+    if (pnl < -0.01) n += 1;
+    else break;
+  }
+  return n;
+}
+
+export interface SettlementEvent {
+  conditionId: string;
+  question: string | null;
+  outcome: string | null;
+  costUsd: number | null;
+  payoutUsd: number | null;
+  pnlUsd: number | null;
+  won: boolean | null;
+  at: string;
+}
+
+/**
+ * 结算对账(P0-4):探测 ledger 里仍有敞口持仓的 Gamma 结算状态,按结算价记
+ * 已实现盈亏;连亏 ≥ EXEC_LOSS_HALT_COUNT 笔自动落 halt(修复前 autoHalt 只认
+ * status=error,连亏 8 笔 -$800 也不触发任何防线)。返回待通知事件(含既往
+ * 发信失败的重试);无持仓且无待通知时返回 null(零网络调用)。调用方发信
+ * 成功后必须调 markSettlementsNotified,否则每 tick 重复通知。
+ * 同一轮连亏只熔断一次("_lossHaltAt" 水位):操作员删 halt 恢复后,除非有
+ * 新亏损落地,不会被同一段历史立刻再次熔断。
+ */
+export async function reconcileSettlements(budgetMs: number): Promise<{
+  events: SettlementEvent[];
+  consecutiveLosses: number;
+  lossHalted: boolean;
+} | null> {
+  const cfg = execConfig();
+  const ledger = readLedger(cfg.ledger).filter((e) => e.mode === "live" && !e.probe);
+  const cache = loadSettledCache(cfg);
+  const pendingNotify = (): Array<[string, SettledRecord]> =>
+    Object.entries(cache).filter(
+      (kv): kv is [string, SettledRecord] => typeof kv[1] === "object" && kv[1].notified === false
+    );
+  const open = ledger.filter((e) => exposedUsd(e) > 0 && e.conditionId && !cache[e.conditionId]);
+  if (open.length === 0 && pendingNotify().length === 0) return null;
+
+  const deadline = Date.now() + Math.max(0, budgetMs);
+  let dirty = false;
+  for (const cid of [...new Set(open.map((e) => e.conditionId!))]) {
+    if (Date.now() >= deadline) break;
+    if (await probeAndRecordSettlement(cid, ledger, cache)) dirty = true;
+  }
+
+  const settledRecords = Object.values(cache).filter(
+    (v): v is SettledRecord => typeof v === "object" && v !== null
+  );
+  const losses = consecutiveLossTail(settledRecords);
+  const lastHaltMark = typeof cache["_lossHaltAt"] === "string" ? (cache["_lossHaltAt"] as string) : "";
+  const lastPnlRec = settledRecords
+    .filter((r) => r.pnlUsd != null)
+    .sort((a, b) => a.at.localeCompare(b.at))
+    .at(-1);
+  let lossHalted = false;
+  if (losses >= cfg.lossHaltCount && lastPnlRec && lastPnlRec.at > lastHaltMark) {
+    if (!existsSync(cfg.haltFile)) {
+      haltTrading(
+        cfg,
+        `结算对账连亏 ${losses} 笔(阈值 ${cfg.lossHaltCount}),疑似系统性误判;明细见 ${settledCachePath(cfg)}`
+      );
+    }
+    cache["_lossHaltAt"] = new Date().toISOString();
+    dirty = true;
+    lossHalted = true;
+  }
+  if (dirty) saveSettledCache(cfg, cache);
+
+  const events: SettlementEvent[] = pendingNotify().map(([cid, r]) => ({
+    conditionId: cid,
+    question: r.question ?? null,
+    outcome: r.outcome ?? null,
+    costUsd: r.costUsd ?? null,
+    payoutUsd: r.payoutUsd ?? null,
+    pnlUsd: r.pnlUsd ?? null,
+    won: r.won ?? null,
+    at: r.at,
+  }));
+  return { events, consecutiveLosses: losses, lossHalted };
+}
+
+/** 结算通知已成功送达 —— 置位 notified(at-least-once 的收尾)。 */
+export function markSettlementsNotified(conditionIds: string[]): void {
+  const cfg = execConfig();
+  const cache = loadSettledCache(cfg);
+  let dirty = false;
+  for (const cid of conditionIds) {
+    const r = cache[cid];
+    if (r && typeof r === "object" && r.notified === false) {
+      r.notified = true;
+      dirty = true;
+    }
+  }
+  if (dirty) saveSettledCache(cfg, cache);
 }
 
 // ── CLOB client(进程内单例;chain-watch 每 tick 一个进程)──
@@ -323,9 +609,16 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
         ...(raw !== undefined ? { raw } : {}),
       });
     } catch (err) {
-      console.warn(
-        `[trade-executor] ledger 写入失败: ${err instanceof Error ? err.message : String(err)}`
-      );
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[trade-executor] ledger 写入失败: ${msg}`);
+      // P0-3 fail-closed:ledger 是去重与全部额度的唯一事实源。写不进去(磁盘
+      // 满/权限)还继续跑 = 下个 tick 看不到本次记录,同一信号每 3 分钟重复
+      // 实弹买入 —— 全系统唯一无上限亏损路径。写失败即落 kill-switch。
+      if (mode === "live") {
+        haltTrading(cfg, `ledger 写入失败(${msg})——去重/额度事实源不可用,fail-closed`);
+        a.subjectAlert = a.subjectAlert ?? "ledger写失败已停机";
+        a.reason = `${a.reason ? `${a.reason}; ` : ""}ledger 写入失败,已自动落 kill-switch`;
+      }
     }
     return a;
   };
@@ -358,6 +651,19 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       );
       if (dup) {
         return finish({ mode, status: "skipped", reason: `已对该 token 执行过(${dup.at} ${dup.status})` });
+      }
+      // §7 翻向双腿保护:correction 翻向(或任何原因)对同市场反向腿下单 =
+      // 确定性锁损。已有敞口时一律 skip + 主题级告警,人工决定是否对冲/换腿。
+      const opposite = findOppositeLeg(ledger, input.conditionId, input.tokenId);
+      if (opposite) {
+        return finish({
+          mode,
+          status: "skipped",
+          reason: `同市场已持反向腿 ${opposite.outcome ?? opposite.tokenId.slice(0, 10)}(${opposite.at});${
+            input.correction ? "更正裁定翻向" : "翻向"
+          }买入=双腿锁损,需人工处理`,
+          subjectAlert: "翻向双腿⚠",
+        });
       }
       const today = new Date().toISOString().slice(0, 10);
       const spentToday = ledger
@@ -419,13 +725,28 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
     if (freshAsk < cfg.minPrice) {
       return finish({ mode, status: "skipped", reason: `ask ${freshAsk.toFixed(3)} < 下限 ${cfg.minPrice}`, freshAsk });
     }
-    if (input.bestAskAtSignal != null && freshAsk > input.bestAskAtSignal + cfg.slippage) {
-      return finish({
-        mode,
-        status: "skipped",
-        reason: `信号后已重定价(注解 ${input.bestAskAtSignal.toFixed(3)} → 现 ${freshAsk.toFixed(3)},超滑点带 ${cfg.slippage})`,
-        freshAsk,
-      });
+    if (input.bestAskAtSignal != null) {
+      // §2.3 漂移带按边缩放:上行容忍 max(slippage, edgeFrac×(1−signal))。
+      const up = upDriftBand(input.bestAskAtSignal, cfg.slippage, cfg.slippageEdgeFrac);
+      if (freshAsk > input.bestAskAtSignal + up) {
+        return finish({
+          mode,
+          status: "skipped",
+          reason: `信号后已重定价(注解 ${input.bestAskAtSignal.toFixed(3)} → 现 ${freshAsk.toFixed(3)},超漂移带 ${up.toFixed(3)})`,
+          freshAsk,
+        });
+      }
+      // §2.3 下行守卫:ask 暴跌 = 市场读出反方向,便宜是毒饵,不买、报警。
+      const down = crashDropThreshold(input.bestAskAtSignal, cfg.slippage, cfg.crashDropFrac);
+      if (freshAsk < input.bestAskAtSignal - down) {
+        return finish({
+          mode,
+          status: "skipped",
+          reason: `盘口反向暴跌(注解 ${input.bestAskAtSignal.toFixed(3)} → 现 ${freshAsk.toFixed(3)},超下行阈值 ${down.toFixed(3)}),市场可能读出反方向 — 人工复核`,
+          freshAsk,
+          subjectAlert: "盘口反向暴跌⚠",
+        });
+      }
     }
 
     const limitPrice = Math.min(
@@ -436,7 +757,7 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
     const depthUsd = asks
       .filter((l) => l.price <= limitPrice)
       .reduce((s, l) => s + l.price * l.size, 0);
-    const orderUsd = Math.floor(Math.min(cfg.maxOrderUsd, dailyLeft, totalLeft, depthUsd * 0.9));
+    let orderUsd = Math.floor(Math.min(cfg.maxOrderUsd, dailyLeft, totalLeft, depthUsd * 0.9));
     if (orderUsd < cfg.minOrderUsd) {
       return finish({
         mode,
@@ -480,6 +801,25 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
     }
 
     // ── live ──
+    // §7 下单前余额核查:USDC 被持仓占满后,不查余额的每个绿单都会变
+    // error→3 次误熔断。链上直读 proxy 的 pUSD,不足即降额或 skip 告警;
+    // RPC 不可达时 fail-open 照常下单(CLOB 侧最终把关)。
+    {
+      const balance = await proxyUsdcBalance(cfg.funder);
+      if (balance != null) {
+        if (balance < cfg.minOrderUsd) {
+          return finish({
+            mode,
+            status: "skipped",
+            reason: `proxy USDC 余额不足($${balance.toFixed(2)} < 最低 $${cfg.minOrderUsd})——持仓占满/待赎回?`,
+            freshAsk,
+            limitPrice,
+            subjectAlert: "余额不足",
+          });
+        }
+        if (balance < orderUsd) orderUsd = Math.floor(balance);
+      }
+    }
     const { Side, OrderType } = await import("@polymarket/clob-client-v2");
     const signed = await withTimeout(
       client.createMarketOrder(
@@ -619,12 +959,7 @@ function autoHaltOnRepeatedErrors(cfg: ReturnType<typeof execConfig>): void {
     const entries = readLedger(cfg.ledger).filter((e) => e.mode === "live" && !e.probe);
     const tail = entries.slice(-3);
     if (tail.length === 3 && tail.every((e) => e.status === "error")) {
-      mkdirSync(path.dirname(cfg.haltFile), { recursive: true });
-      writeFileSync(
-        cfg.haltFile,
-        `auto-halt ${new Date().toISOString()}: 连续 3 次 live 执行错误,详见 ${cfg.ledger} 尾部。人工排查后删除本文件恢复。\n`
-      );
-      console.error(`[trade-executor] 连续 3 次 live error — 已自动创建 kill-switch ${cfg.haltFile}`);
+      haltTrading(cfg, `连续 3 次 live 执行错误,详见 ${cfg.ledger} 尾部`);
     }
   } catch {
     // 自动熔断是尽力而为

@@ -76,6 +76,26 @@ export interface MailContent {
   text: string;
 }
 
+/** SMTP 连通性探针(heartbeat §3.1):建立连接并完成认证握手,不发信。
+ * 失败即抛 —— 调用方应硬失败(exit≠0),把发现交给外部 healthchecks:
+ * SMTP 是其余一切告警的传输层,它死了邮件自报是不可能的。 */
+export async function verifySmtp(): Promise<void> {
+  const cfg = loadMailConfig();
+  const transporter = nodemailer.createTransport({
+    host: cfg.host,
+    port: cfg.port,
+    secure: cfg.secure,
+    auth: { user: cfg.user, pass: cfg.authCode },
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+  });
+  try {
+    await transporter.verify();
+  } finally {
+    transporter.close();
+  }
+}
+
 export async function sendMail({
   subject,
   html,

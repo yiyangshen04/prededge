@@ -53,7 +53,14 @@ import {
 } from "../lib/polymarket/clarificationSchedule";
 import { classifyStanceWithLlm, llmCliCallCount, type LlmStanceVerdict } from "../lib/polymarket/llmStance";
 import { checkExecutability, stancePolarity, type ExecCheck } from "../lib/polymarket/execCheck";
-import { executeSignal, executionMode, type TradeAttempt } from "../lib/polymarket/tradeExecutor";
+import {
+  executeSignal,
+  executionMode,
+  reconcileSettlements,
+  markSettlementsNotified,
+  type TradeAttempt,
+} from "../lib/polymarket/tradeExecutor";
+import { priorityOf as tierOf, isGreen, isFatTailShape, type TierVerdict } from "../lib/polymarket/tiering";
 import { isDirectionalStance } from "../lib/virtualTags";
 import { KNOWN_ADAPTERS } from "../lib/polymarket/onchainEvents";
 import { writeFileAtomic } from "../lib/fsAtomic";
@@ -232,6 +239,10 @@ interface LlmPendingEntry {
   description: string | null;
   attempts: number;
   firstSeenAt: number;
+  /** §5 补判缺口:入队时正则已有方向且已按 🟠 发信(LLM 无定论)。补判只为
+   * 绿档升级 —— 升级成 🟢 才再次发信+自动执行,否则静默收队(🟠 已发过,
+   * 重复无价值)。修复前这类事件永不补判,绿档机会永久丢失。 */
+  mailedDirectional?: boolean;
 }
 
 /** I7: a V2-adapter question being polled for storage-only context updates. */
@@ -894,6 +905,14 @@ async function main(): Promise<void> {
       timeoutMs: Math.min(60_000, wallBudgetLeftMs()),
     });
 
+  // ── 标题分级(结构化 tier,§3.4)── 分级逻辑在 lib/polymarket/tiering.ts。
+  // 闸门(自动下单/paper 登记/复判/路由)只看 tier/rank,label 仅供人读展示
+  // —— label 文案 15 个月改过 5+ 次,emoji 前缀判档是必然被踩的地雷。
+  const boundaryGuardOn = (process.env.LLM_BOUNDARY_GUARD ?? "").trim().toLowerCase() !== "off";
+  const priorityOf = (n: Notable): TierVerdict => tierOf(n, { boundaryGuardOn });
+  const isFatTail = (n: Notable): boolean => priorityOf(n).tier === "green_fire";
+  const polarity = stancePolarity;
+
   const mailable: Notable[] = [];
   let llmSkipped = 0;
 
@@ -916,24 +935,24 @@ async function main(): Promise<void> {
       // RPC 瞬断 — 留队,下轮再试(attempts 照常累积,防永久滞留)
     }
     if (updates.length > 0) {
-      const latest = stanceFromText(updates[updates.length - 1].text);
       const revived: Notable = {
         qid,
         adapter: p.adapter,
         kinds: new Set(p.kinds.filter((k): k is "reset" | "context" => k === "reset" || k === "context")),
         title: p.title,
         description: p.description ?? null,
-        stance: latest.stance,
-        confidence: latest.confidence,
+        stance: "none",
+        confidence: "none",
         refundClause: detectRefundClause(updates.map((u) => u.text)),
         excerpt: updates[updates.length - 1].text.slice(0, 400),
         updateCount: updates.length,
         updates,
         enriched: true,
       };
+      applyStanceFromUpdates(revived);
       annotateTextMarkers(revived);
       maybeArm(revived);
-      if (isDirectionalStance(latest.stance)) {
+      if (isDirectionalStance(revived.stance) && !p.mailedDirectional) {
         // 补判期间官方追加了方向性文本(罕见,通常伴随新事件走正常闸门)
         delete state.llmPending[qid];
         mailable.push(revived);
@@ -942,7 +961,12 @@ async function main(): Promise<void> {
       const verdict = await consultLlm(revived);
       if (verdict) {
         delete state.llmPending[qid];
-        if (isDirectionalStance(verdict.stance)) {
+        if (p.mailedDirectional) {
+          // §5:该事件已按 🟠 发过信 —— 补判只为绿档升级。经完整分级(M1/M2/
+          // M3 降档照常适用)升级成 🟢 才值得再次发信+自动执行;其余静默收队。
+          revived.llm = verdict;
+          if (isGreen(priorityOf(revived))) mailable.push(revived);
+        } else if (isDirectionalStance(verdict.stance)) {
           revived.llm = verdict;
           mailable.push(revived);
         }
@@ -958,7 +982,9 @@ async function main(): Promise<void> {
       state.digestQueue.push({
         qid,
         title: p.title,
-        label: `⚪ LLM 判读失败(${p.attempts >= 16 ? `${p.attempts} 次尝试` : "48h"}后放弃),正则亦无方向 — 建议人工瞄一眼`,
+        label: p.mailedDirectional
+          ? `🟠 补判放弃(${p.attempts >= 16 ? `${p.attempts} 次尝试` : "48h"}):该官方方向事件已发 🟠,绿档升级复核未能完成`
+          : `⚪ LLM 判读失败(${p.attempts >= 16 ? `${p.attempts} 次尝试` : "48h"}后放弃),正则亦无方向 — 建议人工瞄一眼`,
         stance: "none",
         llmStance: null,
         bestAsk: null,
@@ -996,6 +1022,21 @@ async function main(): Promise<void> {
     // 窗口信号(bt5/E2:全部真翻转都是此形态),静默等于丢掉最肥的时刻。
     if (regexDirectional || llmDirectional || item.correction) {
       mailable.push(item);
+      // §5 补判缺口:正则有方向但 LLM 无定论(预算耗尽/失败)时,本 tick 只能
+      // 发 🟠 —— 而它可能本是 🟢(双确认∧high,自动执行档)。入队补判,后续
+      // tick LLM 恢复后复核,升级成 🟢 才重发+执行(mailedDirectional 语义)。
+      // 修复前这类事件指纹已提交、永不复核,绿档机会永久丢失。
+      if (regexDirectional && hasText && item.llm == null) {
+        state.llmPending[item.qid] = {
+          adapter: item.adapter,
+          kinds: [...item.kinds],
+          title: item.title,
+          description: item.description,
+          attempts: 0,
+          firstSeenAt: Date.now(),
+          mailedDirectional: true,
+        };
+      }
       continue;
     }
     if (hasText && item.llm == null) {
@@ -1046,7 +1087,11 @@ async function main(): Promise<void> {
   // 对前几项做 Gamma/CLOB 核查(经代理,fail-open),把"能不能买、什么价、多深"
   // 直接写进邮件,并供 I3/I5 的分级与路由使用。
   let execChecked = 0;
-  for (const item of mailable.slice(0, EXEC_ANNOTATE_MAX)) {
+  // §2.3:mailable 原序是事件发现序 —— 忙 tick 时 🟢 候选排位靠后拿不到盘口
+  // 注解,maybeExecuteTrade 因无 exec 静默不执行。先按档位排序再切片(此刻
+  // exec 未注解,rank 用无盘口口径判定,足以把 🟢/🔄 排到前面)。
+  const annotateOrder = [...mailable].sort((a, b) => priorityOf(a).rank - priorityOf(b).rank);
+  for (const item of annotateOrder.slice(0, EXEC_ANNOTATE_MAX)) {
     if (llmBudgetLeftMs() < 10_000) break;
     const effStance = isDirectionalStance(item.stance)
       ? item.stance
@@ -1058,107 +1103,9 @@ async function main(): Promise<void> {
     execChecked += 1;
   }
 
-  // 标题即分诊:最高优先级事件的 stance·置信度直接进主题行,一眼可判是否
-  // 值得打开。分级依据 bt4 实测(2026-07-09,v4 全量重放 + 四实验臂):
-  //   🟢 只授"双确认∧LLM conf=high"——该格是唯一跨 prompt 稳健结构
-  //   (v3/v4/A2/A4 四臂交集 17 笔 17/17 全胜,累计 +524%);medium 置信区
-  //   含历史全部 -100% 级灾难,一律降 🟠 展示(M1,邮件照发)。
-  //   🟢🔥 肥尾候选 > 🟢 双确认 > 🟠 官方方向(LLM拒判/中置信/无定论/红旗)
-  // > 🔵 LLM 单独判读 > ⚪ 降级。
-  // P0-2③:与 execCheck 共用同一收紧后的整串正则(原 /YES$/i、/NO$/i 会把
-  // resolve_to_hayes/resolve_to_bruno 劫持成 +/-,「双方判读一致却买反」可达
-  // 🟢 闸门)。resolve_to_* 仍要求字面一致,不做归一化。
-  const polarity = stancePolarity;
-  // I4 规则层边界闸门(eventStatus=pending ∧ leans_* → 降档)。M6 注:bt4 实测
-  // 该闸门 15 个月仅触发 1 次且拦下的是 +1.0% 赢单——几乎不承担防损职能
-  // (实测全部深亏在 es=decided 侧,由 M1/M2 防守);保留仅作标注语义。
-  // 注意:M1 上线后 off 挡只能 A/B 到 high 置信的 pending∧leans 形态(medium
-  // 已被 M1 无条件降档,不再回到 I4 前的旧行为)。
-  const boundaryGuardOn = (process.env.LLM_BOUNDARY_GUARD ?? "").trim().toLowerCase() !== "off";
-  const boundaryPending = (n: Notable): boolean =>
-    boundaryGuardOn &&
-    n.llm?.eventStatus === "pending" &&
-    (/^leans_/i.test(n.llm.stance) || /^leans_/i.test(n.stance));
-  const basePriorityOf = (n: Notable): { rank: number; label: string } => {
-    const llmDir = n.llm != null && isDirectionalStance(n.llm.stance) && n.llm.confidence !== "low";
-    // P3(bt5/E3b):预告模板家族的绿档负向注解(label-only,不降档)。
-    const forecastBit = n.forecastTemplate ? " ⚠预告模板家族(bt5:绿档均值−5.5%·零肥尾)" : "";
-    if (isDirectionalStance(n.stance)) {
-      if (llmDir && polarity(n.llm!.stance) === polarity(n.stance)) {
-        if (boundaryPending(n))
-          return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (⚠️边界澄清·事件未决)` };
-        // M1:🟢 只授 conf=high。bt4 实测 medium 区 = 历史全部 -100% 所在,
-        // 且各臂全档收益差异均来自 medium 区归属(高置信档对 prompt 不敏感)。
-        if (n.llm!.confidence !== "high")
-          return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (双确认·中置信⚠历史灾难区)` };
-        const ask = n.exec?.bestAsk ?? null;
-        // M2 H2 红旗:极端逆共识(方向价 <0.15 = 判读逆着 85%+ 市场共识)且
-        // LLM 非决断句式(leans_*) → 不给 🟢。bt4 实测该形态 4/4 归零,而真肥尾
-        // (Norway@0.164/Khamenei@0.179)入场价均 ≥0.15 且判读为决断级。
-        if (ask != null && ask < 0.15 && /^leans_/i.test(n.llm!.stance))
-          return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (🚩极端逆共识·历史此形态4/4归零)` };
-        // M3:🟢🔥 复判分歧 → 降档(同 prompt 方向翻转率实测 5%/次)。二票反向
-        // 与二票失方向分开表述——标签必须如实,人工分诊靠它。
-        if (n.llmRevoteMismatch)
-          return {
-            rank: 1,
-            label: `🟠 官方方向 ${n.stance}·${n.confidence} (${
-              isDirectionalStance(n.llmRevoteMismatch.stance) ? "复判反向⚠" : "复判失方向⚠"
-            }:二票 ${n.llmRevoteMismatch.stance})`,
-          };
-        // I3 🟢 内部再分级:入场价离 1 越远(市场重仓反向)越像肥尾;尾价 ≥0.97
-        // 只是薄利 carry。无盘口数据时退化为"是否处于争议(reset)"判断。
-        if ((ask != null && ask <= 0.9) || (ask == null && n.kinds.has("reset")))
-          return { rank: 0, label: `🟢🔥 肥尾候选 ${n.stance}·${n.confidence}${forecastBit}` };
-        if (ask != null && ask >= 0.97)
-          return { rank: 0, label: `🟢 双确认 ${n.stance}·${n.confidence} (尾价carry)${forecastBit}` };
-        return { rank: 0, label: `🟢 双确认 ${n.stance}·${n.confidence}${forecastBit}` };
-      }
-      if (n.llm && !isDirectionalStance(n.llm.stance))
-        return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence} (LLM拒判⚠)` };
-      return { rank: 1, label: `🟠 官方方向 ${n.stance}·${n.confidence}` };
-    }
-    if (llmDir) return { rank: 2, label: `🔵 LLM判读 ${n.llm!.stance}·${n.llm!.confidence}` };
-    if (!n.enriched) return { rank: 3, label: `⚪ 降级(文本读取失败)` };
-    return { rank: 4, label: `⚪ ${n.stance}` };
-  };
-  // P2(bt5/E2):更正裁定的分层语义(设计复盘后修正,2026-07-10)。
-  // 数据:6 例真翻转中 4 个已结算全部按更正方向落地,且 v3 对更正文本全判
-  // 方向·high —— 但它们在 286 行真实成交经济样本里只有 1 行(入场 0.99,窗口
-  // 内 0-1 笔成交),历史绿档战绩(20/20)几乎没有更正类贡献,且 6 例=同一晚
-  // 同一事故簇(统计上是 1 个事件)。因此:
-  //   · 更正 ∧ 独立通过双确认∧high 闸门 → 保留 🟢 标签(闸门定义从未排除
-  //     更正,这是对验证过配置的保真)+ 追加 🔄 注解 + 照常进 paper 登记
-  //     (前瞻账本恰恰需要这类样本来裁决更正类是否配得上完整绿档);
-  //     错价窗口下 ask≤0.9 会自然落 🟢🔥 → M3 复判照常加持。
-  //   · 更正但未过闸(无方向/中置信/红旗/复判分歧) → 🔄 置顶展示专用,
-  //     不冒充 🟢:官方在本市场已自证会出错,二次更正先验不同于 32/32 口径。
-  const priorityOf = (n: Notable): { rank: number; label: string } => {
-    const base = basePriorityOf(n);
-    if (!n.correction) return base;
-    if (base.rank === 0 && base.label.startsWith("🟢")) {
-      return { rank: 0, label: `${base.label} ·🔄更正裁定` };
-    }
-    const llmDir = n.llm != null && isDirectionalStance(n.llm.stance) && n.llm.confidence !== "low";
-    const st = isDirectionalStance(n.stance)
-      ? `${n.stance}·${n.confidence}`
-      : llmDir
-        ? `${n.llm!.stance}·${n.llm!.confidence}(via=llm)`
-        : "方向待人工判读⚠";
-    return { rank: 0, label: `🔄 官方更正裁定(issued-in-error) ${st}` };
-  };
-  const isFatTail = (n: Notable): boolean => priorityOf(n).label.includes("肥尾候选");
-  // 肥尾"形态"(双确认∧深价位/争议中,不含 M1/M2/M3 的降档条件):洪水豁免用它
-  // 而非 isFatTail——降档承诺是 label-only,被降档的肥尾形态若因此从即时改走
-  // 6h 汇总,恰恰在批量裁定日延误了灾难形/机会形并存的关键告警(审查修正)。
-  // 置信 low 不算(降档前的旧口径也从不给 low 豁免)。
-  const isFatTailShape = (n: Notable): boolean => {
-    if (!isDirectionalStance(n.stance)) return false;
-    if (!n.llm || !isDirectionalStance(n.llm.stance) || n.llm.confidence === "low") return false;
-    if (polarity(n.llm.stance) !== polarity(n.stance)) return false;
-    const ask = n.exec?.bestAsk ?? null;
-    return (ask != null && ask <= 0.9) || (ask == null && n.kinds.has("reset"));
-  };
+  // 标题即分诊:最高优先级事件的 stance·置信度直接进主题行。分级/降档全部
+  // 逻辑与依据见 lib/polymarket/tiering.ts(§3.4 结构化 tier 重构后,priorityOf
+  // /isFatTail 闭包已提前到闸门 A 段之前定义,这里不再重复)。
 
   // ── bt5/E1:dispute 时点领先侧翻盘风险标注 ──
   // 事件时点买领先侧的事件级翻盘率:ask≥0.95 → 6.4%,0.90–0.95 → 9.3% ——
@@ -1316,8 +1263,8 @@ async function main(): Promise<void> {
   let paperRegistered = 0;
   const maybeRegisterPaperTrade = (n: Notable): void => {
     if ((process.env.PAPER_TRADES_AUTO ?? "").trim().toLowerCase() === "off") return;
-    const pr = priorityOf(n);
-    if (pr.rank !== 0 || !pr.label.startsWith("🟢")) return;
+    // §3.4:闸门只看结构化 tier(isGreen),不解析 label 文案。
+    if (!isGreen(priorityOf(n))) return;
     const e = n.exec;
     if (!e || e.closed || !e.fill100) return;
     try {
@@ -1361,7 +1308,9 @@ async function main(): Promise<void> {
   const maybeExecuteTrade = async (n: Notable): Promise<void> => {
     if (executionMode() === "off" || n.trade !== undefined) return;
     const pr = priorityOf(n);
-    if (pr.rank !== 0 || !pr.label.startsWith("🟢")) return;
+    // §3.4:闸门只看结构化 tier(isGreen),不解析 label 文案 —— 标签改文案
+    // 曾是"自动下单静默停摆"的必踩地雷。
+    if (!isGreen(pr)) return;
     const e = n.exec;
     if (!e || e.closed || !e.tokenId) return;
     if (!AUTO_EXEC_DIR_METHODS.has(e.dirMethod)) {
@@ -1502,6 +1451,49 @@ async function main(): Promise<void> {
     }
   };
 
+  // ── P0-4:结算对账 + 连亏熔断 + 赢单赎回提醒 ──
+  // 已实现盈亏此前是全系统唯一没有防线的维度:autoHalt 只认执行错误,连亏
+  // 8 笔 -$800 不触发任何告警;赢单也从无"该去赎回了"的提示(利润永不落袋)。
+  // 每 tick 预算内跑(无持仓且无待通知时零网络调用);发信成功才 mark
+  // notified(at-least-once,失败下 tick 重试)。承诺窗口临近时让位快轮询。
+  const reconcileTrades = async (): Promise<void> => {
+    if (wallBudgetLeftMs() < 25_000 || prearmWindowSoon()) return;
+    try {
+      const rec = await reconcileSettlements(Math.min(20_000, wallBudgetLeftMs() - 15_000));
+      if (!rec || (rec.events.length === 0 && !rec.lossHalted)) return;
+      const fmt = (v: number | null): string => (v == null ? "?" : `$${v.toFixed(2)}`);
+      const rows = rec.events
+        .map(
+          (e) => `<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:13px">
+          ${e.won === true ? "🎉" : e.won === false ? "📉" : "❔"} <b>${escapeHtml(e.question ?? e.conditionId.slice(0, 12))}</b><br>
+          <span style="font-size:12px;color:#555">买入 ${escapeHtml(e.outcome ?? "?")} · 成本 ${fmt(e.costUsd)} → 结算 ${fmt(e.payoutUsd)} · 盈亏 <b style="color:${(e.pnlUsd ?? 0) >= 0 ? "#16a34a" : "#dc2626"}">${e.pnlUsd == null ? "无法计算(人工核对 ledger)" : `${e.pnlUsd >= 0 ? "+" : ""}$${e.pnlUsd.toFixed(2)}`}</b></span>
+          ${e.won === true ? `<div style="font-size:12px;color:#16a34a">✅ 赢单已结算 —— 记得到 Polymarket 网页端赎回 ${fmt(e.payoutUsd)}(利润不会自动落袋)。</div>` : ""}
+        </td></tr>`
+        )
+        .join("\n");
+      const totalPnl = rec.events.reduce((s, e) => s + (e.pnlUsd ?? 0), 0);
+      const subject = rec.lossHalted
+        ? `[PredEdge实盘] ⛔ 连亏熔断(连亏 ${rec.consecutiveLosses} 笔)— 已停止自动交易`
+        : `[PredEdge实盘] ${totalPnl >= 0 ? "💰" : "📉"} 持仓结算 ×${rec.events.length}(${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)})`;
+      await sendMail({
+        subject,
+        html: `<div style="font-family:system-ui,sans-serif;max-width:640px">
+          ${rec.lossHalted ? `<p style="color:#dc2626"><b>⛔ 结算对账检出连亏 ${rec.consecutiveLosses} 笔,已自动创建 kill-switch(data/trading-halt)停止自动交易。</b>疑似系统性误判,请人工复盘 ledger 与判读后删除该文件恢复。</p>` : ""}
+          ${rec.events.length > 0 ? `<p>持仓结算对账结果:</p><table style="width:100%;border-collapse:collapse">${rows}</table>` : ""}
+          <p style="font-size:12px;color:#888">口径:按 Gamma 结算价(outcomePrices)对 trade-ledger 实际成交核算;连亏熔断阈值 EXEC_LOSS_HALT_COUNT(默认 3)。</p>
+        </div>`,
+        text: rec.events
+          .map((e) => `${e.won ? "WIN" : "LOSS"} ${e.question ?? e.conditionId} | cost=${e.costUsd} payout=${e.payoutUsd} pnl=${e.pnlUsd}`)
+          .join("\n") + (rec.lossHalted ? `\n⛔ 连亏 ${rec.consecutiveLosses} 笔已自动熔断` : ""),
+      });
+      markSettlementsNotified(rec.events.map((e) => e.conditionId));
+    } catch (err) {
+      console.warn(
+        `[chain-watch] 结算对账失败(下轮重试): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  };
+
   // ── P1:承诺时点快轮询 ──
   // bt5/C1 实测兑现精度中位 +31s,3min cron 结构性吃不到;e6 全窗口重抓证明
   // 收益断崖在 2-5 分钟(秒级入场较 2min 每笔 +5.75~12.75pp)。窗口内本 tick
@@ -1577,7 +1569,19 @@ async function main(): Promise<void> {
           // 判读成功则清掉早前失败轮次写入的旧条目,防 A 段重复升级发信。
           if (item.llm != null) {
             delete state.llmPending[qid];
-          } else if (!isDirectionalStance(item.stance) && !item.correction) {
+          } else if (isDirectionalStance(item.stance)) {
+            // §5:正则有方向但 LLM 无定论 —— ⏰ 邮件照发(🟠 级),入队补判;
+            // 后续 tick 升级成 🟢 才重发+自动执行(mailedDirectional 语义)。
+            state.llmPending[qid] = {
+              adapter: item.adapter,
+              kinds: [...item.kinds],
+              title: item.title,
+              description: item.description,
+              attempts: 0,
+              firstSeenAt: Date.now(),
+              mailedDirectional: true,
+            };
+          } else if (!item.correction) {
             state.llmPending[qid] = {
               adapter: item.adapter,
               kinds: [...item.kinds],
@@ -1600,10 +1604,7 @@ async function main(): Promise<void> {
           // M3 复判:🟢 且(深价位或盘口未知)= 肥尾候选形态,关键决策必须二票。
           if (item.llm && wallBudgetLeftMs() >= LLM_MIN_CALL_MS) {
             const prePr = priorityOf(item);
-            if (
-              prePr.label.startsWith("🟢") &&
-              (item.exec?.bestAsk == null || item.exec.bestAsk <= 0.9)
-            ) {
+            if (isGreen(prePr) && (item.exec?.bestAsk == null || item.exec.bestAsk <= 0.9)) {
               const second = await consultLlm(item, ":v2");
               if (second != null) {
                 const agrees =
@@ -1777,6 +1778,7 @@ async function main(): Promise<void> {
     }
     await flushDigest();
     await flushPreArmMail();
+    await reconcileTrades();
     logSummary(0);
     await runPreArmFastLoop();
     return;
@@ -1875,6 +1877,7 @@ async function main(): Promise<void> {
   commitState();
   await flushDigest();
   await flushPreArmMail();
+  await reconcileTrades();
   logSummary(immediate.length);
   await runPreArmFastLoop();
 }

@@ -278,6 +278,9 @@ async function watch(): Promise<void> {
       `连续 ${fails} 次无法经代理访问 gamma-api —— Clash 大概率已死。scan-notify 整通道、盘口注解、自动下单、结算对账全部依赖它;chain-watch 链上告警(直连 RPC)不受影响。`,
       "Gamma 经代理已恢复可达。"
     );
+    // 低于阈值的失败必须可见:显示 "ok" 曾把"claude token 已死一针"糊过部署验证
+    // (2026-07-11 实测教训)。
+    if (!down && fails > 0) summary[PROXY_KEY] = `failing(${fails}/${PROBE_FAIL_THRESHOLD})`;
   }
 
   // 探针 3:claude CLI 登录态(每小时一次,每次是真调用)。
@@ -296,8 +299,12 @@ async function watch(): Promise<void> {
         `连续 ${fails} 次 claude -p 探针失败:${detail || "无输出"}\nLLM 判读正在静默 fail-open —— 🟢 双确认档与自动下单闸门已实质停摆(只发 🟠),邮件表面全绿。ssh sufe 后重新 claude setup-token 并更新 .env 的 CLAUDE_CODE_OAUTH_TOKEN。`,
         "claude CLI 探针已恢复。"
       );
+      if (!down && fails > 0) summary[CLAUDE_KEY] = `failing(${fails}/${PROBE_FAIL_THRESHOLD})`;
     } else {
-      summary[CLAUDE_KEY] = state.alert[CLAUDE_KEY]?.status ?? "ok";
+      const st = state.alert[CLAUDE_KEY]?.status ?? "ok";
+      const fails = state.probeFails[CLAUDE_KEY] ?? 0;
+      summary[CLAUDE_KEY] =
+        st === "down" ? "down" : fails > 0 ? `failing(${fails}/${PROBE_FAIL_THRESHOLD})` : "ok";
     }
   }
 
@@ -528,9 +535,37 @@ async function daily(): Promise<void> {
 
   const chainLast = lastOkAt(CHANNELS[0]);
   const scanLast = lastOkAt(CHANNELS[1]);
-  const hcConfigured = Boolean(process.env.HC_PING_CHAIN_WATCH?.trim() && process.env.HC_PING_SCAN_NOTIFY?.trim());
+  const hcConfigured = Boolean(
+    process.env.HC_PING_CHAIN_WATCH?.trim() &&
+      process.env.HC_PING_SCAN_NOTIFY?.trim() &&
+      process.env.HC_PING_HEARTBEAT?.trim()
+  );
 
-  const subject = `[PredEdge 日报] 哨兵 ${cs.okTicks}✓/${cs.fatalTicks}✗ · 巡逻 ${ss.fullOk}✓/${ss.gammaUnreachable}✗ — ${fmtTime(now).slice(5, 16)}`;
+  // §3.1:日报必须带探针状态。2026-07-11 实测教训:claude token 失效,凌晨
+  // 告警已发,而 9:05 日报只看通道 tick 照样"一切正常"——两封邮件自相矛盾,
+  // 日报的"全绿"必须覆盖探针,否则它就是假保证。
+  const PROBE_LABELS: Array<[string, string]> = [
+    [HALT_KEY, "kill-switch(自动交易)"],
+    [PROXY_KEY, "Clash/Gamma 代理"],
+    [CLAUDE_KEY, "claude 登录态(LLM判读)"],
+  ];
+  const probes = PROBE_LABELS.map(([key, label]) => {
+    const down = state.alert[key]?.status === "down";
+    const fails = state.probeFails[key] ?? 0;
+    const since = state.alert[key]?.since;
+    return {
+      label,
+      down,
+      disp: down
+        ? `down${since ? `(自 ${fmtTime(new Date(since))})` : ""}`
+        : fails > 0
+          ? `failing(${fails}/${PROBE_FAIL_THRESHOLD})`
+          : "ok",
+    };
+  });
+  const probesDown = probes.filter((p) => p.down);
+
+  const subject = `[PredEdge 日报] ${probesDown.length > 0 ? `⛔探针down×${probesDown.length} · ` : ""}哨兵 ${cs.okTicks}✓/${cs.fatalTicks}✗ · 巡逻 ${ss.fullOk}✓/${ss.gammaUnreachable}✗ — ${fmtTime(now).slice(5, 16)}`;
 
   const row = (k: string, v: string) =>
     `<tr><td style="padding:4px 12px 4px 0;color:#9aa3ad;white-space:nowrap">${k}</td><td style="padding:4px 0">${v}</td></tr>`;
@@ -556,8 +591,20 @@ async function daily(): Promise<void> {
     ${row("最后成功", scanLast ? `${fmtTime(scanLast)}(${ageMinutes(scanLast)} 分钟前)` : '<span style="color:#f87171">无记录(或尚未生成标记)</span>')}
   </table>
 
+  <h3 style="margin:14px 0 4px;font-size:14px;color:#7dd3fc">静默单点探针(--watch 每 10 分钟)</h3>
+  <table style="font-size:13px;border-collapse:collapse">
+    ${probes
+      .map((p) =>
+        row(
+          escapeHtml(p.label),
+          `<span style="color:${p.down ? "#f87171" : p.disp === "ok" ? "#34d399" : "#fbbf24"}">${escapeHtml(p.disp)}</span>`
+        )
+      )
+      .join("\n")}
+  </table>
+
   <p style="margin:14px 0 0;font-size:12px;color:${hcConfigured ? "#34d399" : "#fbbf24"}">
-    ${hcConfigured ? "✅ healthchecks.io 心跳已配置(整机死亡也会被外部告警)。" : "⚠️ healthchecks.io 心跳未配置 — 整机死亡时本日报也会消失且无人报警。注册后把两个 ping URL 填入 ~/prededge/.env 的 HC_PING_CHAIN_WATCH / HC_PING_SCAN_NOTIFY。"}
+    ${hcConfigured ? "✅ healthchecks.io 三个心跳均已配置(整机/SMTP 死亡也会被外部告警)。" : "⚠️ healthchecks.io 心跳未配齐 — 需要三个 check:HC_PING_CHAIN_WATCH / HC_PING_SCAN_NOTIFY / HC_PING_HEARTBEAT(heartbeat 这个尤其关键:SMTP 挂掉时只有它能从外部报警),填入 ~/prededge/.env。"}
   </p>
   <p style="margin:8px 0 0;font-size:11px;color:#6b7280">约定:每天 09:05 必有本邮件;没收到 = 系统死了。scripts/heartbeat.ts --daily 自动发送。</p>
 </div>`;
@@ -566,7 +613,8 @@ async function daily(): Promise<void> {
     `统计区间 ${periodFrom} → ${fmtTime(now)}`,
     `chain-watch: ok=${cs.okTicks} fatal=${cs.fatalTicks} partial=${cs.partialTicks} events=${cs.events} notified=${cs.notified} directional=${cs.directional} gap=${cs.gapBlocks}`,
     `scan-notify: starts=${ss.starts} fullOk=${ss.fullOk} unreachable=${ss.gammaUnreachable} mails=${ss.mailsSent}`,
-    hcConfigured ? "HC ping: configured" : "HC ping: NOT configured",
+    `probes: ${probes.map((p) => `${p.label}=${p.disp}`).join(" | ")}`,
+    hcConfigured ? "HC ping: all 3 configured" : "HC ping: NOT fully configured",
   ].join("\n");
 
   await sendMail({ subject, html, text });

@@ -28,8 +28,10 @@
  *                        核销释放,缓存于 ledger 同目录 trade-settled.json)
  *   EXEC_MIN_ORDER_USD   default 5    (低于此值不值得付固定成本)
  *   EXEC_MAX_PRICE       default 0.97 (入场价上限;≥0.97 是尾价 carry,自动模式不吃)
- *   EXEC_MIN_PRICE       default 0.12 (入场价下限;2026-07-10 审计定量裁决:
- *                        0.03-0.15 彩票区历史 4/4 归零,而真肥尾入场价均 ≥0.15)
+ *   EXEC_MIN_PRICE       default 0.15 (入场价下限;bt4 定量:0.03-0.15 彩票区
+ *                        历史 4/4 归零、真肥尾入场价均 ≥0.15。这同时是 M2 极端
+ *                        逆共识红旗(注解时刻 ask<0.15)在执行侧的地板 —— 原默认
+ *                        0.12 与自家研究结论打架,留出 0.12-0.15 的时间差绕行区)
  *   EXEC_SLIPPAGE        default 0.03 (限价帽 = 新鲜 ask + slippage;也是漂移带的下限)
  *   EXEC_SLIPPAGE_EDGE_FRAC  default 0.15 (上行漂移带按剩余边缩放:容忍
  *                        max(EXEC_SLIPPAGE, frac×(1−signalAsk));绝对带在 0.16
@@ -42,6 +44,13 @@
  *   EXEC_SKIP_FORECAST_TEMPLATE  default on(bt5/E3b:预告模板家族绿档均值 −5.5%、零肥尾)
  *   EXEC_HALT_FILE       default data/trading-halt(存在即停;连续 3 次 live error 自动创建)
  *   EXEC_LEDGER          default data/trade-ledger.jsonl
+ *
+ * Ledger 语义(2026-07-11 审计修复批):live 单在 postOrder 前先落 status="intent"
+ * 的 write-ahead 行(posted="unknown" 按 requestedUsd 占额并封锁该 token 去重),
+ * 终态行经同一 attemptId 在读取时取代它 —— 进程死在下单在途窗口时孤儿 intent
+ * 保守视作持仓。postOrder 的超时、传输层异常、无 HTTP status 的错误对象、
+ * delayed/live 未终局状态一律 posted="unknown";只有带 status 的真拒单与明确
+ * 零成交(unmatched)记 $0。
  */
 import { readFileSync, existsSync, appendFileSync, writeFileSync, mkdirSync, chmodSync } from "fs";
 import path from "path";
@@ -98,10 +107,16 @@ export interface TradeSignalInput {
   probe?: boolean;
 }
 
-interface LedgerEntry extends TradeAttempt {
+interface LedgerEntry extends Omit<TradeAttempt, "status"> {
+  /** "intent" 只存在于 ledger:postOrder 发出前的 write-ahead 行(posted=
+   * "unknown" 占额+封锁去重),终态行落地后经 attemptId 取代;进程在两行之间
+   * 死亡时孤儿 intent 把"可能已成交"保守当持仓,直到结算核销。 */
+  status: TradeAttempt["status"] | "intent";
   at: string;
   qid: string;
   tokenId: string;
+  /** 同一次执行尝试的 intent 行与终态行共享此 id,readLedger 只保留最后一行。 */
+  attemptId?: string;
   conditionId?: string;
   outcome?: string;
   question?: string;
@@ -138,7 +153,7 @@ export function execConfig() {
     totalMaxUsd: num("EXEC_TOTAL_MAX_USD", 400),
     minOrderUsd: num("EXEC_MIN_ORDER_USD", 5),
     maxPrice: num("EXEC_MAX_PRICE", 0.97),
-    minPrice: num("EXEC_MIN_PRICE", 0.12),
+    minPrice: num("EXEC_MIN_PRICE", 0.15),
     slippage: num("EXEC_SLIPPAGE", 0.03),
     slippageEdgeFrac: num("EXEC_SLIPPAGE_EDGE_FRAC", 0.15),
     crashDropFrac: num("EXEC_CRASH_DROP_FRAC", 0.35),
@@ -152,6 +167,17 @@ export function execConfig() {
 
 // ── Ledger ──
 
+/** 同一 attemptId 的多行(intent → 终态)只保留最后一行:终态行取代 intent
+ * 的额度口径;没有终态行的孤儿 intent(进程死在 postOrder 在途窗口)原样保留,
+ * 以 posted:"unknown" 保守占额并封锁该 token 去重。 */
+export function collapseAttempts<T extends Pick<LedgerEntry, "attemptId">>(entries: T[]): T[] {
+  const lastIdx = new Map<string, number>();
+  entries.forEach((e, i) => {
+    if (e.attemptId) lastIdx.set(e.attemptId, i);
+  });
+  return entries.filter((e, i) => !e.attemptId || lastIdx.get(e.attemptId) === i);
+}
+
 function readLedger(ledgerPath: string): LedgerEntry[] {
   if (!existsSync(ledgerPath)) return [];
   const out: LedgerEntry[] = [];
@@ -163,7 +189,7 @@ function readLedger(ledgerPath: string): LedgerEntry[] {
       // 半行(崩溃截断)容忍:append-only,坏行不影响后续
     }
   }
-  return out;
+  return collapseAttempts(out);
 }
 
 function appendLedger(ledgerPath: string, entry: LedgerEntry): void {
@@ -184,6 +210,15 @@ export const exposedUsd = (
   if (e.posted !== true) return 0;
   return e.filledUsd ?? 0;
 };
+
+/** postOrder 响应的传输层歧义判定(审计 2026-07-11 §1):clob-client-v2 对纯
+ * 网络错误(ECONNRESET/socket hang up,请求可能已送达并成交)不 throw,返回
+ * {error} 且无 status/orderID;真拒单必带 HTTP status(探针实测 400+orderID)。
+ * 歧义结果不是拒单,必须按 posted:"unknown" 保守占额,否则是重复买入路径。 */
+export const isTransportAmbiguous = (
+  resp: { error?: unknown; status?: unknown; orderID?: unknown } | null | undefined,
+  haveFill: boolean
+): boolean => !haveFill && resp?.error != null && resp?.status == null && resp?.orderID == null;
 
 /** 上行漂移容忍带(§2.3):绝对带在低价位是过窄的相对档 —— 肥尾回归途中
  * 0.164→0.20 仍 +400% EV 却被 0.03 绝对带拒单。带宽按剩余边(1−signalAsk)
@@ -238,14 +273,24 @@ interface SettledRecord {
   outcomePrice?: number;
   costUsd?: number;
   payoutUsd?: number;
-  /** 已实现盈亏;无法可靠计算(无成交明细/outcome 未匹配/结算价未定型)时
-   * 缺失 —— 缺失条目不进连亏熔断链(错的盈亏比没有盈亏更毒)。 */
+  /** 已实现盈亏;无法可靠计算(无成交明细/outcome 未匹配)时缺失 ——
+   * 缺失条目不进连亏熔断链(错的盈亏比没有盈亏更毒)。 */
   pnlUsd?: number;
   won?: boolean;
+  /** 结算价已终局但 pnl 确认算不出(outcome 不匹配/无成交明细):terminal,
+   * 不再重探。缺此标记且缺 pnlUsd 的对象 = 修复前冻结的未定型记录,要重探。 */
+  pnlUnavailable?: boolean;
   /** 结算邮件已成功发出(markSettlementsNotified 置位)。 */
   notified?: boolean;
 }
 type SettledCache = Record<string, string | SettledRecord>;
+
+/** 结算记录是否终局(审计 2026-07-11 §4):legacy 字符串(旧格式,视为已结)、
+ * 带 pnl、或已确认 pnl 不可算。非终局对象(修复前在结算价未定型时就永久落盘
+ * 的记录)既不释放敞口、也要继续重探,否则该持仓的真实亏损永远进不了连亏
+ * 熔断链、敞口在钱仍在风险中时被提前放出。 */
+export const settledFinal = (v: string | SettledRecord | undefined): boolean =>
+  typeof v === "string" ? true : v != null && (v.pnlUsd != null || v.pnlUnavailable === true);
 
 function settledCachePath(cfg: ReturnType<typeof execConfig>): string {
   return path.join(path.dirname(cfg.ledger), "trade-settled.json");
@@ -349,14 +394,20 @@ async function probeAndRecordSettlement(
     const outcomes = parseArr(m.outcomes);
     const prices = parseArr(m.outcomePrices).map(Number);
     const entries = ledger.filter((e) => e.conditionId === cid && exposedUsd(e) > 0);
-    // closed 可先于赔付价定型出现(如 0.999 过渡态);未定型不记盈亏,防污染熔断链
+    // closed 可先于赔付价定型出现(如 0.999 过渡态、UMA 争议中)。未定型一律
+    // 不落缓存(审计 2026-07-11 §4):敞口不释放(钱仍在风险中)、下轮继续重探
+    // —— 修复前这里落永久无 pnl 记录,dispute 市场的真实亏损被终身冻结在连亏
+    // 熔断链之外。
     const finalized = prices.length > 0 && prices.every((p) => p <= 0.005 || p >= 0.995);
-    const pnl = finalized ? computeSettlementPnl(entries, outcomes, prices) : null;
+    if (!finalized) return false;
+    const pnl = computeSettlementPnl(entries, outcomes, prices);
     cache[cid] = {
       at: new Date().toISOString(),
       question: (m.question ?? entries[0]?.question)?.slice(0, 120),
       outcome: entries[0]?.outcome,
-      ...(pnl ?? {}),
+      // pnl 确认算不出(outcome 不匹配/无成交明细):terminal 标记,防止无限重探
+      // + 每轮重发"无法计算"邮件。
+      ...(pnl ?? { pnlUnavailable: true }),
       notified: false,
     };
     return true;
@@ -377,7 +428,7 @@ async function openExposureUsd(
   if (open.length === 0) return 0;
   const cache = loadSettledCache(cfg);
   const pending = [
-    ...new Set(open.map((e) => e.conditionId).filter((c): c is string => !!c && !cache[c])),
+    ...new Set(open.map((e) => e.conditionId).filter((c): c is string => !!c && !settledFinal(cache[c]))),
   ];
   let dirty = false;
   for (const cid of pending) {
@@ -386,7 +437,7 @@ async function openExposureUsd(
   }
   if (dirty) saveSettledCache(cfg, cache);
   return open
-    .filter((e) => !(e.conditionId && cache[e.conditionId]))
+    .filter((e) => !(e.conditionId && settledFinal(cache[e.conditionId])))
     .reduce((s, e) => s + exposedUsd(e), 0);
 }
 
@@ -422,6 +473,25 @@ export function consecutiveLossTail(records: Array<{ at: string; pnlUsd?: number
   return n;
 }
 
+/** 连亏熔断条件评估(reconcile 与 executeSignal 执行前闸共用,审计 2026-07-11
+ * §7):尾亏 ≥ 阈值,且最近一笔有盈亏的结算晚于上次熔断水位 "_lossHaltAt"
+ * (操作员删 halt 恢复后,除非有新亏损落地,同一段历史不重复熔断)。 */
+export function lossHaltTripped(
+  cache: SettledCache,
+  lossHaltCount: number
+): { losses: number; tripped: boolean } {
+  const records = Object.values(cache).filter(
+    (v): v is SettledRecord => typeof v === "object" && v !== null
+  );
+  const losses = consecutiveLossTail(records);
+  const lastHaltMark = typeof cache["_lossHaltAt"] === "string" ? (cache["_lossHaltAt"] as string) : "";
+  const lastPnlRec = records
+    .filter((r) => r.pnlUsd != null)
+    .sort((a, b) => a.at.localeCompare(b.at))
+    .at(-1);
+  return { losses, tripped: losses >= lossHaltCount && !!lastPnlRec && lastPnlRec.at > lastHaltMark };
+}
+
 export interface SettlementEvent {
   conditionId: string;
   question: string | null;
@@ -454,7 +524,9 @@ export async function reconcileSettlements(budgetMs: number): Promise<{
     Object.entries(cache).filter(
       (kv): kv is [string, SettledRecord] => typeof kv[1] === "object" && kv[1].notified === false
     );
-  const open = ledger.filter((e) => exposedUsd(e) > 0 && e.conditionId && !cache[e.conditionId]);
+  const open = ledger.filter(
+    (e) => exposedUsd(e) > 0 && e.conditionId && !settledFinal(cache[e.conditionId])
+  );
   if (open.length === 0 && pendingNotify().length === 0) return null;
 
   const deadline = Date.now() + Math.max(0, budgetMs);
@@ -464,17 +536,9 @@ export async function reconcileSettlements(budgetMs: number): Promise<{
     if (await probeAndRecordSettlement(cid, ledger, cache)) dirty = true;
   }
 
-  const settledRecords = Object.values(cache).filter(
-    (v): v is SettledRecord => typeof v === "object" && v !== null
-  );
-  const losses = consecutiveLossTail(settledRecords);
-  const lastHaltMark = typeof cache["_lossHaltAt"] === "string" ? (cache["_lossHaltAt"] as string) : "";
-  const lastPnlRec = settledRecords
-    .filter((r) => r.pnlUsd != null)
-    .sort((a, b) => a.at.localeCompare(b.at))
-    .at(-1);
+  const { losses, tripped } = lossHaltTripped(cache, cfg.lossHaltCount);
   let lossHalted = false;
-  if (losses >= cfg.lossHaltCount && lastPnlRec && lastPnlRec.at > lastHaltMark) {
+  if (tripped) {
     if (!existsSync(cfg.haltFile)) {
       haltTrading(
         cfg,
@@ -588,6 +652,9 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
   const t0 = Date.now();
   const cfg = execConfig();
   const mode = executionMode();
+  /** live 路径下单前置位;此后所有终态行(含 catch 兜底)带同一 attemptId,
+   * 在 readLedger 处取代 write-ahead intent 行。 */
+  let liveAttemptId: string | undefined;
   const finish = (a: TradeAttempt, raw?: unknown): TradeAttempt => {
     a.latencyMs = Date.now() - t0;
     try {
@@ -605,6 +672,7 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
         signalAsk: input.bestAskAtSignal,
         ...(input.dirMethod ? { dirMethod: input.dirMethod } : {}),
         ...(input.probe ? { probe: true } : {}),
+        ...(liveAttemptId ? { attemptId: liveAttemptId } : {}),
         ...a,
         ...(raw !== undefined ? { raw } : {}),
       });
@@ -641,6 +709,35 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
     let dailyLeft = cfg.maxOrderUsd;
     let totalLeft = cfg.maxOrderUsd;
     if (!input.probe) {
+      // 漂移防护前置条件(审计 2026-07-11 §5):注解时无盘口基准 = 上行漂移带、
+      // 下行暴跌守卫、tiering 的 M2 逆共识红旗全部失效(它们都以 bestAskAtSignal
+      // 为锚)。这类信号只发信人工确认,不自动执行。
+      if (input.bestAskAtSignal == null) {
+        return finish({
+          mode,
+          status: "skipped",
+          reason: "信号注解无盘口基准(bestAskAtSignal=null),漂移带/暴跌守卫/M2 红旗不可用 — 人工确认后手动下单",
+          subjectAlert: "无盘口基准",
+        });
+      }
+      // 连亏熔断前置检查(审计 2026-07-11 §7):对账在 tick 末才跑,不前置则
+      // 隔夜已定型的连亏拦不住本 tick 的新绿单(阈值实际 N+1)。零网络调用,
+      // 只读本地结算缓存;水位推进与 ⛔ 通知仍归 reconcile 侧,这里只落 halt
+      // 文件并拦下本单。
+      if (mode === "live") {
+        const lh = lossHaltTripped(loadSettledCache(cfg), cfg.lossHaltCount);
+        if (lh.tripped) {
+          if (!existsSync(cfg.haltFile)) {
+            haltTrading(cfg, `结算连亏 ${lh.losses} 笔(阈值 ${cfg.lossHaltCount},执行前置检查)`);
+          }
+          return finish({
+            mode,
+            status: "skipped",
+            reason: `结算连亏 ${lh.losses} 笔 ≥ 阈值 ${cfg.lossHaltCount},已落 kill-switch`,
+            subjectAlert: "连亏熔断⛔",
+          });
+        }
+      }
       // 去重只看「有敞口」的条目(P0-1):确认零成交(none)与明确拒单不封锁
       // token,否则一次 FAK 无对手盘就永久放弃该市场的后续机会。
       const dup = ledger.find(
@@ -650,7 +747,25 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
           (exposedUsd(e) > 0 || (mode === "dry" && e.mode === "dry" && e.status === "dry"))
       );
       if (dup) {
-        return finish({ mode, status: "skipped", reason: `已对该 token 执行过(${dup.at} ${dup.status})` });
+        // P1 快轮询邮件失败重试会整段重放到这里(审计 2026-07-11 §8):重试轮
+        // 送达的邮件是这条 skipped —— 不带持仓信息的话,真实成交会被呈现成
+        // "未下单"。把已持仓状态升到主题级。
+        const held =
+          dup.status === "filled" || dup.status === "partial"
+            ? `,已成交 $${(dup.filledUsd ?? 0).toFixed(2)}${dup.avgPrice != null ? ` @均价 ${dup.avgPrice}` : ""}`
+            : dup.posted === "unknown"
+              ? ",下单结果未知(保守按持仓计)"
+              : "";
+        return finish({
+          mode,
+          status: "skipped",
+          reason: `已对该 token 执行过(${dup.at} ${dup.status}${held})`,
+          ...(dup.status === "filled" || dup.status === "partial"
+            ? { subjectAlert: `已持仓$${Math.round(dup.filledUsd ?? 0)}` }
+            : dup.posted === "unknown"
+              ? { subjectAlert: "持仓状态未知" }
+              : {}),
+        });
       }
       // §7 翻向双腿保护:correction 翻向(或任何原因)对同市场反向腿下单 =
       // 确定性锁损。已有敞口时一律 skip + 主题级告警,人工决定是否对冲/换腿。
@@ -835,6 +950,30 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       Math.min(30_000, input.budgetMs - 8_000),
       "createMarketOrder"
     );
+    // ── write-ahead intent(审计 2026-07-11 §1)──
+    // postOrder 一旦发出,结果在响应回来前对本进程是未知的:先落一条
+    // posted:"unknown" 的 intent 行(按 requestedUsd 占额、封锁该 token 去重),
+    // 终态行随后经同一 attemptId 在 readLedger 处取代它。进程死在在途窗口
+    // (run-cron 170s SIGTERM/断电)时,孤儿 intent 保守把"可能已成交"当持仓,
+    // 修复前这里是全系统唯一在成交后对所有防线不可见的窗口。
+    liveAttemptId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    appendLedger(cfg.ledger, {
+      at: new Date().toISOString(),
+      qid: input.qid,
+      tokenId: input.tokenId,
+      conditionId: input.conditionId,
+      outcome: input.outcome,
+      question: input.question?.slice(0, 160),
+      mode,
+      status: "intent",
+      posted: "unknown",
+      requestedUsd: orderUsd,
+      limitPrice,
+      freshAsk,
+      attemptId: liveAttemptId,
+      ...(input.probe ? { probe: true } : {}),
+    });
+
     // clob-client-v2 的 http 层从不 throw HTTP 错误:非 2xx 一律返回
     // {error: string|object, status: number}(2026-07-10 探针单实测)。
     let resp: {
@@ -847,19 +986,28 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       makingAmount?: string;
     };
     try {
-      resp = await withTimeout(client.postOrder(signed, OrderType.FAK), 20_000, "postOrder");
+      // 超时按剩余墙钟钳制:等不到响应就放弃等待(订单结果由 intent 行兜底),
+      // 不把 20s 平坦超时硬顶进 SIGTERM 窗口。
+      resp = await withTimeout(
+        client.postOrder(signed, OrderType.FAK),
+        Math.min(20_000, Math.max(5_000, input.budgetMs - (Date.now() - t0) - 2_000)),
+        "postOrder"
+      );
     } catch (err) {
-      // 超时后订单可能已被交易所接受 —— posted=unknown,按已占用额度计
+      // 超时/传输层异常(ECONNRESET、代理中断):请求可能已到达交易所 ——
+      // 一律 posted:"unknown" 保守占额。修复前非超时异常记 posted:false
+      // (不占额、不封锁去重),是重复实弹买入路径。
       const msg = err instanceof Error ? err.message : String(err);
       const attempt = finish(
         {
           mode,
           status: "error",
-          reason: `postOrder: ${msg}`,
+          reason: `postOrder(结果未知): ${msg}`,
           freshAsk,
           limitPrice,
           requestedUsd: orderUsd,
-          posted: /timed out/.test(msg) ? "unknown" : false,
+          posted: "unknown",
+          subjectAlert: "下单结果未知",
         },
         undefined
       );
@@ -877,6 +1025,25 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
         : resp?.error != null
           ? JSON.stringify(resp.error).slice(0, 200)
           : undefined);
+    // 传输层歧义({error} 无 status/orderID = 请求可能已送达但响应丢失):
+    // 不是拒单,posted:"unknown" 保守占额,结算核销时终局(审计 2026-07-11 §1)。
+    if (isTransportAmbiguous(resp, haveFill)) {
+      const attempt = finish(
+        {
+          mode,
+          status: "error",
+          reason: `postOrder 传输层错误(结果未知): ${errStr}`,
+          freshAsk,
+          limitPrice,
+          requestedUsd: orderUsd,
+          posted: "unknown",
+          subjectAlert: "下单结果未知",
+        },
+        resp
+      );
+      autoHaltOnRepeatedErrors(cfg);
+      return attempt;
+    }
     // FAK 零成交即撤:交易所受理(有 orderID)但簿内无对手 —— 语义是"未成交",
     // 不是运维错误,不计入连续报错熔断(探针实测:error 文案 + status 400 + orderID)。
     if (!haveFill && errStr && /FAK order/i.test(errStr)) {
@@ -911,6 +1078,26 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       return attempt;
     }
     if (!haveFill) {
+      // FAK 受理但无成交金额:status=delayed/live 表示订单仍可能被撮合(撮合
+      // 延迟市场),资金可能稍后被吃 —— 结果未知保守占额;只有明确终态才记
+      // $0 的 none(审计 2026-07-11 §15)。
+      const st = typeof resp?.status === "string" ? resp.status.toLowerCase() : "";
+      if (st === "delayed" || st === "live") {
+        return finish(
+          {
+            mode,
+            status: "none",
+            reason: `FAK 受理但撮合未终局(status=${resp?.status}),结果未知按持仓保守计`,
+            orderId: resp?.orderID,
+            freshAsk,
+            limitPrice,
+            requestedUsd: orderUsd,
+            posted: "unknown",
+            subjectAlert: "成交结果未知",
+          },
+          resp
+        );
+      }
       return finish(
         {
           mode,
@@ -953,11 +1140,19 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
 }
 
 /** 连续 3 次 live error → 自动落 kill-switch 文件(带原因),宁停不重复烧钱。
- * skipped/none 不算 error;人工删除该文件即恢复。 */
+ * 计数窗口只看真正到达交易所的执行尝试(error/filled/partial/none):skipped
+ * 是风控闸拦截、intent 是结果未知的孤儿行,都不代表执行链路健康 —— 让它们
+ * 打断计数,持续性故障会因错误间穿插额度/盘口 skip 而永远凑不满 3 连
+ * (审计 2026-07-11 §6)。人工删除该文件即恢复。 */
 function autoHaltOnRepeatedErrors(cfg: ReturnType<typeof execConfig>): void {
   try {
-    const entries = readLedger(cfg.ledger).filter((e) => e.mode === "live" && !e.probe);
-    const tail = entries.slice(-3);
+    const attempts = readLedger(cfg.ledger).filter(
+      (e) =>
+        e.mode === "live" &&
+        !e.probe &&
+        (e.status === "error" || e.status === "filled" || e.status === "partial" || e.status === "none")
+    );
+    const tail = attempts.slice(-3);
     if (tail.length === 3 && tail.every((e) => e.status === "error")) {
       haltTrading(cfg, `连续 3 次 live 执行错误,详见 ${cfg.ledger} 尾部`);
     }

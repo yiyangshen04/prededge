@@ -269,6 +269,9 @@ interface DigestEntry {
   /** Why it was digested: "flood" (I2 批量裁定限流)、"blue_no_edge" (I5 🔵收窄)
    * 或 "llm_gave_up" (M4 补判放弃兜底,不再静默丢弃)。 */
   reason: string;
+  /** 自动下单结论摘要(如 "skipped"/"none $0"):路由已后移到执行之后,真金
+   * 动手的条目会促升 immediate,这里是 skipped/none 结论的兜底留痕。 */
+  trade?: string | null;
   at: number;
 }
 
@@ -1128,14 +1131,21 @@ async function main(): Promise<void> {
   const tradeLineHtml = (n: Notable): string => {
     const t = n.trade;
     if (!t) return "";
+    // subjectAlert 是「引擎状态」级信息,任何 status 下都不允许被吞(审计
+    // 2026-07-11 §11:filled 短路曾吞掉 "ledger写失败已停机" —— 已成交但未
+    // 入账+引擎已停,被渲染成一次普通成功)。error 分支自己已展示 reason,
+    // 只补告警标签;其余分支补完整 alert+reason 行。
+    const alertHtml = t.subjectAlert
+      ? `<div style="margin-top:2px;font-size:13px"><b style="color:#dc2626">⚠ ${escapeHtml(t.subjectAlert)}${t.status !== "error" && t.reason ? `: ${escapeHtml(t.reason)}` : ""}</b></div>`
+      : "";
     if (t.status === "filled" || t.status === "partial")
-      return `<div style="margin-top:2px;font-size:13px"><b style="color:#16a34a">🤖 已自动买入 ${escapeHtml(n.exec?.outcome ?? "")} $${t.filledUsd?.toFixed(2)}${t.status === "partial" ? `(部分,请求 $${t.requestedUsd}` + ")" : ""} @ 均价 ${t.avgPrice?.toFixed(3)}</b><span style="font-size:12px;color:#888"> · orderId ${escapeHtml((t.orderId ?? "?").slice(0, 12))}… · ${((t.latencyMs ?? 0) / 1000).toFixed(1)}s</span></div>`;
+      return `<div style="margin-top:2px;font-size:13px"><b style="color:#16a34a">🤖 已自动买入 ${escapeHtml(n.exec?.outcome ?? "")} $${t.filledUsd?.toFixed(2)}${t.status === "partial" ? `(部分,请求 $${t.requestedUsd}` + ")" : ""} @ 均价 ${t.avgPrice?.toFixed(3)}</b><span style="font-size:12px;color:#888"> · orderId ${escapeHtml((t.orderId ?? "?").slice(0, 12))}… · ${((t.latencyMs ?? 0) / 1000).toFixed(1)}s</span></div>${alertHtml}`;
     if (t.status === "none")
-      return `<div style="margin-top:2px;font-size:13px;color:#d97706">🤖 FAK 提交成功但未成交(限价 ${t.limitPrice} 内无对手盘),已自动撤单</div>`;
+      return `<div style="margin-top:2px;font-size:13px;color:#d97706">🤖 FAK 提交成功但未成交(限价 ${t.limitPrice} 内无对手盘),已自动撤单</div>${alertHtml}`;
     if (t.status === "dry")
-      return `<div style="margin-top:2px;font-size:13px;color:#2563eb">🤖[演练] 将买入 ${escapeHtml(n.exec?.outcome ?? "")} $${t.requestedUsd} @≤${t.limitPrice}(EXEC_MODE=dry,未提交)</div>`;
+      return `<div style="margin-top:2px;font-size:13px;color:#2563eb">🤖[演练] 将买入 ${escapeHtml(n.exec?.outcome ?? "")} $${t.requestedUsd} @≤${t.limitPrice}(EXEC_MODE=dry,未提交)</div>${alertHtml}`;
     if (t.status === "error")
-      return `<div style="margin-top:2px;font-size:13px"><b style="color:#dc2626">🤖 自动下单失败: ${escapeHtml(t.reason ?? "未知错误")}</b></div>`;
+      return `<div style="margin-top:2px;font-size:13px"><b style="color:#dc2626">🤖 自动下单失败: ${escapeHtml(t.reason ?? "未知错误")}</b></div>${alertHtml}`;
     // P0-1④:额度打满等风控状态不再只是灰色小字 —— 这是「引擎停机」级信息。
     if (t.subjectAlert)
       return `<div style="margin-top:2px;font-size:13px"><b style="color:#dc2626">🤖 ${escapeHtml(t.subjectAlert)},未下单: ${escapeHtml(t.reason ?? "")}</b></div>`;
@@ -1144,13 +1154,14 @@ async function main(): Promise<void> {
   const tradeSubjectBit = (n: Notable): string => {
     const t = n.trade;
     if (!t) return "";
-    if (t.status === "filled") return ` 🤖已买$${t.filledUsd?.toFixed(0)}`;
-    if (t.status === "partial") return ` 🤖部分$${t.filledUsd?.toFixed(0)}`;
-    if (t.status === "error") return " 🤖下单失败⚠";
-    if (t.status === "none") return " 🤖未成交";
-    if (t.status === "dry") return " 🤖dry";
-    if (t.subjectAlert) return ` 🤖${t.subjectAlert}⚠`; // P0-1④:skipped 里的额度告警升到主题级
-    return "";
+    // 同上:subjectAlert 追加到任何 status 的主题位之后,不被 filled 短路吞掉。
+    const alert = t.subjectAlert ? ` 🤖${t.subjectAlert}⚠` : "";
+    if (t.status === "filled") return ` 🤖已买$${t.filledUsd?.toFixed(0)}${alert}`;
+    if (t.status === "partial") return ` 🤖部分$${t.filledUsd?.toFixed(0)}${alert}`;
+    if (t.status === "error") return ` 🤖下单失败⚠${alert}`;
+    if (t.status === "none") return ` 🤖未成交${alert}`;
+    if (t.status === "dry") return ` 🤖dry${alert}`;
+    return alert; // P0-1④:skipped 里的额度告警升到主题级
   };
   const tradeTextBit = (n: Notable): string => {
     const t = n.trade;
@@ -1199,62 +1210,9 @@ async function main(): Promise<void> {
     }
   }
 
-  // ── I5 🔵收窄 + I2 洪水限流:即时邮件 vs 汇总队列 ──
-  const routeNow = Date.now();
-  state.mailLog = state.mailLog.filter((t) => routeNow - t < FLOOD_WINDOW_MS);
-  const floodActive = state.mailLog.length >= FLOOD_MAX;
-  const immediate: Notable[] = [];
-  const digested: Array<{ n: Notable; reason: string }> = [];
-  for (const n of mailable) {
-    const pr = priorityOf(n);
-    // I5:🔵(纯 LLM 判读)只有"争议中"或"盘口显示有肉且可执行"才配即时打扰。
-    // 回测 🔵 档 95% 胜率却 -0.1%/笔(0.99 薄 carry),模板簇判向率 67% 全不可执行。
-    if (pr.rank === 2) {
-      const hasEdge =
-        n.kinds.has("reset") ||
-        (n.exec != null && n.exec.bestAsk != null && n.exec.bestAsk < 0.97 && n.exec.executable);
-      if (!hasEdge) {
-        digested.push({ n, reason: "blue_no_edge" });
-        continue;
-      }
-    }
-    // I2:批量裁定洪水(2026-06 单月 690 信号/单日峰 320)中,只有肥尾候选、
-    // 更正裁定(P2:全部真翻转形态,且事故簇之夜恰恰触发洪水——2025-11-17 实例)
-    // 与降级告警(enriched=false,安全兜底语义不能延迟)保持即时,其余进汇总。
-    if (floodActive && pr.rank <= 2 && !isFatTail(n) && !isFatTailShape(n) && !n.correction && n.enriched) {
-      digested.push({ n, reason: "flood" });
-      continue;
-    }
-    immediate.push(n);
-  }
-  for (const { n, reason } of digested) {
-    state.digestQueue.push({
-      qid: n.qid,
-      title: n.title,
-      label: priorityOf(n).label,
-      stance: n.stance,
-      llmStance: n.llm?.stance ?? null,
-      bestAsk: n.exec?.bestAsk ?? null,
-      askUsd: n.exec?.askUsdNear ?? null,
-      marketUrl: n.exec?.marketUrl ?? null,
-      reason,
-      at: routeNow,
-    });
-  }
-  if (state.digestQueue.length > 100) {
-    // 截断分层(审查 major):信息性面包屑(prearm_expired)先让位,方向性事件
-    // (flood/blue_no_edge/llm_gave_up)最后才丢 —— 否则批量预告过期会把真正
-    // 的方向性信号从队列里静默挤掉(其指纹已提交,丢即永久)。
-    let toDrop = state.digestQueue.length - 100;
-    state.digestQueue = state.digestQueue.filter((d) => {
-      if (toDrop > 0 && d.reason === "prearm_expired") {
-        toDrop -= 1;
-        return false;
-      }
-      return true;
-    });
-    if (toDrop > 0) state.digestQueue.splice(0, toDrop);
-  }
+  // (I5/I2 即时 vs 汇总路由已后移到自动下单循环之后 —— 审计 2026-07-11 §9:
+  // 路由必须看得见 n.trade,否则洪水日照常实弹下单的普通 🟢 会带着真金成交
+  // 进 6h 汇总,且 DigestEntry 快照里没有任何下单痕迹。)
 
   // ── I6: 🟢 自动登记 paper_trades(前瞻虚拟持仓,再也不用事后重建回测)──
   // localDb 惰性加载:chain-watch 的承诺是"无 sqlite 也能跑",登记失败只记日志。
@@ -1312,7 +1270,25 @@ async function main(): Promise<void> {
     // 曾是"自动下单静默停摆"的必踩地雷。
     if (!isGreen(pr)) return;
     const e = n.exec;
-    if (!e || e.closed || !e.tokenId) return;
+    if (!e || !e.tokenId) {
+      // 审计 2026-07-11 §13:🟢 没拿到盘口注解(注解循环预算耗尽/排在
+      // EXEC_ANNOTATE_MAX 之外)不是"已评估被风控拦下",而是"没评估上"。
+      // 静默 return 会让这笔机会无痕迹丢失(指纹随后照常提交、永不复核),
+      // 而肥尾恰恰集中在注解预算最紧的批量澄清 tick。落 trade 记录升主题级。
+      n.trade = {
+        mode: executionMode(),
+        status: "skipped",
+        reason: e
+          ? "exec 注解无 tokenId,自动执行未评估 — 人工确认"
+          : "无盘口注解(注解预算耗尽或超出 EXEC_ANNOTATE_MAX),自动执行未评估 — 人工确认",
+        subjectAlert: "🟢未评估",
+      };
+      return;
+    }
+    if (e.closed) {
+      n.trade = { mode: executionMode(), status: "skipped", reason: "市场已关闭,无可执行盘口" };
+      return;
+    }
     if (!AUTO_EXEC_DIR_METHODS.has(e.dirMethod)) {
       n.trade = {
         mode: executionMode(),
@@ -1361,6 +1337,82 @@ async function main(): Promise<void> {
   };
   for (const n of mailable) await maybeExecuteTrade(n);
 
+  // ── I5 🔵收窄 + I2 洪水限流:即时邮件 vs 汇总队列 ──
+  // 在自动下单之后路由(审计 2026-07-11 §9):真金动过手(成交/部分/错误/引擎级
+  // 告警)的条目不允许进 6h 汇总 —— 花钱不可见比邮件洪水更贵。
+  const routeNow = Date.now();
+  state.mailLog = state.mailLog.filter((t) => routeNow - t < FLOOD_WINDOW_MS);
+  const floodActive = state.mailLog.length >= FLOOD_MAX;
+  const immediate: Notable[] = [];
+  const digested: Array<{ n: Notable; reason: string }> = [];
+  for (const n of mailable) {
+    const pr = priorityOf(n);
+    const tradeUrgent =
+      n.trade != null &&
+      (n.trade.status === "filled" ||
+        n.trade.status === "partial" ||
+        n.trade.status === "error" ||
+        n.trade.subjectAlert != null);
+    // I5:🔵(纯 LLM 判读)只有"争议中"或"盘口显示有肉且可执行"才配即时打扰。
+    // 回测 🔵 档 95% 胜率却 -0.1%/笔(0.99 薄 carry),模板簇判向率 67% 全不可执行。
+    if (pr.rank === 2 && !tradeUrgent) {
+      const hasEdge =
+        n.kinds.has("reset") ||
+        (n.exec != null && n.exec.bestAsk != null && n.exec.bestAsk < 0.97 && n.exec.executable);
+      if (!hasEdge) {
+        digested.push({ n, reason: "blue_no_edge" });
+        continue;
+      }
+    }
+    // I2:批量裁定洪水(2026-06 单月 690 信号/单日峰 320)中,只有肥尾候选、
+    // 更正裁定(P2:全部真翻转形态,且事故簇之夜恰恰触发洪水——2025-11-17 实例)
+    // 与降级告警(enriched=false,安全兜底语义不能延迟)保持即时,其余进汇总。
+    if (
+      floodActive &&
+      pr.rank <= 2 &&
+      !tradeUrgent &&
+      !isFatTail(n) &&
+      !isFatTailShape(n) &&
+      !n.correction &&
+      n.enriched
+    ) {
+      digested.push({ n, reason: "flood" });
+      continue;
+    }
+    immediate.push(n);
+  }
+  for (const { n, reason } of digested) {
+    state.digestQueue.push({
+      qid: n.qid,
+      title: n.title,
+      label: priorityOf(n).label,
+      stance: n.stance,
+      llmStance: n.llm?.stance ?? null,
+      bestAsk: n.exec?.bestAsk ?? null,
+      askUsd: n.exec?.askUsdNear ?? null,
+      marketUrl: n.exec?.marketUrl ?? null,
+      // 兜底留痕:促升规则应保证进汇总的条目没动过真金,但 skipped/none 的
+      // 下单结论仍值得在汇总里可见。
+      trade: n.trade ? `${n.trade.status}${n.trade.filledUsd ? ` $${n.trade.filledUsd}` : ""}` : null,
+      reason,
+      at: routeNow,
+    });
+  }
+  if (state.digestQueue.length > 100) {
+    // 截断分层(审查 major):信息性面包屑(prearm_expired)先让位,方向性事件
+    // (flood/blue_no_edge/llm_gave_up)最后才丢 —— 否则批量预告过期会把真正
+    // 的方向性信号从队列里静默挤掉(其指纹已提交,丢即永久)。
+    let toDrop = state.digestQueue.length - 100;
+    state.digestQueue = state.digestQueue.filter((d) => {
+      if (toDrop > 0 && d.reason === "prearm_expired") {
+        toDrop -= 1;
+        return false;
+      }
+      return true;
+    });
+    if (toDrop > 0) state.digestQueue.splice(0, toDrop);
+  }
+
   // ── I2: 汇总队列冲洗(攒满 DIGEST_MAX_SIZE 条,或最老条目滞留超 6h)──
   // 独立于即时邮件的 best-effort:失败保留队列下轮重试,绝不阻塞 cursor 推进。
   const flushDigest = async (): Promise<void> => {
@@ -1375,7 +1427,7 @@ async function main(): Promise<void> {
       ${escapeHtml(d.title ?? d.qid)}<br>
       <span style="font-size:12px;color:#888">${escapeHtml(d.label)} · ${
         d.bestAsk != null ? `价${d.bestAsk.toFixed(3)} · 深$${Math.round(d.askUsd ?? 0)}` : "盘口未核对"
-      } · ${new Date(d.at).toISOString().slice(5, 16)}Z${
+      }${d.trade ? ` · 🤖${escapeHtml(d.trade)}` : ""} · ${new Date(d.at).toISOString().slice(5, 16)}Z${
         d.marketUrl ? ` · <a href="${d.marketUrl}">市场</a>` : ""
       }</span>
     </td></tr>`
@@ -1385,7 +1437,7 @@ async function main(): Promise<void> {
       await sendMail({
         subject: `[PredEdge链上] 📦 低优先级方向事件汇总 ${items.length} 项`,
         html: `<div style="font-family:system-ui,sans-serif;max-width:640px"><p>洪水限流(I2)/🔵收窄(I5)期间积累的方向性事件,汇总如下(未即时打扰):</p><table style="width:100%;border-collapse:collapse">${digestRows}</table></div>`,
-        text: items.map((d) => `${d.title ?? d.qid} | ${d.label} | ask=${d.bestAsk ?? "?"} 深$${d.askUsd ?? "?"}`).join("\n"),
+        text: items.map((d) => `${d.title ?? d.qid} | ${d.label} | ask=${d.bestAsk ?? "?"} 深$${d.askUsd ?? "?"}${d.trade ? ` | 🤖${d.trade}` : ""}`).join("\n"),
       });
       state.digestQueue = q.slice(items.length);
       saveState(state);

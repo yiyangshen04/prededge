@@ -41,7 +41,16 @@
  *                        max(EXEC_SLIPPAGE, frac×signalAsk) = 市场把裁定读成
  *                        反方向,skip 待人工复核,不当便宜货买)
  *   EXEC_LOSS_HALT_COUNT default 3    (结算对账连亏 N 笔 → 自动落 halt 文件)
- *   EXEC_SKIP_FORECAST_TEMPLATE  default on(bt5/E3b:预告模板家族绿档均值 −5.5%、零肥尾)
+ *   EXEC_SKIP_FORECAST_TEMPLATE  default off(2026-07-14 官方行为研究 §7.2 策略反转:
+ *                        预告模板家族从一刀切 skip 改三闸门制 —— bt5/E3b 的"绿档均值
+ *                        −5.5%"结论只对预告期入场成立,肉在落地瞬间(簇级 meat 中位
+ *                        9~17pp);历史重放 15 个月:三闸门 16 笔全胜 +$194,无闸裸执行
+ *                        −$195。on = 恢复旧一刀切 skip)
+ *   EXEC_FORECAST_MIN_PRICE  default 0.30(预告家族防雷闸:方向侧信号价 <0.30 =
+ *                        市场不跟随澄清方向,文本可疑/姊妹盘错配形态,不执行)
+ *   EXEC_FORECAST_LIVE   default off(预告家族 paper 验证期:三闸门通过后 live 模式
+ *                        也不实弹,先观察 4-6 周线上判读口径下的闸门表现;验证通过
+ *                        后置 on 放实弹。期望量级 $5-15/月,与主策略共用管线)
  *   EXEC_HALT_FILE       default data/trading-halt(存在即停;连续 3 次 live error 自动创建)
  *   EXEC_LEDGER          default data/trade-ledger.jsonl
  *
@@ -93,6 +102,9 @@ export interface TradeSignalInput {
   stance: string;
   llmStance?: string | null;
   llmConfidence?: string | null;
+  /** LLM 判读的事件状态(decided/pending/unclear)——预告家族 boundary 闸
+   * 的输入:leans ∧ pending = 快照雷形态(历史重放全部 -100% 在此)。 */
+  llmEventStatus?: string | null;
   /** 信号注解时刻的 bestAsk(漂移防护的基准;null = 注解时无盘口)。 */
   bestAskAtSignal: number | null;
   /** execCheck 的方向映射方法,进 ledger 供事后归因(P0-2⑤)。自动执行的
@@ -159,7 +171,9 @@ export function execConfig() {
     crashDropFrac: num("EXEC_CRASH_DROP_FRAC", 0.35),
     lossHaltCount: num("EXEC_LOSS_HALT_COUNT", 3),
     skipForecastTemplate:
-      (process.env.EXEC_SKIP_FORECAST_TEMPLATE ?? "on").trim().toLowerCase() !== "off",
+      (process.env.EXEC_SKIP_FORECAST_TEMPLATE ?? "off").trim().toLowerCase() === "on",
+    forecastMinPrice: num("EXEC_FORECAST_MIN_PRICE", 0.3),
+    forecastLive: (process.env.EXEC_FORECAST_LIVE ?? "off").trim().toLowerCase() === "on",
     haltFile: rel(process.env.EXEC_HALT_FILE?.trim() || "data/trading-halt"),
     ledger: rel(process.env.EXEC_LEDGER?.trim() || "data/trade-ledger.jsonl"),
   };
@@ -701,8 +715,45 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
     if (input.budgetMs < 12_000) {
       return finish({ mode, status: "skipped", reason: `tick 预算不足(${Math.round(input.budgetMs / 1000)}s)` });
     }
-    if (input.forecastTemplate && cfg.skipForecastTemplate) {
-      return finish({ mode, status: "skipped", reason: "预告模板家族(bt5/E3b 绿档均值−5.5%,EXEC_SKIP_FORECAST_TEMPLATE=on)" });
+    // ── 预告模板家族闸门制(2026-07-14 官方行为研究 §7.2)──
+    // 一刀切 skip 改三闸门:重放 15 个月,三闸门 16 笔全胜 +$194,C0 无闸裸
+    // 执行 −$195(未到期快照雷全踩)。闸3 owner 白名单在 chain-watch 事件层
+    // (非官方 owner 的 context 不进判读/执行路径),此处是闸1/闸2。
+    if (input.forecastTemplate) {
+      if (cfg.skipForecastTemplate) {
+        return finish({ mode, status: "skipped", reason: "预告模板家族(EXEC_SKIP_FORECAST_TEMPLATE=on,旧一刀切口径)" });
+      }
+      // 闸1 boundary(核心):落地为 leans ∧ 事件窗口未结束 —— 与 tiering 的
+      // boundaryPending 同语义,在执行侧做成硬拦截(tiering 侧只降档,且
+      // LLM_BOUNDARY_GUARD 可被关掉;-100% 级快照雷全部是此形态)。
+      if (
+        input.llmEventStatus === "pending" &&
+        (/^leans_/i.test(input.llmStance ?? "") || /^leans_/i.test(input.stance))
+      ) {
+        return finish({
+          mode,
+          status: "skipped",
+          reason: "预告家族boundary闸:leans∧事件未决(快照雷形态,重放中无此闸家族净亏−$195)",
+        });
+      }
+      // 闸2 防雷:方向侧信号价 <0.30 = 市场不跟随澄清方向(文本可疑/姊妹盘
+      // 错配形态),不执行。freshAsk 侧同样按此地板(下方盘口检查)。
+      if (input.bestAskAtSignal != null && input.bestAskAtSignal < cfg.forecastMinPrice) {
+        return finish({
+          mode,
+          status: "skipped",
+          reason: `预告家族防雷闸:信号价 ${input.bestAskAtSignal.toFixed(3)} < ${cfg.forecastMinPrice}(市场不跟随澄清方向,文本可疑/姊妹盘错配)`,
+        });
+      }
+      // paper 验证期:三闸门通过后 live 也暂不实弹,先验证闸门在线上判读口径
+      // 下的表现(4-6 周);ledger 落 skipped 行留痕,paper_trades 照常独立登记。
+      if (mode === "live" && !cfg.forecastLive) {
+        return finish({
+          mode,
+          status: "skipped",
+          reason: "预告家族三闸门通过 — paper 验证期(EXEC_FORECAST_LIVE=off),本单不实弹;验证期后置 on 放开",
+        });
+      }
     }
 
     const ledger = readLedger(cfg.ledger);
@@ -837,8 +888,13 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
         freshAsk,
       });
     }
-    if (freshAsk < cfg.minPrice) {
-      return finish({ mode, status: "skipped", reason: `ask ${freshAsk.toFixed(3)} < 下限 ${cfg.minPrice}`, freshAsk });
+    // 预告家族防雷闸在新鲜盘口上的同一地板(信号价过闸后价格仍可能塌下去)。
+    const minPriceEff =
+      input.forecastTemplate && !cfg.skipForecastTemplate
+        ? Math.max(cfg.minPrice, cfg.forecastMinPrice)
+        : cfg.minPrice;
+    if (freshAsk < minPriceEff) {
+      return finish({ mode, status: "skipped", reason: `ask ${freshAsk.toFixed(3)} < 下限 ${minPriceEff}`, freshAsk });
     }
     if (input.bestAskAtSignal != null) {
       // §2.3 漂移带按边缩放:上行容忍 max(slippage, edgeFrac×(1−signal))。

@@ -63,8 +63,10 @@ const boundaryPending = (n: TierInput, opts: TierOptions): boolean =>
 function basePriorityOf(n: TierInput, opts: TierOptions): TierVerdict {
   const polarity = stancePolarity;
   const llmDir = n.llm != null && isDirectionalStance(n.llm.stance) && n.llm.confidence !== "low";
-  // P3(bt5/E3b):预告模板家族的绿档负向注解(label-only,不降档)。
-  const forecastBit = n.forecastTemplate ? " ⚠预告模板家族(bt5:绿档均值−5.5%·零肥尾)" : "";
+  // P3 预告模板家族注解(label-only,不降档)。bt5/E3b 的"绿档均值 −5.5%"
+  // 经 2026-07-14 官方行为研究修正:负收益只属预告期入场,肉在落地后 20-60s
+  // (簇级 meat 中位 9~17pp);执行侧走三闸门制(tradeExecutor §7.2)。
+  const forecastBit = n.forecastTemplate ? " ⏰预告模板家族(落地瞬间机会·执行三闸门)" : "";
   if (isDirectionalStance(n.stance)) {
     if (llmDir && polarity(n.llm!.stance) === polarity(n.stance)) {
       if (boundaryPending(n, opts))

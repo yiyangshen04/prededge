@@ -138,3 +138,104 @@ test("lossHaltTripped:尾亏达阈值触发;水位之后无新亏损不重复熔
   // 盈亏未知的记录不稀释计数(consecutiveLossTail 语义透传)
   assert.equal(lossHaltTripped({ ...cache, c4: { at: "2026-07-04", notified: false } }, 3).tripped, true);
 });
+
+// ── 预告模板家族三闸门(2026-07-14 官方行为研究 §7.2)──
+// 重放 15 个月:三闸门 16 笔全胜 +$194,无闸裸执行 −$195(快照雷全踩)。
+// 闸门全部在任何网络调用之前,可离线断言;EXEC_WALLET_JSON 指向不存在路径,
+// 保证"过闸"用例在 client init 处以 error 终止,绝不触网。
+import { executeSignal } from "../lib/polymarket/tradeExecutor";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const FORECAST_SIGNAL = {
+  qid: "0xq",
+  tokenId: "1234",
+  conditionId: "0xc",
+  outcome: "Yes",
+  question: "gate test?",
+  marketUrl: null,
+  label: "🟢 双确认 YES·high",
+  stance: "YES",
+  llmStance: "YES",
+  llmConfidence: "high",
+  llmEventStatus: "decided",
+  bestAskAtSignal: 0.55,
+  forecastTemplate: true,
+  budgetMs: 60_000,
+};
+
+async function execWith(
+  env: Record<string, string>,
+  input: Partial<typeof FORECAST_SIGNAL>
+) {
+  const dir = mkdtempSync(join(tmpdir(), "prededge-gate-"));
+  const saved: Record<string, string | undefined> = {};
+  const overrides: Record<string, string> = {
+    EXEC_MODE: "live",
+    EXEC_LEDGER: join(dir, "ledger.jsonl"),
+    EXEC_HALT_FILE: join(dir, "halt-absent"),
+    EXEC_WALLET_JSON: join(dir, "wallet-absent.json"),
+    EXEC_SKIP_FORECAST_TEMPLATE: "",
+    EXEC_FORECAST_LIVE: "",
+    ...env,
+  };
+  for (const [k, v] of Object.entries(overrides)) {
+    saved[k] = process.env[k];
+    if (v === "") delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    return await executeSignal({ ...FORECAST_SIGNAL, ...input });
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test("预告家族:EXEC_SKIP_FORECAST_TEMPLATE=on 恢复旧一刀切 skip", async () => {
+  const r = await execWith({ EXEC_SKIP_FORECAST_TEMPLATE: "on" }, {});
+  assert.equal(r.status, "skipped");
+  assert.match(r.reason ?? "", /EXEC_SKIP_FORECAST_TEMPLATE=on/);
+});
+
+test("预告家族闸1 boundary:leans∧事件未决 → 拦截(llm 侧与正则侧都看)", async () => {
+  const viaLlm = await execWith({}, { llmStance: "leans_YES", llmEventStatus: "pending" });
+  assert.equal(viaLlm.status, "skipped");
+  assert.match(viaLlm.reason ?? "", /boundary闸/);
+  const viaRegex = await execWith({}, { stance: "leans_NO", llmStance: "NO", llmEventStatus: "pending" });
+  assert.match(viaRegex.reason ?? "", /boundary闸/);
+  // decided 时 leans 不触发 boundary 闸(掉到下一道闸)
+  const decided = await execWith({}, { llmStance: "leans_YES", llmEventStatus: "decided" });
+  assert.doesNotMatch(decided.reason ?? "", /boundary闸/);
+});
+
+test("预告家族闸2 防雷:方向侧信号价 <0.30 → 不执行;非预告家族不受此闸", async () => {
+  const r = await execWith({}, { bestAskAtSignal: 0.22 });
+  assert.equal(r.status, "skipped");
+  assert.match(r.reason ?? "", /防雷闸/);
+  // 同价位的非预告家族信号不触发防雷闸(走到钱包缺失的 error = 已过全部风控闸)
+  const normal = await execWith({}, { bestAskAtSignal: 0.22, forecastTemplate: false });
+  assert.doesNotMatch(normal.reason ?? "", /防雷闸/);
+});
+
+test("预告家族 paper 验证期:三闸门通过后 live 不实弹(EXEC_FORECAST_LIVE 默认 off)", async () => {
+  const r = await execWith({}, {});
+  assert.equal(r.status, "skipped");
+  assert.match(r.reason ?? "", /paper 验证期/);
+});
+
+test("预告家族 EXEC_FORECAST_LIVE=on:过闸放行,推进到 client init(此处按缺钱包 error 终止)", async () => {
+  const r = await execWith({ EXEC_FORECAST_LIVE: "on" }, {});
+  assert.equal(r.status, "error");
+  assert.doesNotMatch(r.reason ?? "", /预告|boundary闸|防雷闸|paper 验证期/);
+});
+
+test("预告家族 dry 模式:闸门语义一致,paper skip 只拦 live 不拦 dry", async () => {
+  const r = await execWith({ EXEC_MODE: "dry" }, {});
+  // dry 过三闸门后继续全链路(client init 因缺钱包 error)——线上演练路径可用
+  assert.equal(r.status, "error");
+  assert.doesNotMatch(r.reason ?? "", /paper 验证期/);
+});

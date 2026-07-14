@@ -44,7 +44,7 @@ import { readFileSync } from "fs";
 import path from "path";
 import { sendMail } from "./mailer";
 import { ethCall } from "../lib/polymarket/oracleState";
-import { getOfficialUpdates, stanceFromText, detectRefundClause } from "../lib/polymarket/officialContext";
+import { getOfficialUpdates, isOfficialContextOwner, stanceFromText, detectRefundClause } from "../lib/polymarket/officialContext";
 import type { OfficialUpdate } from "../lib/polymarket/officialContext";
 import {
   parseScheduledClarification,
@@ -326,6 +326,10 @@ interface WatchState {
   digestQueue: DigestEntry[];
   /** Epoch-ms timestamps of immediately-mailed directional items (flood detector). */
   mailLog: number[];
+  /** qid → QuestionReset 累计(P2 扩层组合红旗,2026-07-14 §7.3:多轮
+   * dispute ∧ 方向性澄清 = Dota 形态)。lastBlock 单调去重防 crash 重扫
+   * 重复计数;30 天 TTL 修剪。 */
+  resetSeen: Record<string, { n: number; lastBlock: number; at: number }>;
 }
 
 function statePath(): string {
@@ -340,7 +344,7 @@ function loadState(): WatchState {
     raw = readFileSync(statePath(), "utf8");
   } catch {
     // first run — file absent
-    return { lastBlock: 0, notified: {}, llmPending: {}, v2Watch: {}, preArm: {}, digestQueue: [], mailLog: [] };
+    return { lastBlock: 0, notified: {}, llmPending: {}, v2Watch: {}, preArm: {}, digestQueue: [], mailLog: [], resetSeen: {} };
   }
   try {
     const parsed = JSON.parse(raw);
@@ -353,6 +357,7 @@ function loadState(): WatchState {
       preArm: parsed.preArm && typeof parsed.preArm === "object" ? parsed.preArm : {},
       digestQueue: Array.isArray(parsed.digestQueue) ? parsed.digestQueue : [],
       mailLog: Array.isArray(parsed.mailLog) ? parsed.mailLog.filter((t: unknown) => Number.isFinite(t)) : [],
+      resetSeen: parsed.resetSeen && typeof parsed.resetSeen === "object" ? parsed.resetSeen : {},
     };
   } catch (err) {
     // File exists but is corrupt (truncated by a crash mid-write). Do NOT
@@ -437,9 +442,38 @@ interface Notable {
   /** P3(bt5/E3b):update 链含定时澄清预告模板 —— green∧该家族 n=13 均
    * −5.5% 且零肥尾(green∧非预告 +47% 含全部肥尾)。label-only 负向注解。 */
   forecastTemplate?: boolean;
+  /** owner 白名单加固(2026-07-14):市场 creator 不在官方发布地址白名单内
+   * —— getOfficialUpdates 读的是 creator 桶,creator 非官方意味着判读文本
+   * 来源不可信(野市场/对抗注入)。置位后强制 stance none、跳过 LLM 与
+   * 自动下单,邮件标红提示人工核对。 */
+  untrustedCreator?: boolean;
+  /** P2 扩层组合红旗(2026-07-14 §7.3):该 qid 的 QuestionReset 累计 ≥2
+   * (多轮 dispute)。与方向性澄清并存 = Dota 形态(官方解释性裁决 vs 结算
+   * 源数字矛盾 + 多轮 dispute,15 个月唯一无退款损失)。展示层红旗,不降档
+   * 不拦执行 —— dispute 情境本身不降低官方预测力(92% vs 92.3%),事故
+   * 基础率 1/15mo,降档会误杀 dispute 子集的正常好信号。 */
+  multiDispute?: boolean;
   /** 自动下单结果(EXEC_MODE 控制;undefined = 未尝试)。闸门与 paper 登记
    * 同语义(🟢∧盘口存在),执行器内部另有价格/额度/去重/kill-switch 风控。 */
   trade?: TradeAttempt;
+}
+
+/** getOfficialUpdates + creator 白名单校验(2026-07-14 加固)。updates 按
+ * (questionID, owner) 分桶,生产读的是 creator 桶;creator 非官方白名单
+ * (野市场/对抗注入)时文本不可信 —— 一条 update 都不返回(判读/LLM/交易
+ * 零暴露),untrusted 置位供通知标红。四处读取共用同一语义。 */
+async function getTrustedOfficialUpdates(input: {
+  resolvedBy: string;
+  questionID: string;
+}): Promise<{ updates: OfficialUpdate[]; untrusted: boolean }> {
+  const { updates, creator } = await getOfficialUpdates(input);
+  if (updates.length > 0 && !isOfficialContextOwner(creator)) {
+    console.warn(
+      `[chain-watch] ${input.questionID.slice(0, 10)} creator ${creator ?? "?"} 非官方白名单,丢弃 ${updates.length} 条 context`
+    );
+    return { updates: [], untrusted: true };
+  }
+  return { updates, untrusted: false };
 }
 
 /** 从 update 链提取正则立场:优先最新的方向性文本,否则用最新一条的分类。
@@ -556,7 +590,7 @@ async function main(): Promise<void> {
   const ENRICH_BUDGET_MS = 140_000;
   const elapsed = () => Date.now() - tickStartedAt;
 
-  const logs: Array<{ address: string; topics: string[] }> = [];
+  const logs: Array<{ address: string; topics: string[]; blockNumber?: string }> = [];
   const WINDOW = 48;
   let sweptTo = from - 1;
   let sweepError: string | null = null;
@@ -567,7 +601,7 @@ async function main(): Promise<void> {
     }
     const end = Math.min(start + WINDOW - 1, to);
     try {
-      const page = await rpc<Array<{ address: string; topics: string[] }>>("eth_getLogs", [
+      const page = await rpc<Array<{ address: string; topics: string[]; blockNumber?: string }>>("eth_getLogs", [
         {
           fromBlock: `0x${start.toString(16)}`,
           toBlock: `0x${end.toString(16)}`,
@@ -590,12 +624,35 @@ async function main(): Promise<void> {
 
   // Group events by questionID
   const byQid = new Map<string, Notable>();
+  let nonOfficialDropped = 0;
   for (const log of logs) {
     const topic0 = log.topics?.[0]?.toLowerCase();
     const qid = log.topics?.[1]?.toLowerCase();
     if (!qid) continue;
     const kind = topic0 === TOPIC_QUESTION_RESET ? "reset" : topic0 === TOPIC_ANCILLARY_UPDATED ? "context" : null;
     if (!kind) continue;
+    // owner 白名单(2026-07-14 加固):AncillaryDataUpdated 任何地址都能发,
+    // 已实测对抗案例(Peng 案 troll 掐官方澄清前 4 秒抢发反向文、bot 测试
+    // 文本)。topics[2]=owner;非白名单事件不触发 enrich/通知(防噪音 tick
+    // 与 enrich 预算消耗),仅计数留痕。QuestionReset 是 OO 流程事件、无
+    // owner 伪造面,不过滤。
+    if (kind === "context") {
+      const owner = log.topics?.[2] ? `0x${log.topics[2].slice(-40)}` : null;
+      if (!isOfficialContextOwner(owner)) {
+        nonOfficialDropped += 1;
+        continue;
+      }
+    }
+    // P2 扩层(2026-07-14 §7.3):QuestionReset 跨 tick 累计,≥2 = 多轮
+    // dispute(Dota 形态红旗的一半)。block 单调去重:crash 后同窗口重扫
+    // 不重复计数(同 block 同 qid 双 reset 极罕见,漏计是保守方向)。
+    if (kind === "reset") {
+      const blockNum = Number(log.blockNumber ?? 0) || 0;
+      const seen = state.resetSeen[qid];
+      if (!seen || blockNum > seen.lastBlock) {
+        state.resetSeen[qid] = { n: (seen?.n ?? 0) + 1, lastBlock: blockNum, at: Date.now() };
+      }
+    }
     if (!byQid.has(qid)) {
       byQid.set(qid, {
         qid,
@@ -615,6 +672,12 @@ async function main(): Promise<void> {
     byQid.get(qid)!.kinds.add(kind);
   }
 
+  /** P2 扩层:多轮 dispute 红旗置位(mailable 统一跑一遍 + P1 快轮询条目
+   * 单独调用;幂等)。 */
+  const markMultiDispute = (n: Notable): void => {
+    if ((state.resetSeen[n.qid]?.n ?? 0) >= 2) n.multiDispute = true;
+  };
+
   // Enrich each with title + official context read straight from the chain.
   // Past the time budget the remaining items go out un-enriched (title=null,
   // stance none) — a degraded but timely alert beats a tick killed by timeout
@@ -630,8 +693,9 @@ async function main(): Promise<void> {
     item.title = meta.title;
     item.description = meta.description;
     try {
-      const { updates } = await getOfficialUpdates({ resolvedBy: item.adapter, questionID: item.qid });
+      const { updates, untrusted } = await getTrustedOfficialUpdates({ resolvedBy: item.adapter, questionID: item.qid });
       item.enriched = true;
+      item.untrustedCreator = untrusted || undefined;
       item.updateCount = updates.length;
       item.updates = updates;
       item.refundClause = detectRefundClause(updates.map((u) => u.text));
@@ -660,6 +724,10 @@ async function main(): Promise<void> {
   for (const [qid, w] of Object.entries(state.v2Watch)) {
     if (nowMs - w.firstSeenAt > V2_WATCH_TTL_MS) delete state.v2Watch[qid];
   }
+  // resetSeen 修剪:争议流程以天计,30 天无新 reset 即过期(防 state 无界膨胀)。
+  for (const [qid, r] of Object.entries(state.resetSeen)) {
+    if (nowMs - r.at > 30 * 24 * 3600_000) delete state.resetSeen[qid];
+  }
   {
     const keys = Object.keys(state.v2Watch);
     if (keys.length > V2_WATCH_MAX) {
@@ -675,7 +743,7 @@ async function main(): Promise<void> {
     if (elapsed() > ENRICH_BUDGET_MS) break;
     w.lastPolledAt = Date.now();
     try {
-      const { updates } = await getOfficialUpdates({ resolvedBy: w.adapter, questionID: qid });
+      const { updates } = await getTrustedOfficialUpdates({ resolvedBy: w.adapter, questionID: qid });
       v2Polled += 1;
       if (updates.length <= w.updateCount) continue;
       w.updateCount = updates.length;
@@ -933,7 +1001,7 @@ async function main(): Promise<void> {
     if (llmBudgetLeftMs() < LLM_MIN_CALL_MS) break;
     let updates: OfficialUpdate[] = [];
     try {
-      ({ updates } = await getOfficialUpdates({ resolvedBy: p.adapter, questionID: qid }));
+      ({ updates } = await getTrustedOfficialUpdates({ resolvedBy: p.adapter, questionID: qid }));
     } catch {
       // RPC 瞬断 — 留队,下轮再试(attempts 照常累积,防永久滞留)
     }
@@ -1061,6 +1129,7 @@ async function main(): Promise<void> {
       for (const k of pendingKeys.slice(0, pendingKeys.length - 50)) delete state.llmPending[k];
     }
   }
+  for (const n of mailable) markMultiDispute(n);
   const suppressedItems = notable.filter((n) => !mailable.includes(n));
   const suppressed = suppressedItems.length;
   const degraded = mailable.filter((n) => !n.enriched).length;
@@ -1309,6 +1378,7 @@ async function main(): Promise<void> {
         stance: n.stance,
         llmStance: n.llm?.stance ?? null,
         llmConfidence: n.llm?.confidence ?? null,
+        llmEventStatus: n.llm?.eventStatus ?? null,
         bestAskAtSignal: e.bestAsk,
         dirMethod: e.dirMethod,
         negRisk: e.negRisk,
@@ -1487,7 +1557,7 @@ async function main(): Promise<void> {
         html: `<div style="font-family:system-ui,sans-serif;max-width:640px">
           <p>官方文本承诺了定时澄清(bt5/C1:该模板 79/80 在承诺时点 ±1 分钟内兑现,提前量中位 1.55h):</p>
           <table style="width:100%;border-collapse:collapse">${rows}</table>
-          <p style="font-size:12px;color:#888">系统将在各承诺时点 −${PREARM_EARLY_MS / 60_000}min/+${PREARM_LATE_MS / 60_000}min 窗口内以 ${PREARM_POLL_MS / 1000}s 间隔快轮询,裁定落地即发 ⏰ 邮件;时点过后无文本 = 官方兑现"无澄清"(digest 留痕)。注意:预告模板家族属绿档负收益家族(bt5/E3b:均值 −5.5%·零肥尾),届时信号请按注解审慎对待。</p>
+          <p style="font-size:12px;color:#888">系统将在各承诺时点 −${PREARM_EARLY_MS / 60_000}min/+${PREARM_LATE_MS / 60_000}min 窗口内以 ${PREARM_POLL_MS / 1000}s 间隔快轮询,裁定落地即发 ⏰ 邮件;时点过后无文本 = 官方兑现"无澄清"(digest 留痕)。注意:预告模板家族肉在落地瞬间(2026-07-14 研究:簇级 meat 中位 9~17pp),自动执行走三闸门制(boundary/防雷/白名单),当前为 paper 验证期。</p>
         </div>`,
         text: pending
           .map(([qid, e]) => `${e.title ?? qid} | 承诺时点 ${new Date(e.commitAtMs).toISOString()} | "${e.quote.slice(0, 120)}"`)
@@ -1591,7 +1661,7 @@ async function main(): Promise<void> {
       for (const [qid, e] of targets) {
         if (elapsed() >= PREARM_LOOP_END_MS) break;
         try {
-          const { updates } = await getOfficialUpdates({ resolvedBy: e.adapter, questionID: qid });
+          const { updates } = await getTrustedOfficialUpdates({ resolvedBy: e.adapter, questionID: qid });
           polls += 1;
           if (updates.length <= e.updateCountAtArm) continue;
           // 承诺兑现:新官方文本落地。与主闸门同语义的完整判读。
@@ -1612,6 +1682,7 @@ async function main(): Promise<void> {
           };
           applyStanceFromUpdates(item);
           annotateTextMarkers(item);
+          markMultiDispute(item);
           if (wallBudgetLeftMs() >= LLM_MIN_CALL_MS) item.llm = await consultLlm(item);
           else llmSkipped += 1;
           // M4 语义(审查 major):判读无定论(CLI 失败/预算跳过)且正则无方向时
@@ -1710,12 +1781,13 @@ async function main(): Promise<void> {
               <div style="font-weight:600">${escapeHtml(item.title ?? qid)}</div>
               <div style="margin-top:4px">${isDirectionalStance(item.stance) ? `<b style="color:#d97706">官方方向: ${escapeHtml(item.stance)} (${escapeHtml(item.confidence)})</b>` : `正则立场: ${escapeHtml(item.stance)} (${escapeHtml(item.confidence)})`}</div>
               ${item.correction ? `<div style="margin-top:2px;font-size:13px;color:#dc2626"><b>🔄 此文本更正/撤回此前裁定 —— 核对新旧方向后再动。</b></div>` : ""}
+              ${item.multiDispute && (isDirectionalStance(item.stance) || (item.llm != null && isDirectionalStance(item.llm.stance))) ? `<div style="margin-top:2px;font-size:13px;color:#d97706"><b>🚩 多轮 dispute ∧ 方向性澄清(Dota 形态)—— 下单前人工核对结算源数字。</b></div>` : ""}
               ${llmLine}
               ${execLine}
               ${tradeLineHtml(item)}
               ${item.excerpt ? `<div style="font-size:12px;color:#aaa;margin-top:4px">"${escapeHtml(item.excerpt)}"</div>` : ""}
               <div style="margin-top:4px"><a href="${searchUrl}">在 Polymarket 搜索</a> · qid ${escapeHtml(qid.slice(0, 10))}…</div>
-              <p style="font-size:12px;color:#888">盘口为发信时刻快照;预告模板家族属绿档负收益家族(bt5/E3b),审慎对待。</p>
+              <p style="font-size:12px;color:#888">盘口为发信时刻快照;预告模板家族自动执行走三闸门制(2026-07-14 研究,paper 验证期),执行结果见上方注解。</p>
             </div>`,
             text: `预告兑现 +${latencyS}s | ${item.title ?? qid} | ${pr.label} | stance=${item.stance}(${item.confidence})${item.llm && isDirectionalStance(item.llm.stance) ? ` llm=${item.llm.stance}(${item.llm.confidence})` : ""}${item.exec?.bestAsk != null ? ` ask=${item.exec.bestAsk.toFixed(3)}` : ""}${tradeTextBit(item)}`,
           });
@@ -1752,7 +1824,7 @@ async function main(): Promise<void> {
           .join("\n");
         await sendMail({
           subject: `[PredEdge链上] ⏰预告批量兑现 ×${batchPending.size}(同刻姊妹市场合并)`,
-          html: `<div style="font-family:system-ui,sans-serif;max-width:640px"><p>本 tick 兑现超过 ${PREARM_FIRE_SOLO_MAX} 个(批量定时澄清),余下合并如下:</p><table style="width:100%;border-collapse:collapse">${rows}</table><p style="font-size:12px;color:#888">盘口为检出时刻快照;预告模板家族属绿档负收益家族(bt5/E3b),审慎对待。</p></div>`,
+          html: `<div style="font-family:system-ui,sans-serif;max-width:640px"><p>本 tick 兑现超过 ${PREARM_FIRE_SOLO_MAX} 个(批量定时澄清),余下合并如下:</p><table style="width:100%;border-collapse:collapse">${rows}</table><p style="font-size:12px;color:#888">盘口为检出时刻快照;预告模板家族自动执行走三闸门制(2026-07-14 研究,paper 验证期),执行结果见各行注解。</p></div>`,
           text: [...batchPending.entries()]
             .map(([qid, { item, latencyS }]) => `${item.title ?? qid} | ${priorityOf(item).label} | +${latencyS}s | stance=${item.stance}`)
             .join("\n"),
@@ -1787,6 +1859,8 @@ async function main(): Promise<void> {
         from,
         to: sweptTo,
         events: logs.length,
+        non_official_dropped: nonOfficialDropped || undefined,
+        untrusted_creator: notable.filter((n) => n.untrustedCreator).length || undefined,
         notified,
         queued_digest: digested.length,
         digest_queue: state.digestQueue.length,
@@ -1883,11 +1957,20 @@ async function main(): Promise<void> {
       const correctionLine = n.correction
         ? `<div style="margin-top:2px;font-size:13px;color:#dc2626"><b>🔄 此文本更正/撤回此前裁定 —— 市场可能仍按旧裁定定价(bt5/E2:历史全部真方向翻转均为此形态),核对新旧方向后再动。</b></div>`
         : "";
+      const untrustedLine = n.untrustedCreator
+        ? `<div style="margin-top:2px;font-size:13px;color:#dc2626"><b>🚫 市场 creator 非官方发布地址 —— context 文本不可信已丢弃(判读/下单已隔离),人工核对后再动。</b></div>`
+        : "";
+      const multiDisputeLine =
+        n.multiDispute && (isDirectionalStance(n.stance) || (n.llm != null && isDirectionalStance(n.llm.stance)))
+          ? `<div style="margin-top:2px;font-size:13px;color:#d97706"><b>🚩 多轮 dispute(QuestionReset≥2)∧ 方向性澄清 —— Dota 形态红旗:官方解释性裁决若与结算源数字矛盾,是 15 个月唯一无退款损失形态,下单前人工核对结算源数字。</b></div>`
+          : "";
       return `<tr>
         <td style="padding:8px;border-bottom:1px solid #333">
           <div style="font-weight:600">${escapeHtml(n.title ?? n.qid)}</div>
           <div style="font-size:12px;color:#888">${kindLabel} · updates=${n.updateCount}${n.refundClause ? " · ⚠️refund条款" : ""}${degradedTag}</div>
           <div style="margin-top:4px">${stanceLine}</div>
+          ${untrustedLine}
+          ${multiDisputeLine}
           ${correctionLine}
           ${llmLine}
           ${execLine}

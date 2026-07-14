@@ -21,6 +21,22 @@ const SELECTORS = {
   getUpdates: "0x555c56fc",
 };
 
+/** 官方 context 发布地址白名单(2026-07-14 官方行为研究,15 个月全量事件级
+ * 考证):0x9143=2024-03→2026-05-21 主发布地址;0xf43d=2026-05-22 起接管;
+ * 0xac99=2026-05-18 批量提前结算 ops。AncillaryDataUpdated 任何地址都能发
+ * (updates 按 (questionID, owner) 分桶),链上已实测到掐着官方澄清前 4 秒
+ * 抢发反向文本的对抗案例(Peng 案)与机器人测试文本——非白名单 owner 的
+ * 事件与 creator 一律不得进入判读/交易路径。 */
+export const OFFICIAL_CONTEXT_OWNERS: ReadonlySet<string> = new Set([
+  "0xf43d55f3a8b7484ed4b6931f93cb6f9ef5dd369d",
+  "0x91430cad2d3975766499717fa0d66a78d814e5c5",
+  "0xac9930b2ae455a671b62de86876a7e8587825294",
+]);
+
+export function isOfficialContextOwner(addr: string | null | undefined): boolean {
+  return !!addr && OFFICIAL_CONTEXT_OWNERS.has(addr.toLowerCase());
+}
+
 /** A disputed market priced at an extreme implies the leading side even when
  * the official text is absent or carries no parseable direction. */
 const PRICE_FALLBACK_MIN = 0.9;

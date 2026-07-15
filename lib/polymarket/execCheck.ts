@@ -11,15 +11,30 @@
  *
  * Fail-open by design: chain-watch's job is the timely alert; Gamma/CLOB sit
  * behind the box's proxy and may be down when the chain is fine. Every
- * failure returns null and the alert goes out un-annotated. Neg-risk events
- * (qid = negRiskRequestID, whose conditionId derives from the NegRiskAdapter
- * instead) miss the condition_ids lookup and fall through to question_ids;
- * if both miss we return null rather than guessing.
+ * failure returns null and the alert goes out un-annotated.
+ *
+ * Neg-risk resolution (2026-07-15, SOOP 九盘考证): for neg-risk events the
+ * on-chain qid is the negRiskRequestID — it matches neither Gamma's
+ * questionID (= NegRiskOperator marketId+index) nor the regular conditionId
+ * formula, so both Gamma routes structurally miss. The real chain is
+ * adapter.ctf() → NegRiskOperator (V3.1 → 0x71523d0f…, V4 → 0x661992ae…),
+ * operator.questionIds(requestId) → neg-risk questionId, conditionId =
+ * keccak256(NegRiskAdapter 0xd91E80cF… ‖ questionId ‖ 2). Detection is
+ * adaptive — a regular adapter's ctf() is ConditionalTokens, whose
+ * questionIds(qid) call returns empty/zero and we fall through — so no
+ * neg-risk adapter allowlist to maintain. Verified on-chain 9/9 against the
+ * SOOP batch plus a live V3.1 market (derived cid == Gamma conditionId).
+ *
+ * Archived/delisted markets (Gamma hides archived rows entirely — the SOOP
+ * batch was only visible on CLOB) fall back to CLOB /markets/<conditionId>,
+ * mapped into the GammaMarket shape with closed=true unless the book is
+ * genuinely tradable.
  *
  * Env: EXEC_CHECK=off disables (annotation absent, alerts unaffected).
  */
 import { GAMMA_API, CLOB_API } from "./config";
 import { conditionIdFor } from "./keccak";
+import { ethCall } from "./oracleState";
 import type { GammaMarket, OrderBook } from "../types";
 
 export const MIN_EXEC_USD = 100;
@@ -129,31 +144,135 @@ export function directionalOutcomeIndex(
   return null;
 }
 
+/** NegRiskAdapter(经典部署,V3.1/V4 两家 operator 的 nrAdapter() 均指向它,
+ * 2026-07-15 链上实测)——neg-risk CTF condition 的 oracle。 */
+export const NEG_RISK_ADAPTER = "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296";
+/** ctf() —— UMA adapter 的 CTF 指针;neg-risk 部署上它指向 NegRiskOperator。 */
+export const CTF_SELECTOR = "0x22a9339f";
+/** questionIds(bytes32) —— NegRiskOperator 的 requestId→questionId 映射。 */
+export const QUESTION_IDS_SELECTOR = "0xdc89a198";
+
+export function deriveNegRiskConditionId(negRiskQuestionId: string): string {
+  return conditionIdFor(NEG_RISK_ADAPTER, negRiskQuestionId);
+}
+
+/** adapter → ctf() 地址。只缓存成功结果:RPC 瞬断不能被永久记成"非 neg-risk"。 */
+const ctfAddressCache = new Map<string, string>();
+
+/** neg-risk 家族的 qid(= negRiskRequestID)→ 真 conditionId。自适应探测:
+ * 常规 adapter 的 ctf() 是 ConditionalTokens,questionIds 调用返回空/零 →
+ * null(非 neg-risk)。任何 RPC 失败也返回 null(fail-open,下轮再试)。 */
+async function negRiskConditionId(adapter: string, qid: string): Promise<string | null> {
+  try {
+    const key = adapter.toLowerCase();
+    let ctfAddr = ctfAddressCache.get(key) ?? null;
+    if (!ctfAddr) {
+      const raw = (await ethCall(adapter, CTF_SELECTOR)).toLowerCase();
+      if (!/^0x0{24}[0-9a-f]{40}$/.test(raw)) return null;
+      ctfAddr = `0x${raw.slice(-40)}`;
+      ctfAddressCache.set(key, ctfAddr);
+    }
+    const nrQid = (await ethCall(ctfAddr, QUESTION_IDS_SELECTOR + qid.slice(2).toLowerCase())).toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(nrQid) || /^0x0{64}$/.test(nrQid)) return null;
+    return deriveNegRiskConditionId(nrQid);
+  } catch {
+    return null;
+  }
+}
+
+/** CLOB /markets/<cid> 响应 → GammaMarket 形状(纯转换,供测试)。归档/下架
+ * 市场 Gamma 完全不列(SOOP 批只在 CLOB 可见),这是它们唯一的可见面。
+ * `closed` 语义收紧为"不可交易":closed/archived/book 关闭任一命中即 true,
+ * 下游 maybeExecuteTrade 的 e.closed 分支与 paper 登记闸门都依赖它兜底。 */
+export function clobToGammaMarket(m: {
+  condition_id?: string;
+  question?: string;
+  market_slug?: string;
+  end_date_iso?: string | null;
+  active?: boolean;
+  closed?: boolean;
+  archived?: boolean;
+  enable_order_book?: boolean;
+  neg_risk?: boolean;
+  tokens?: Array<{ token_id?: string; outcome?: string }>;
+}): GammaMarket | null {
+  const tokens = Array.isArray(m.tokens) ? m.tokens : [];
+  if (!m.condition_id || tokens.length === 0 || !tokens.every((t) => t.token_id && t.outcome)) {
+    return null;
+  }
+  const tradable = m.enable_order_book === true && m.archived !== true && m.closed !== true;
+  return {
+    id: "",
+    question: m.question ?? "",
+    conditionId: m.condition_id,
+    slug: m.market_slug ?? "",
+    endDate: m.end_date_iso ?? null,
+    active: m.active === true,
+    closed: !tradable,
+    enableOrderBook: m.enable_order_book,
+    archived: m.archived,
+    outcomes: JSON.stringify(tokens.map((t) => String(t.outcome))),
+    clobTokenIds: JSON.stringify(tokens.map((t) => String(t.token_id))),
+    negRisk: m.neg_risk === true,
+    // CLOB /markets 不含这三个 Gamma 字段;execCheck 不读它们,置空即可。
+    outcomePrices: "[]",
+    volume: "0",
+    liquidity: "0",
+  };
+}
+
+async function clobLookup(cid: string): Promise<GammaMarket | null> {
+  try {
+    const m = await fetchJson<Parameters<typeof clobToGammaMarket>[0]>(`${CLOB_API}/markets/${cid}`);
+    if (m?.condition_id?.toLowerCase() !== cid.toLowerCase()) return null;
+    return clobToGammaMarket(m);
+  } catch {
+    return null;
+  }
+}
+
 async function lookupMarket(adapter: string, qid: string): Promise<GammaMarket | null> {
   const cid = conditionIdFor(adapter, qid);
-  try {
-    const byCid = await fetchJson<GammaMarket[] | null>(
-      `${GAMMA_API}/markets?condition_ids=${cid}&limit=2`
-    );
-    const hit = (Array.isArray(byCid) ? byCid : []).find(
-      (m) => m.conditionId?.toLowerCase() === cid.toLowerCase()
-    );
-    if (hit) return hit;
-  } catch {
-    // fall through to question_ids
+  // Gamma 默认不返回已关闭行(存量洞:condition_ids 须带 closed=true 才命中
+  // 已结算市场),每路都查两种口径。网络层一旦抛错(≠查空)说明 Gamma 整体
+  // 不可达,跳过其余 Gamma 路由直奔兜底 —— 避免注解循环在断网 tick 上把
+  // 每个 6s 超时都吃满。
+  let gammaDown = false;
+  const gammaFind = async (
+    params: string,
+    match: (m: GammaMarket) => boolean
+  ): Promise<GammaMarket | null> => {
+    if (gammaDown) return null;
+    try {
+      const rows = await fetchJson<GammaMarket[] | null>(`${GAMMA_API}/markets?${params}`);
+      return (Array.isArray(rows) ? rows : []).find(match) ?? null;
+    } catch {
+      gammaDown = true;
+      return null;
+    }
+  };
+  const byCid = (m: GammaMarket) => m.conditionId?.toLowerCase() === cid.toLowerCase();
+  const byQid = (m: GammaMarket) => m.questionID?.toLowerCase() === qid.toLowerCase();
+  const regular =
+    (await gammaFind(`condition_ids=${cid}&limit=2`, byCid)) ??
+    (await gammaFind(`condition_ids=${cid}&closed=true&limit=2`, byCid)) ??
+    (await gammaFind(`question_ids=${qid}&limit=2`, byQid)) ??
+    (await gammaFind(`question_ids=${qid}&closed=true&limit=2`, byQid));
+  if (regular) return regular;
+
+  // neg-risk 家族:qid 是 negRiskRequestID,常规两路必然落空 → operator 映射
+  // 推导真 conditionId。推导成功即权威(operator 认得这个 requestId),不再
+  // 回落常规 cid 的 CLOB 查询。
+  const nrCid = await negRiskConditionId(adapter, qid);
+  if (nrCid) {
+    const byNrCid = (m: GammaMarket) => m.conditionId?.toLowerCase() === nrCid.toLowerCase();
+    const viaGamma =
+      (await gammaFind(`condition_ids=${nrCid}&limit=2`, byNrCid)) ??
+      (await gammaFind(`condition_ids=${nrCid}&closed=true&limit=2`, byNrCid));
+    return viaGamma ?? (await clobLookup(nrCid));
   }
-  try {
-    const byQid = await fetchJson<GammaMarket[] | null>(
-      `${GAMMA_API}/markets?question_ids=${qid}&limit=2`
-    );
-    const hit = (Array.isArray(byQid) ? byQid : []).find(
-      (m) => m.questionID?.toLowerCase() === qid.toLowerCase()
-    );
-    if (hit) return hit;
-  } catch {
-    // both routes failed
-  }
-  return null;
+  // 常规市场的归档兜底:Gamma 不列 archived 行,CLOB 是唯一可见面。
+  return clobLookup(cid);
 }
 
 /**

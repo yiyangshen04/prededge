@@ -140,8 +140,12 @@ const FLOOD_MAX = Number(process.env.CHAIN_WATCH_FLOOD_MAX) || 12;
 const DIGEST_MAX_AGE_MS = 6 * 3600_000;
 const DIGEST_MAX_SIZE = 40;
 
-/** 每 tick 最多做几个盘口核查(I1) —— 每个约 2-4 次代理往返。 */
-const EXEC_ANNOTATE_MAX = 6;
+/** 每 tick 最多做几个盘口核查(I1)—— 每个约 2-4 次代理往返(negRisk 再加
+ * ≤2 次直连 ethCall)。2026-07-15 SOOP 批 9 个姊妹盘只注解上 6 个,唯一 YES
+ * 腿(批量澄清里仅有的肥尾腿)排第 8 连查询都没轮上 → 提到 12。断网 tick
+ * 不会因此把预算吃满:lookupMarket 首个 Gamma 网络错误即短路其余 Gamma 路由,
+ * 且循环内每项之间有 llmBudgetLeftMs 早停守卫。 */
+const EXEC_ANNOTATE_MAX = 12;
 
 // ── bt5 标记点落地(P1/P2/P3, 2026-07-10)的常量 ──
 
@@ -1162,14 +1166,27 @@ async function main(): Promise<void> {
   // §2.3:mailable 原序是事件发现序 —— 忙 tick 时 🟢 候选排位靠后拿不到盘口
   // 注解,maybeExecuteTrade 因无 exec 静默不执行。先按档位排序再切片(此刻
   // exec 未注解,rank 用无盘口口径判定,足以把 🟢/🔄 排到前面)。
-  const annotateOrder = [...mailable].sort((a, b) => priorityOf(a).rank - priorityOf(b).rank);
+  // 同档内 YES 腿优先(2026-07-15 SOOP 批教训):negRisk 批量澄清一次打出 N
+  // 个姊妹盘,N−1 个 NO 腿 ask 早已贴 1、肉全在唯一的 YES 腿上 —— 它按事件
+  // 发现序恰好排最后就整批白给。无方向腿(注解循环里本来就 continue)沉底,
+  // 不再空占注解名额。
+  const effDirectionalStance = (n: Notable): string | null =>
+    isDirectionalStance(n.stance)
+      ? n.stance
+      : n.llm && isDirectionalStance(n.llm.stance)
+        ? n.llm.stance
+        : null;
+  const annotatePriority = (n: Notable): number => {
+    const eff = effDirectionalStance(n);
+    if (eff == null) return 2; // 无方向:不会被注解,沉底
+    return stancePolarity(eff) === "+" ? 0 : 1;
+  };
+  const annotateOrder = [...mailable].sort(
+    (a, b) => priorityOf(a).rank - priorityOf(b).rank || annotatePriority(a) - annotatePriority(b)
+  );
   for (const item of annotateOrder.slice(0, EXEC_ANNOTATE_MAX)) {
     if (llmBudgetLeftMs() < 10_000) break;
-    const effStance = isDirectionalStance(item.stance)
-      ? item.stance
-      : item.llm && isDirectionalStance(item.llm.stance)
-        ? item.llm.stance
-        : null;
+    const effStance = effDirectionalStance(item);
     if (!effStance) continue;
     item.exec = await checkExecutability({ adapter: item.adapter, qid: item.qid, stance: effStance });
     execChecked += 1;

@@ -55,9 +55,13 @@ export interface TierOptions {
   boundaryGuardOn: boolean;
 }
 
+/** fail-closed(2026-07-19 审查 §10,与 tradeExecutor 预告家族闸1 同条件):
+ * eventStatus=null 是 llmStance 设计内状态(v3 回复/字段缺失),原 ===
+ * "pending" 对 null/unclear 放行。leans ∧ 未确认已决一律按边界未决降档。 */
 const boundaryPending = (n: TierInput, opts: TierOptions): boolean =>
   opts.boundaryGuardOn &&
-  n.llm?.eventStatus === "pending" &&
+  n.llm != null &&
+  n.llm.eventStatus !== "decided" &&
   (/^leans_/i.test(n.llm.stance) || /^leans_/i.test(n.stance));
 
 function basePriorityOf(n: TierInput, opts: TierOptions): TierVerdict {

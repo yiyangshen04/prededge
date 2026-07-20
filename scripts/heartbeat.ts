@@ -105,6 +105,20 @@ function saveState(state: HeartbeatState): void {
   writeFileAtomic(STATE_FILE, JSON.stringify(state, null, 1) + "\n");
 }
 
+/** 顺手项(2026-07-19 审查):claude 探针时间戳单独即时落盘 —— 探针是真实
+ * 计费调用,只靠 tick 末尾的 saveState 的话,探针后任何一步挂死/被杀都会丢
+ * 时间戳,下 tick 重复烧一次探针。只回写这一个字段:alert 翻转必须等发信
+ * 成功才落盘(at-least-once),整个 state 不能提前保存。 */
+function persistClaudeProbeAt(at: string | null): void {
+  try {
+    const onDisk = loadState();
+    onDisk.lastClaudeProbeAt = at;
+    saveState(onDisk);
+  } catch {
+    // 尽力而为:失败的代价只是可能多探针一次
+  }
+}
+
 // ── 工具 ──
 
 function fmtTime(d: Date): string {
@@ -288,6 +302,7 @@ async function watch(): Promise<void> {
     const last = state.lastClaudeProbeAt ? Date.parse(state.lastClaudeProbeAt) : 0;
     if (Date.now() - last > 55 * 60_000) {
       state.lastClaudeProbeAt = new Date().toISOString();
+      persistClaudeProbeAt(state.lastClaudeProbeAt); // 探针发起前即落盘,防重复计费探针
       const { ok, detail } = await probeClaude();
       const fails = ok ? 0 : (state.probeFails[CLAUDE_KEY] ?? 0) + 1;
       state.probeFails[CLAUDE_KEY] = fails;

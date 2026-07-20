@@ -498,6 +498,10 @@ export interface PaperTrade {
   pnlPct: number | null;
   createdAt: string;
   resolvedAt: string | null;
+  /** execCheck 方向映射方法(后加列,存量行为 null)。 */
+  dirMethod?: string | null;
+  /** 登记时刻的闸门/判读快照(后加列 JSON;预告家族 go/no-go 分层用)。 */
+  gateMeta?: Record<string, unknown> | null;
 }
 
 // ── Scan run summary ──

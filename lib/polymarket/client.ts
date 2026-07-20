@@ -393,18 +393,26 @@ export class PolymarketClient {
       const batch = chunks.slice(i, i + concurrency);
       const pages = await Promise.all(
         batch.map(async (chunk) => {
-          const params = new URLSearchParams();
-          for (const id of chunk) params.append("condition_ids", id);
-          params.set("limit", String(chunk.length));
-          // Don't restrict by active/closed — we want to see BOTH resolved and open
-          try {
-            const data = await this.fetchJson<GammaMarket[] | null>(
-              `${GAMMA_API}/markets?${params}`
-            );
-            return Array.isArray(data) ? data : [];
-          } catch {
-            return [];
+          // Gamma 的 condition_ids= 默认查询对已 closed 市场返回空(2026-07-11
+          // tradeExecutor 实测):只发默认查询时,已结算市场永远查不到,paper
+          // 单因此终身 open。每 chunk 双查询(默认 + closed=true)合并 ——
+          // 与 probeAndRecordSettlement / backfill-taker-fee 的口径一致。
+          const merged: GammaMarket[] = [];
+          for (const closed of [false, true]) {
+            const params = new URLSearchParams();
+            for (const id of chunk) params.append("condition_ids", id);
+            params.set("limit", String(chunk.length));
+            if (closed) params.set("closed", "true");
+            try {
+              const data = await this.fetchJson<GammaMarket[] | null>(
+                `${GAMMA_API}/markets?${params}`
+              );
+              if (Array.isArray(data)) merged.push(...data);
+            } catch {
+              // 单口径失败不影响另一口径的结果
+            }
           }
+          return merged;
         })
       );
       for (const page of pages) {

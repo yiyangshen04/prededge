@@ -70,6 +70,18 @@ test("I4 边界闸门:pending∧leans_* 仅在 guard on 时降档", () => {
   assert.equal(priorityOf(n, { boundaryGuardOn: false }).tier, "green_fire");
 });
 
+test("I4 边界闸门 fail-closed(2026-07-19 §10):eventStatus null/unclear ∧ leans 同样降档,decided 才放行", () => {
+  const nullEs = input({ stance: "leans_YES", llm: llm({ stance: "leans_YES", eventStatus: null }) });
+  assert.equal(priorityOf(nullEs, OPTS).tier, "orange");
+  const unclear = input({ stance: "leans_YES", llm: llm({ stance: "leans_YES", eventStatus: "unclear" }) });
+  assert.equal(priorityOf(unclear, OPTS).tier, "orange");
+  const decided = input({ stance: "leans_YES", llm: llm({ stance: "leans_YES", eventStatus: "decided" }) });
+  assert.equal(priorityOf(decided, OPTS).tier, "green_fire");
+  // 非 leans 的确定方向不受 boundary 闸影响(eventStatus 未知照常 green)
+  const firmDir = input({ llm: llm({ eventStatus: null }) });
+  assert.equal(priorityOf(firmDir, OPTS).tier, "green_fire");
+});
+
 test("P2 更正:过闸保留绿档 tier(带🔄注解),未过闸是 correction 展示档", () => {
   const green = priorityOf(input({ correction: true }), OPTS);
   assert.equal(green.tier, "green_fire");

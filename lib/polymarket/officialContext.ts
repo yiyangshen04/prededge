@@ -171,10 +171,16 @@ function decodeUpdates(raw: string): OfficialUpdate[] {
 export async function getOfficialUpdates(input: {
   resolvedBy: string;
   questionID: string;
+  /** 可选墙钟预算(2026-07-19 审查 §5):两次串行 ethCall 无预算时最坏 ~120s,
+   * chain-watch 的 enrich 项会冲破 SIGTERM。前一半给 getQuestion,余量给
+   * getUpdates。 */
+  budgetMs?: number;
 }): Promise<{ updates: OfficialUpdate[]; creator: string | null }> {
+  const deadline = input.budgetMs != null ? Date.now() + Math.max(0, input.budgetMs) : null;
   const questionResult = await ethCall(
     input.resolvedBy,
-    `${SELECTORS.getQuestion}${input.questionID.slice(2)}`
+    `${SELECTORS.getQuestion}${input.questionID.slice(2)}`,
+    deadline == null ? undefined : Math.max(0, Math.floor((deadline - Date.now()) / 2))
   );
   const question = decodeQuestionWithCreator(questionResult);
   if (!question?.creator) return { updates: [], creator: null };
@@ -184,7 +190,11 @@ export async function getOfficialUpdates(input: {
     input.questionID.slice(2),
     addressArg(question.creator),
   ].join("");
-  const rawUpdates = await ethCall(input.resolvedBy, updateData);
+  const rawUpdates = await ethCall(
+    input.resolvedBy,
+    updateData,
+    deadline == null ? undefined : Math.max(0, deadline - Date.now())
+  );
   return {
     updates: decodeUpdates(rawUpdates).sort((a, b) => a.timestamp - b.timestamp),
     creator: question.creator,

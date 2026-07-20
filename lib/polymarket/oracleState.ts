@@ -107,10 +107,24 @@ function bytes32Ascii(value: string): string {
   return Buffer.from(value, "utf8").toString("hex").padEnd(64, "0");
 }
 
-export async function ethCall(to: string, data: string): Promise<string> {
+/**
+ * @param budgetMs 可选墙钟预算(2026-07-19 审查 §5):不传时每 URL 固定 10s
+ *   串行 4-6 个 URL,单次最坏 ~60s —— chain-watch 单 enrich 项 3 次 ethCall
+ *   最坏可冲破 170s SIGTERM。传入后单 URL 超时取
+ *   min(10s, 剩余预算/剩余URL数),预算耗尽即停止尝试后续 URL。
+ */
+export async function ethCall(to: string, data: string, budgetMs?: number): Promise<string> {
   let lastError: Error | null = null;
+  const urls = rpcUrls();
+  const deadline = budgetMs != null ? Date.now() + Math.max(0, budgetMs) : null;
 
-  for (const rpc of rpcUrls()) {
+  for (let i = 0; i < urls.length; i += 1) {
+    const rpc = urls[i];
+    let perUrlMs = 10_000;
+    if (deadline != null) {
+      perUrlMs = Math.min(10_000, Math.floor((deadline - Date.now()) / (urls.length - i)));
+      if (perUrlMs < 300) break; // 预算耗尽:剩余 URL 不再尝试,抛最后错误
+    }
     try {
       // AbortSignal.timeout bounds the whole call (headers AND body). Without
       // it, a proxy black-hole (connection established, no response) would
@@ -126,7 +140,7 @@ export async function ethCall(to: string, data: string): Promise<string> {
           method: "eth_call",
           params: [{ to, data }, "latest"],
         }),
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.timeout(perUrlMs),
       });
       const json = (await res.json()) as {
         result?: string;

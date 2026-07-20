@@ -108,6 +108,12 @@ export async function sendMail({
     port: cfg.port,
     secure: cfg.secure,
     auth: { user: cfg.user, pass: cfg.authCode },
+    // 无超时的发信路径会在代理半开连接上挂到 TCP 默认(可达数十分钟),把
+    // chain-watch 整 tick 拖过 SIGTERM —— 哨兵与告警一起死。verifySmtp 已设
+    // 超时,发信路径同样兜底;socketTimeout 盖 DATA 阶段的慢滴。
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 60_000,
   });
 
   const info = await transporter.sendMail({

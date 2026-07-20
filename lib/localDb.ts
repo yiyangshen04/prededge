@@ -248,8 +248,26 @@ export function getDb(): DatabaseSync {
 	  `);
 
   ensureOpportunityColumns(db);
+  ensurePaperTradeColumns(db);
 
   return db;
+}
+
+/** paper_trades 后加列(2026-07-19 审查 §11):dir_method 与三闸门快照。8 月
+ * 预告家族 go/no-go 需要按 dirMethod/闸门结果分层,登记时不留痕就只能事后
+ * 用裸均值糊(决策失真)。 */
+function ensurePaperTradeColumns(database: DatabaseSync) {
+  const rows = database.prepare("PRAGMA table_info(paper_trades)").all();
+  const existing = new Set(rows.map((row) => String(row.name)));
+  const columns: Array<[string, string]> = [
+    ["dir_method", "dir_method TEXT"],
+    ["gate_meta", "gate_meta TEXT"],
+  ];
+  for (const [name, ddl] of columns) {
+    if (!existing.has(name)) {
+      database.exec(`ALTER TABLE paper_trades ADD COLUMN ${ddl}`);
+    }
+  }
 }
 
 function ensureOpportunityColumns(database: DatabaseSync) {
@@ -442,6 +460,8 @@ function paperTradeFromRow(row: Record<string, unknown>): PaperTrade {
     pnlPct: row.pnl_pct == null ? null : Number(row.pnl_pct),
     createdAt: String(row.created_at),
     resolvedAt: row.resolved_at == null ? null : String(row.resolved_at),
+    dirMethod: row.dir_method == null ? null : String(row.dir_method),
+    gateMeta: fromJson<Record<string, unknown> | null>(row.gate_meta, null),
   };
 }
 
@@ -664,6 +684,10 @@ export function insertPaperTrade(input: {
   avgFillPrice: number;
   worstFillPrice: number;
   fills: Fill[];
+  /** execCheck 方向映射方法(2026-07-19 审查 §11:事后按映射可信度分层)。 */
+  dirMethod?: string | null;
+  /** 登记时刻的闸门/判读快照(JSON;预告家族 8 月 go/no-go 按此分层)。 */
+  gateMeta?: Record<string, unknown> | null;
 }): PaperTrade {
   const id = randomUUID();
   const createdAt = nowIso();
@@ -673,8 +697,8 @@ export function insertPaperTrade(input: {
       `INSERT INTO paper_trades (
         id, condition_id, token_id, market_question, outcome_bought,
         market_url, end_date, usd_amount, shares, avg_fill_price,
-        worst_fill_price, fills, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        worst_fill_price, fills, status, created_at, dir_method, gate_meta
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       id,
@@ -690,7 +714,9 @@ export function insertPaperTrade(input: {
       input.worstFillPrice,
       toJson(input.fills),
       "open",
-      createdAt
+      createdAt,
+      input.dirMethod ?? null,
+      input.gateMeta == null ? null : toJson(input.gateMeta)
     );
 
   return {
@@ -712,6 +738,8 @@ export function insertPaperTrade(input: {
     pnlPct: null,
     createdAt,
     resolvedAt: null,
+    dirMethod: input.dirMethod ?? null,
+    gateMeta: input.gateMeta ?? null,
   };
 }
 

@@ -56,6 +56,7 @@ import { checkExecutability, stancePolarity, type ExecCheck } from "../lib/polym
 import {
   executeSignal,
   executionMode,
+  execConfig,
   reconcileSettlements,
   markSettlementsNotified,
   type TradeAttempt,
@@ -63,6 +64,7 @@ import {
 import { priorityOf as tierOf, isGreen, isFatTailShape, type TierVerdict } from "../lib/polymarket/tiering";
 import { isDirectionalStance } from "../lib/virtualTags";
 import { KNOWN_ADAPTERS } from "../lib/polymarket/onchainEvents";
+import { guardHeadJump } from "../lib/polymarket/headGuard";
 import { writeFileAtomic } from "../lib/fsAtomic";
 
 /** Full HTML entity escape for any chain-sourced string spliced into email
@@ -249,6 +251,18 @@ interface LlmPendingEntry {
   mailedDirectional?: boolean;
 }
 
+/** §12(2026-07-19 审查):enrich 失败(RPC 瞬断/预算耗尽)的事件此前只降级
+ * 发信一次,指纹随后提交、官方文本永不补读 —— 官方最终裁定往往是市场的最后
+ * 一个事件,漏掉的恰是肥尾。与 llmPending 同构:入队限量重试,成功后构造
+ * 完整 Notable 合入 byQid 重新过闸(指纹含 updateCount,补全后必然不同),
+ * 超限放弃时进 digest 显式留痕。 */
+interface PendingEnrichEntry {
+  adapter: string;
+  kinds: string[];
+  attempts: number;
+  firstSeenAt: number;
+}
+
 /** I7: a V2-adapter question being polled for storage-only context updates. */
 interface V2WatchEntry {
   adapter: string;
@@ -306,6 +320,10 @@ interface PreArmEntry {
   firedAtMs?: number;
   /** 窗口外经常规扫描看到过新文本(承诺被提前兑现/中途插入其他文本)。 */
   sawUpdate?: boolean;
+  /** §13(2026-07-19 审查):首轮盘口注解的 bestAsk 锚。重试轮(RPC/判读失败
+   * 后重新检出)不得重锚 —— 落地后价格单调走高,重锚即追高,漂移带守卫被
+   * 架空。null = 首轮注解时确实无盘口;undefined = 尚未注解过。 */
+  anchorAsk?: number | null;
 }
 
 /** P1:该条目在"当前预埋代"(updateCountAtArm 所指的承诺)内是否已兑现发信。
@@ -322,6 +340,8 @@ interface WatchState {
   notified: Record<string, string>;
   /** qid → LLM re-read queue (see LlmPendingEntry). */
   llmPending: Record<string, LlmPendingEntry>;
+  /** qid → enrich 失败重读队列(see PendingEnrichEntry,§12)。 */
+  pendingEnrich: Record<string, PendingEnrichEntry>;
   /** qid → V2 storage-poll watchlist (see V2WatchEntry). */
   v2Watch: Record<string, V2WatchEntry>;
   /** qid → P1 预告时点预埋名单(see PreArmEntry). */
@@ -334,6 +354,10 @@ interface WatchState {
    * dispute ∧ 方向性澄清 = Dota 形态)。lastBlock 单调去重防 crash 重扫
    * 重复计数;30 天 TTL 修剪。 */
   resetSeen: Record<string, { n: number; lastBlock: number; at: number }>;
+  /** 顺手项(2026-07-19 审查):gap 告警发送失败的暂存 —— 原来失败只
+   * console.error 一行,cursor 已提交,"永久漏扫"这个最需要人知道的事实
+   * 随之永久静默。下 tick 重试,新 gap 合并累计。 */
+  pendingGapAlert?: { gap: number; detail: string } | null;
 }
 
 function statePath(): string {
@@ -348,7 +372,7 @@ function loadState(): WatchState {
     raw = readFileSync(statePath(), "utf8");
   } catch {
     // first run — file absent
-    return { lastBlock: 0, notified: {}, llmPending: {}, v2Watch: {}, preArm: {}, digestQueue: [], mailLog: [], resetSeen: {} };
+    return { lastBlock: 0, notified: {}, llmPending: {}, pendingEnrich: {}, v2Watch: {}, preArm: {}, digestQueue: [], mailLog: [], resetSeen: {} };
   }
   try {
     const parsed = JSON.parse(raw);
@@ -357,11 +381,17 @@ function loadState(): WatchState {
       notified: parsed.notified && typeof parsed.notified === "object" ? parsed.notified : {},
       llmPending:
         parsed.llmPending && typeof parsed.llmPending === "object" ? parsed.llmPending : {},
+      pendingEnrich:
+        parsed.pendingEnrich && typeof parsed.pendingEnrich === "object" ? parsed.pendingEnrich : {},
       v2Watch: parsed.v2Watch && typeof parsed.v2Watch === "object" ? parsed.v2Watch : {},
       preArm: parsed.preArm && typeof parsed.preArm === "object" ? parsed.preArm : {},
       digestQueue: Array.isArray(parsed.digestQueue) ? parsed.digestQueue : [],
       mailLog: Array.isArray(parsed.mailLog) ? parsed.mailLog.filter((t: unknown) => Number.isFinite(t)) : [],
       resetSeen: parsed.resetSeen && typeof parsed.resetSeen === "object" ? parsed.resetSeen : {},
+      pendingGapAlert:
+        parsed.pendingGapAlert && typeof parsed.pendingGapAlert === "object"
+          ? parsed.pendingGapAlert
+          : null,
     };
   } catch (err) {
     // File exists but is corrupt (truncated by a crash mid-write). Do NOT
@@ -387,10 +417,11 @@ function saveState(state: WatchState): void {
  * only make sense against the market's own resolution rules. */
 async function fetchQuestionMeta(
   adapter: string,
-  qid: string
+  qid: string,
+  budgetMs?: number
 ): Promise<{ title: string | null; description: string | null }> {
   try {
-    const result = await ethCall(adapter, `${GET_QUESTION_SELECTOR}${qid.slice(2)}`);
+    const result = await ethCall(adapter, `${GET_QUESTION_SELECTOR}${qid.slice(2)}`, budgetMs);
     if (!result || result === "0x") return { title: null, description: null };
     const hex = result.slice(2);
     const utf8 = Buffer.from(hex, "hex").toString("utf8");
@@ -469,6 +500,7 @@ interface Notable {
 async function getTrustedOfficialUpdates(input: {
   resolvedBy: string;
   questionID: string;
+  budgetMs?: number;
 }): Promise<{ updates: OfficialUpdate[]; untrusted: boolean }> {
   const { updates, creator } = await getOfficialUpdates(input);
   if (updates.length > 0 && !isOfficialContextOwner(creator)) {
@@ -514,42 +546,56 @@ function annotateTextMarkers(item: Notable): void {
 
 async function main(): Promise<void> {
   const tickStartedAt = Date.now();
+  // 顺手项(2026-07-19 审查):每 tick 打一行生效配置 —— num() 兜底吞掉的环境
+  // 变量拼写错误/非法值此前完全不可见,排障只能靠猜。
+  {
+    const ec = execConfig();
+    console.log(
+      JSON.stringify({
+        mode: "chain-watch-config",
+        exec_mode: ec.mode,
+        max_order_usd: ec.maxOrderUsd,
+        daily_max_usd: ec.dailyMaxUsd,
+        total_max_usd: ec.totalMaxUsd,
+        price_band: [ec.minPrice, ec.maxPrice],
+        slippage: ec.slippage,
+        loss_halt_count: ec.lossHaltCount,
+        forecast_live: ec.forecastLive || undefined,
+        prearm: PREARM_ENABLED,
+        flood_max: FLOOD_MAX,
+        boundary_guard: (process.env.LLM_BOUNDARY_GUARD ?? "").trim().toLowerCase() !== "off",
+      })
+    );
+  }
   const state = loadState();
   const rawHead = Number(await rpc<string>("eth_blockNumber", []));
   if (!Number.isFinite(rawHead) || rawHead <= 0) throw new Error(`bad head: ${rawHead}`);
 
-  // Sanity: an implausible head jump (multi-chain gateway mis-routing a higher
-  // chain's block number) must not poison the cursor. But a >MAX_HEAD_ADVANCE
-  // jump is ALSO what a legitimate multi-day outage looks like — and head only
-  // keeps growing, so a bare throw would deadlock the channel forever. On
-  // violation, cross-check via a second query with the RPC order reversed: two
-  // independent endpoints agreeing means the jump is real (accept it; the
-  // HEAD_WINDOW clamp + gap alert handle the backlog), disagreement means a
-  // rogue gateway (throw, next tick retries). First run (lastBlock=0) exempt.
-  if (state.lastBlock > 0 && rawHead - state.lastBlock > MAX_HEAD_ADVANCE) {
-    const crossHead = Number(
-      await rpcVia<string>([...rpcUrls()].reverse(), "eth_blockNumber", [])
-    );
-    if (!Number.isFinite(crossHead) || Math.abs(crossHead - rawHead) > 5_000) {
-      throw new Error(
-        `implausible head ${rawHead} vs stored lastBlock ${state.lastBlock} (jump ${rawHead - state.lastBlock} > ${MAX_HEAD_ADVANCE}); cross-check head ${crossHead} disagrees — refusing to advance`
-      );
-    }
-    console.warn(
-      `[chain-watch] head jump ${rawHead - state.lastBlock} blocks confirmed by cross-check (${crossHead}) — accepting after long downtime`
-    );
-  }
+  // 头块守卫(毒化游标/低头静默两向;逻辑抽到 lib/polymarket/headGuard.ts
+  // 与 onchainEvents 共享,语义不变):跳超 MAX_HEAD_ADVANCE 时反序 RPC 交叉
+  // 核验,一致才接受(真实长停机);头远低于游标即 loud-fail。
+  await guardHeadJump({
+    rawHead,
+    lastCursor: state.lastBlock,
+    crossCheckHead: async () =>
+      Number(await rpcVia<string>([...rpcUrls()].reverse(), "eth_blockNumber", [])),
+    tag: "chain-watch",
+    maxAdvance: MAX_HEAD_ADVANCE,
+  });
 
-  // Symmetric low-head guard: a mis-routed head far BELOW the cursor would
-  // otherwise sail through the jump check, land in the "no new blocks" skip
-  // and exit 0 — monitoring stays green while the channel is silently dead.
-  // Loud-fail instead; small negatives (lagging replica within tolerance)
-  // still take the harmless skip path below.
-  if (state.lastBlock > 0 && rawHead < state.lastBlock - 1_000) {
-    throw new Error(
-      `implausible head ${rawHead} far below stored lastBlock ${state.lastBlock}; refusing to treat as "no new blocks"`
+  const elapsed = () => Date.now() - tickStartedAt;
+  // 硬预算:SIGTERM 前的真实剩余。快轮询的决策与单次调用的超时钳制用它。
+  const wallBudgetLeftMs = () => TICK_KILL_MS - SEND_MARGIN_MS - elapsed();
+  // P1 承诺窗口是否临近/进行中(空扫描早退、闸门让位、sweep/enrich 预算钳制
+  // 三处共用的同一判据)。
+  const prearmWindowSoon = () =>
+    PREARM_ENABLED &&
+    Object.values(state.preArm).some(
+      (e) =>
+        !firedCurrentGen(e) &&
+        Date.now() + TICK_KILL_MS >= e.commitAtMs - PREARM_EARLY_MS &&
+        Date.now() <= e.commitAtMs + PREARM_LATE_MS
     );
-  }
 
   // Only scan up to a confirmed depth to avoid reorg/replica-lag silent misses.
   const head = rawHead - CONFIRMATIONS;
@@ -561,15 +607,7 @@ async function main(): Promise<void> {
     // 陈旧副本/无新块:常规扫描无事可做。但承诺窗口临近时不能提前退出 ——
     // 那会吞掉整个在窗 tick 的快轮询驻留(审查确认:滞后副本恰落在承诺时点
     // 附近时,P1 秒级覆盖被打成 3min 盲洞)。带空扫描范围继续走到尾部。
-    const windowSoon =
-      PREARM_ENABLED &&
-      Object.values(state.preArm).some(
-        (e) =>
-          !firedCurrentGen(e) &&
-          Date.now() + TICK_KILL_MS >= e.commitAtMs - PREARM_EARLY_MS &&
-          Date.now() <= e.commitAtMs + PREARM_LATE_MS
-      );
-    if (!windowSoon) {
+    if (!prearmWindowSoon()) {
       console.log(JSON.stringify({ mode: "chain-watch", head, skipped: "no new blocks" }));
       return;
     }
@@ -592,15 +630,20 @@ async function main(): Promise<void> {
   // is retried forever. Budgets guarantee every tick reaches send+commit.
   const SWEEP_BUDGET_MS = 100_000;
   const ENRICH_BUDGET_MS = 140_000;
-  const elapsed = () => Date.now() - tickStartedAt;
+  // §9(2026-07-19 审查):承诺窗口临近的 tick 上,sweep/enrich 预算同样钳到
+  // PREARM_GATE_LLM_CUTOFF_MS —— 原来只有 LLM 闸门让位,enrich 仍可吃到
+  // 140s,快轮询"保底 ~45s"的承诺对最耗时的环节实际无强制。
+  const budgetCapMs = () => (prearmWindowSoon() ? PREARM_GATE_LLM_CUTOFF_MS : Infinity);
+  const sweepBudgetMs = () => Math.min(SWEEP_BUDGET_MS, budgetCapMs());
+  const enrichBudgetMs = () => Math.min(ENRICH_BUDGET_MS, budgetCapMs());
 
   const logs: Array<{ address: string; topics: string[]; blockNumber?: string }> = [];
   const WINDOW = 48;
   let sweptTo = from - 1;
   let sweepError: string | null = null;
   for (let start = from; start <= to; start += WINDOW) {
-    if (elapsed() > SWEEP_BUDGET_MS) {
-      sweepError = `sweep stopped at time budget (${SWEEP_BUDGET_MS / 1000}s); resuming next tick`;
+    if (elapsed() > sweepBudgetMs()) {
+      sweepError = `sweep stopped at time budget (${Math.round(sweepBudgetMs() / 1000)}s); resuming next tick`;
       break;
     }
     const end = Math.min(start + WINDOW - 1, to);
@@ -687,17 +730,25 @@ async function main(): Promise<void> {
   // stance none) — a degraded but timely alert beats a tick killed by timeout
   // with nothing sent and no progress committed.
   for (const item of byQid.values()) {
-    if (elapsed() > ENRICH_BUDGET_MS) {
+    // §5(2026-07-19 审查):进入每项前要求真实墙钟余量 > 45s(单项最坏耗时,
+    // 预算钳制后 fetchQuestionMeta ≤15s + getUpdates ≤25s)。原来只在项间比对
+    // 软预算,一个黑洞端点的单项(3 次 ethCall × 每 URL 10s 串行)最坏 ~120s,
+    // 能把 tick 连同待发邮件和 commitState 一起顶过 170s SIGTERM。
+    if (elapsed() > enrichBudgetMs() || wallBudgetLeftMs() < 45_000) {
       console.warn(
-        `[chain-watch] enrichment stopped at time budget (${ENRICH_BUDGET_MS / 1000}s); remaining events notify without title/context`
+        `[chain-watch] enrichment stopped at time budget (elapsed ${Math.round(elapsed() / 1000)}s); remaining events notify without title/context`
       );
       break;
     }
-    const meta = await fetchQuestionMeta(item.adapter, item.qid);
+    const meta = await fetchQuestionMeta(item.adapter, item.qid, Math.min(15_000, wallBudgetLeftMs()));
     item.title = meta.title;
     item.description = meta.description;
     try {
-      const { updates, untrusted } = await getTrustedOfficialUpdates({ resolvedBy: item.adapter, questionID: item.qid });
+      const { updates, untrusted } = await getTrustedOfficialUpdates({
+        resolvedBy: item.adapter,
+        questionID: item.qid,
+        budgetMs: Math.min(25_000, wallBudgetLeftMs()),
+      });
       item.enriched = true;
       item.untrustedCreator = untrusted || undefined;
       item.updateCount = updates.length;
@@ -744,14 +795,18 @@ async function main(): Promise<void> {
     .sort((a, b) => a[1].lastPolledAt - b[1].lastPolledAt)
     .slice(0, V2_POLLS_PER_TICK);
   for (const [qid, w] of v2ToPoll) {
-    if (elapsed() > ENRICH_BUDGET_MS) break;
+    if (elapsed() > enrichBudgetMs() || wallBudgetLeftMs() < 45_000) break;
     w.lastPolledAt = Date.now();
     try {
-      const { updates } = await getTrustedOfficialUpdates({ resolvedBy: w.adapter, questionID: qid });
+      const { updates } = await getTrustedOfficialUpdates({
+        resolvedBy: w.adapter,
+        questionID: qid,
+        budgetMs: Math.min(25_000, wallBudgetLeftMs()),
+      });
       v2Polled += 1;
       if (updates.length <= w.updateCount) continue;
       w.updateCount = updates.length;
-      const meta = await fetchQuestionMeta(w.adapter, qid);
+      const meta = await fetchQuestionMeta(w.adapter, qid, Math.min(15_000, wallBudgetLeftMs()));
       const item: Notable = {
         qid,
         adapter: w.adapter,
@@ -771,6 +826,90 @@ async function main(): Promise<void> {
       byQid.set(qid, item);
     } catch {
       // RPC 瞬断 — lastPolledAt 已推进,下轮轮询别的条目,此条稍后重试
+    }
+  }
+
+  // ── §12:enrich 失败重读队列(2026-07-19 审查)──
+  // 本 tick enrich 失败/预算跳过的事件入队(本 tick 照旧按降级处理);后续
+  // tick 限量补读,成功即构造完整 Notable 合入 byQid 走同一套闸门与指纹去重。
+  const PENDING_ENRICH_MAX = 50;
+  const PENDING_ENRICH_PER_TICK = 3;
+  const PENDING_ENRICH_MAX_ATTEMPTS = 16;
+  for (const item of byQid.values()) {
+    if (item.enriched) {
+      delete state.pendingEnrich[item.qid];
+      continue;
+    }
+    const prev = state.pendingEnrich[item.qid];
+    state.pendingEnrich[item.qid] = {
+      adapter: item.adapter,
+      kinds: [...new Set([...(prev?.kinds ?? []), ...item.kinds])],
+      attempts: prev?.attempts ?? 0,
+      firstSeenAt: prev?.firstSeenAt ?? Date.now(),
+    };
+  }
+  {
+    const retries = Object.entries(state.pendingEnrich)
+      .filter(([qid]) => !byQid.has(qid))
+      .sort((a, b) => a[1].firstSeenAt - b[1].firstSeenAt)
+      .slice(0, PENDING_ENRICH_PER_TICK);
+    for (const [qid, p] of retries) {
+      if (elapsed() > enrichBudgetMs() || wallBudgetLeftMs() < 45_000) break;
+      p.attempts += 1;
+      let ok = false;
+      try {
+        const { updates, untrusted } = await getTrustedOfficialUpdates({
+          resolvedBy: p.adapter,
+          questionID: qid,
+          budgetMs: Math.min(25_000, wallBudgetLeftMs()),
+        });
+        const meta = await fetchQuestionMeta(p.adapter, qid, Math.min(15_000, wallBudgetLeftMs()));
+        const item: Notable = {
+          qid,
+          adapter: p.adapter,
+          kinds: new Set(
+            p.kinds.filter((k): k is "reset" | "context" => k === "reset" || k === "context")
+          ),
+          title: meta.title,
+          description: meta.description,
+          stance: "none",
+          confidence: "none",
+          refundClause: detectRefundClause(updates.map((u) => u.text)),
+          excerpt: null,
+          updateCount: updates.length,
+          updates,
+          enriched: true,
+          untrustedCreator: untrusted || undefined,
+        };
+        applyStanceFromUpdates(item);
+        annotateTextMarkers(item);
+        byQid.set(qid, item);
+        delete state.pendingEnrich[qid];
+        ok = true;
+      } catch {
+        // 仍不可达 — 留队,下轮再试
+      }
+      if (!ok && (p.attempts >= PENDING_ENRICH_MAX_ATTEMPTS || Date.now() - p.firstSeenAt > 48 * 3600_000)) {
+        // 放弃 ≠ 静默丢弃(M4 同语义):曾降级发信的事件方向始终未知,留痕。
+        console.warn(`[chain-watch] pendingEnrich ${qid} 放弃补读(attempts=${p.attempts})`);
+        delete state.pendingEnrich[qid];
+        state.digestQueue.push({
+          qid,
+          title: null,
+          label: `⚪ 官方文本补读失败(${p.attempts >= PENDING_ENRICH_MAX_ATTEMPTS ? `${p.attempts} 次尝试` : "48h"}后放弃)— 该事件曾降级通知,方向始终未知,建议人工核对`,
+          stance: "none",
+          llmStance: null,
+          bestAsk: null,
+          askUsd: null,
+          marketUrl: null,
+          reason: "enrich_gave_up",
+          at: Date.now(),
+        });
+      }
+    }
+    const keys = Object.keys(state.pendingEnrich);
+    if (keys.length > PENDING_ENRICH_MAX) {
+      for (const k of keys.slice(0, keys.length - PENDING_ENRICH_MAX)) delete state.pendingEnrich[k];
     }
   }
 
@@ -832,18 +971,45 @@ async function main(): Promise<void> {
   if (PREARM_ENABLED) {
     for (const item of byQid.values()) maybeArm(item);
   }
+  // Decide what's notification-worthy and not already notified. Fingerprints
+  // are computed but NOT committed to state.notified yet — they're only
+  // persisted after the email actually goes out (at-least-once), so an SMTP
+  // hiccup can't silently swallow a real dispute event.
+  const pendingFingerprints = new Map<string, string>();
+  const notable = [...byQid.values()].filter((item) => {
+    const fingerprint = `${[...item.kinds].sort().join("+")}:${item.updateCount}:${item.stance}`;
+    if (state.notified[item.qid] === fingerprint) return false;
+    // P1 快轮询去重:承诺窗口内已对该 update 状态(count+stance)发过 ⏰ 邮件;
+    // 常规扫描随后看到的同一事件 kinds 可能多出 reset(模板常伴 orderbook
+    // clear),指纹因此不同 —— 单看 kinds 差异不值得对同一裁定再发一封。
+    // 仅当本 tick 确实带 context(同一文本事件,reset 只是伴生)才吞;纯 reset
+    // (对新裁定的真实 dispute,updates 数未变)必须放行(审查 major:宁重发,
+    // 不吞新争议)。
+    if (
+      item.kinds.has("context") &&
+      state.preArm[item.qid]?.firedFp === `${item.updateCount}:${item.stance}`
+    ) {
+      pendingFingerprints.set(item.qid, fingerprint); // 指纹照常推进
+      return false;
+    }
+    pendingFingerprints.set(item.qid, fingerprint);
+    return true;
+  });
+
   // 过期清理:出窗未兑现 = 官方兑现了"无澄清"承诺,进 digest 留痕(不即时打扰,
   // 但这是"官方不会再说话"的确定性信息,人工据此可撤销观察)。兑现过的静默删。
   // 面包屑按 tick 聚合成单条:批量预告日一次可过期数十条,逐条入队会触发
   // digestQueue 100 条截断、挤掉真正的方向性信号(审查 major)。
+  // §13(2026-07-19 审查):本块必须在上方 notable 指纹过滤之后跑 —— 先删
+  // firedFp 再过滤,停机追赶迟到的同一事件就失去去重依据被双发。
   {
     const expiredUnanswered: Array<{ qid: string; title: string | null }> = [];
     for (const [qid, e] of Object.entries(state.preArm)) {
-      // 兑现过的条目保留期锚定 fire 时刻(+30min):停机追赶迟到的常规扫描事件
-      // 仍需命中 firedFp 去重,防边窗兑现被双发。
+      // 兑现过的条目保留期锚定 fire 时刻 +2h(§13:原 30min 短于 HEAD_WINDOW
+      // ≈2h 的停机追赶深度,追赶扫描迟到的同一裁定恰好错过去重窗口)。
       const retainUntil = Math.max(
         e.commitAtMs + PREARM_LATE_MS,
-        e.firedAtMs != null ? e.firedAtMs + 30 * 60_000 : 0
+        e.firedAtMs != null ? e.firedAtMs + 2 * 3600_000 : 0
       );
       if (retainUntil > Date.now()) continue;
       if (!e.firedFp && !e.sawUpdate) expiredUnanswered.push({ qid, title: e.title });
@@ -876,31 +1042,6 @@ async function main(): Promise<void> {
       for (const [qid] of entries.slice(PREARM_MAX)) delete state.preArm[qid];
     }
   }
-
-  // Decide what's notification-worthy and not already notified. Fingerprints
-  // are computed but NOT committed to state.notified yet — they're only
-  // persisted after the email actually goes out (at-least-once), so an SMTP
-  // hiccup can't silently swallow a real dispute event.
-  const pendingFingerprints = new Map<string, string>();
-  const notable = [...byQid.values()].filter((item) => {
-    const fingerprint = `${[...item.kinds].sort().join("+")}:${item.updateCount}:${item.stance}`;
-    if (state.notified[item.qid] === fingerprint) return false;
-    // P1 快轮询去重:承诺窗口内已对该 update 状态(count+stance)发过 ⏰ 邮件;
-    // 常规扫描随后看到的同一事件 kinds 可能多出 reset(模板常伴 orderbook
-    // clear),指纹因此不同 —— 单看 kinds 差异不值得对同一裁定再发一封。
-    // 仅当本 tick 确实带 context(同一文本事件,reset 只是伴生)才吞;纯 reset
-    // (对新裁定的真实 dispute,updates 数未变)必须放行(审查 major:宁重发,
-    // 不吞新争议)。
-    if (
-      item.kinds.has("context") &&
-      state.preArm[item.qid]?.firedFp === `${item.updateCount}:${item.stance}`
-    ) {
-      pendingFingerprints.set(item.qid, fingerprint); // 指纹照常推进
-      return false;
-    }
-    pendingFingerprints.set(item.qid, fingerprint);
-    return true;
-  });
 
   // Commit progress + notified fingerprints, then bound the map. Called only
   // after any required email send has succeeded. delete-then-set moves a
@@ -937,27 +1078,20 @@ async function main(): Promise<void> {
   // llmPending 队列,后续 tick LLM 恢复后补判(如部署初期 token 未配的窗口)。
   // 所有 notable 无论发信与否都照常 commitState:指纹含 updateCount+stance,
   // 官方后续再发文本时指纹必变,事件仍会回来重新过闸。
-  // 硬预算:SIGTERM 前的真实剩余。快轮询的决策与单次调用的超时钳制用它。
-  const wallBudgetLeftMs = () => TICK_KILL_MS - SEND_MARGIN_MS - elapsed();
-  // 软预算:常规闸门视角的剩余。承诺窗口临近/进行中的 tick 上,闸门(含补判
-  // 队列/盘口注解/复判)在 PREARM_GATE_LLM_CUTOFF_MS 后不再发起新调用,为 P1
-  // 快轮询保底 ~45s(审查确认:无此界则批量姊妹市场日闸门按设计吃满预算,
-  // 快轮询恒零轮询,P1 在其设计针对的场景静默失效)。fail-open 语义照旧:
-  // 被让位跳过的判读走 llmPending 补判,正则方向邮件不受影响。
-  const prearmWindowSoon = () =>
-    PREARM_ENABLED &&
-    Object.values(state.preArm).some(
-      (e) =>
-        !firedCurrentGen(e) &&
-        Date.now() + TICK_KILL_MS >= e.commitAtMs - PREARM_EARLY_MS &&
-        Date.now() <= e.commitAtMs + PREARM_LATE_MS
-    );
+  // 软预算:常规闸门视角的剩余(wallBudgetLeftMs/prearmWindowSoon 已在 main
+  // 顶部定义,enrich 预算钳制与此处共用)。承诺窗口临近/进行中的 tick 上,
+  // 闸门(含补判队列/盘口注解/复判)在 PREARM_GATE_LLM_CUTOFF_MS 后不再发起
+  // 新调用,为 P1 快轮询保底 ~45s(审查确认:无此界则批量姊妹市场日闸门按
+  // 设计吃满预算,快轮询恒零轮询,P1 在其设计针对的场景静默失效)。fail-open
+  // 语义照旧:被让位跳过的判读走 llmPending 补判,正则方向邮件不受影响。
   const llmBudgetLeftMs = () =>
     prearmWindowSoon()
       ? Math.min(PREARM_GATE_LLM_CUTOFF_MS - elapsed(), wallBudgetLeftMs())
       : wallBudgetLeftMs();
   // 单次调用的超时被钳到剩余预算内:一个 149s 才开始的 60s 调用会越过 170s
   // SIGTERM,把整个 tick(连同待发的正则方向邮件和 commitState)一起杀掉。
+  // §9:承诺窗口 tick 上再钳到 PREARM_LOOP_END_MS − elapsed,单个慢判读不许
+  // 吃进快轮询的保底窗(5s 下限防负值;调用点自身有 LLM_MIN_CALL_MS 闸)。
   const consultLlm = (
     item: {
       qid: string;
@@ -977,7 +1111,14 @@ async function main(): Promise<void> {
       updates: item.updates,
       regexStance: { stance: item.stance, confidence: item.confidence },
       cacheKey: `${item.qid}:${item.updateCount}${cacheKeySuffix}`,
-      timeoutMs: Math.min(60_000, wallBudgetLeftMs()),
+      timeoutMs: Math.max(
+        5_000,
+        Math.min(
+          60_000,
+          wallBudgetLeftMs(),
+          prearmWindowSoon() ? PREARM_LOOP_END_MS - elapsed() : Infinity
+        )
+      ),
     });
 
   // ── 标题分级(结构化 tier,§3.4)── 分级逻辑在 lib/polymarket/tiering.ts。
@@ -1307,14 +1448,20 @@ async function main(): Promise<void> {
   let paperRegistered = 0;
   const maybeRegisterPaperTrade = (n: Notable): void => {
     if ((process.env.PAPER_TRADES_AUTO ?? "").trim().toLowerCase() === "off") return;
+    const pr = priorityOf(n);
     // §3.4:闸门只看结构化 tier(isGreen),不解析 label 文案。
-    if (!isGreen(priorityOf(n))) return;
+    if (!isGreen(pr)) return;
     const e = n.exec;
     if (!e || e.closed || !e.fill100) return;
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const db = require("../lib/localDb") as typeof import("../lib/localDb");
       if (db.listOpenPaperTrades().some((t) => t.tokenId === e.tokenId)) return;
+      // §11(2026-07-19 审查):paper 行加记 dirMethod 与闸门/判读快照 ——
+      // 8 月预告家族 go/no-go 按闸门口径分层判定,不用 paper 池裸均值。
+      // 布尔判定与 tradeExecutor 执行侧同条件(boundary fail-closed 版)。
+      const leansStance =
+        /^leans_/i.test(n.llm?.stance ?? "") || /^leans_/i.test(n.stance);
       db.insertPaperTrade({
         conditionId: e.conditionId,
         tokenId: e.tokenId,
@@ -1327,6 +1474,26 @@ async function main(): Promise<void> {
         avgFillPrice: e.fill100.avgPrice,
         worstFillPrice: e.fill100.worstPrice,
         fills: e.fill100.fills,
+        dirMethod: e.dirMethod,
+        gateMeta: {
+          tier: pr.tier,
+          label: pr.label,
+          stance: n.stance,
+          confidence: n.confidence,
+          llmStance: n.llm?.stance ?? null,
+          llmConfidence: n.llm?.confidence ?? null,
+          llmEventStatus: n.llm?.eventStatus ?? null,
+          forecastTemplate: n.forecastTemplate === true,
+          correction: n.correction === true,
+          multiDispute: n.multiDispute === true,
+          bestAskAtSignal: e.bestAsk,
+          feesEnabled: e.feesEnabled,
+          feeRate: e.feeRate,
+          // 预告家族三闸门快照(闸3 owner 白名单在事件层已拦,能走到这里即通过)
+          gateBoundaryPass: !((n.llm?.eventStatus ?? null) !== "decided" && leansStance),
+          gateMinPricePass: !(e.bestAsk != null && e.bestAsk < 0.3),
+          gateOwnerPass: n.untrustedCreator !== true,
+        },
       });
       paperRegistered += 1;
     } catch (err) {
@@ -1349,7 +1516,12 @@ async function main(): Promise<void> {
     "no-side",
     "outcome-exact",
   ]);
-  const maybeExecuteTrade = async (n: Notable): Promise<void> => {
+  // anchorAskOverride(§13,仅 P1 快路径传):跨轮传递的首轮盘口锚,取代
+  // 本轮 exec.bestAsk 作为执行漂移带的基准。undefined = 用本轮注解。
+  const maybeExecuteTrade = async (
+    n: Notable,
+    anchorAskOverride?: number | null
+  ): Promise<void> => {
     if (executionMode() === "off" || n.trade !== undefined) return;
     const pr = priorityOf(n);
     // §3.4:闸门只看结构化 tier(isGreen),不解析 label 文案 —— 标签改文案
@@ -1396,9 +1568,13 @@ async function main(): Promise<void> {
         llmStance: n.llm?.stance ?? null,
         llmConfidence: n.llm?.confidence ?? null,
         llmEventStatus: n.llm?.eventStatus ?? null,
-        bestAskAtSignal: e.bestAsk,
+        bestAskAtSignal: anchorAskOverride !== undefined ? anchorAskOverride : e.bestAsk,
         dirMethod: e.dirMethod,
         negRisk: e.negRisk,
+        // taker 费注解透传(2026-07-19 审查 §2:execCheck 取到了却在此丢弃,
+        // 实盘记账因此全程不含费)。
+        feesEnabled: e.feesEnabled,
+        feeRate: e.feeRate,
         forecastTemplate: n.forecastTemplate === true,
         correction: n.correction === true,
         budgetMs: wallBudgetLeftMs(),
@@ -1499,6 +1675,27 @@ async function main(): Promise<void> {
     });
     if (toDrop > 0) state.digestQueue.splice(0, toDrop);
   }
+
+  // ── 顺手项:gap 告警发送(带 state 暂存重试)──
+  // 失败不再只留一行日志:暂存 state.pendingGapAlert,下 tick 重试;新 gap
+  // 与未送出的旧 gap 合并累计。
+  const flushGapAlert = async (): Promise<void> => {
+    const pending = state.pendingGapAlert;
+    if (!pending) return;
+    try {
+      await sendMail({
+        subject: `[PredEdge 链上] ⚠️ 永久漏扫 ${pending.gap} 个块`,
+        html: `<div style="font-family:system-ui,sans-serif;max-width:640px"><p style="color:#d97706">⚠️ chain-watch 停机追赶超出回看窗口(${HEAD_WINDOW} 块),块 ${escapeHtml(pending.detail)}(共 ${pending.gap} 个)未被扫描且不可回补。若此区间有争议事件,可能已漏报。</p><p style="font-size:12px;color:#888">建议核对 Polymarket 争议区,或考虑接入更深回看能力的付费 RPC。</p></div>`,
+        text: `chain-watch 永久漏扫 ${pending.gap} 个块(${pending.detail});停机超出回看窗口 ${HEAD_WINDOW}。`,
+      });
+      state.pendingGapAlert = null;
+      saveState(state);
+    } catch (err) {
+      console.error(
+        `[chain-watch] gap alert send failed (gap=${pending.gap},已暂存下 tick 重试): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  };
 
   // ── I2: 汇总队列冲洗(攒满 DIGEST_MAX_SIZE 条,或最老条目滞留超 6h)──
   // 独立于即时邮件的 best-effort:失败保留队列下轮重试,绝不阻塞 cursor 推进。
@@ -1678,11 +1875,15 @@ async function main(): Promise<void> {
       for (const [qid, e] of targets) {
         if (elapsed() >= PREARM_LOOP_END_MS) break;
         try {
-          const { updates } = await getTrustedOfficialUpdates({ resolvedBy: e.adapter, questionID: qid });
+          const { updates } = await getTrustedOfficialUpdates({
+            resolvedBy: e.adapter,
+            questionID: qid,
+            budgetMs: Math.min(15_000, wallBudgetLeftMs()),
+          });
           polls += 1;
           if (updates.length <= e.updateCountAtArm) continue;
           // 承诺兑现:新官方文本落地。与主闸门同语义的完整判读。
-          const meta = await fetchQuestionMeta(e.adapter, qid);
+          const meta = await fetchQuestionMeta(e.adapter, qid, Math.min(15_000, wallBudgetLeftMs()));
           const item: Notable = {
             qid,
             adapter: e.adapter,
@@ -1741,6 +1942,9 @@ async function main(): Promise<void> {
           if (effStance && wallBudgetLeftMs() > 10_000) {
             item.exec = await checkExecutability({ adapter: item.adapter, qid, stance: effStance });
           }
+          // §13:首轮真实盘口价即锚定,跨轮传递 —— 重试轮重新注解的 bestAsk
+          // 已被落地后的重定价推高,拿它当漂移带基准等于放行追高。
+          if (e.anchorAsk == null && item.exec?.bestAsk != null) e.anchorAsk = item.exec.bestAsk;
           // M3 复判:🟢 且(深价位或盘口未知)= 肥尾候选形态,关键决策必须二票。
           if (item.llm && wallBudgetLeftMs() >= LLM_MIN_CALL_MS) {
             const prePr = priorityOf(item);
@@ -1764,17 +1968,21 @@ async function main(): Promise<void> {
           }
           // 自动下单:快路径是全系统延迟最敏感的时刻(断崖 2-5min),执行先于
           // 发信;batch 路径同样执行(邮件合并只是通知路由,不是执行路由)。
-          // 邮件失败重试导致的重复检出由执行器 ledger 按 tokenId 去重兜住。
-          await maybeExecuteTrade(item);
+          await maybeExecuteTrade(item, e.anchorAsk ?? undefined);
           const latencyS = Math.round((Date.now() - e.commitAtMs) / 1000);
-          if (fired >= PREARM_FIRE_SOLO_MAX) {
+          const pr = priorityOf(item);
+          // §13(2026-07-19 审查):留痕(firedFp/notified 指纹/paper 登记)紧随
+          // 执行落地,与邮件成败解耦 —— 原顺序下邮件失败重试会整段重放:重新
+          // 注解的 bestAsk 重锚追高 + paper/执行路径重复进入。邮件此后只是
+          // 通知:失败落 digest 面包屑,不再靠重新检出重试。
+          fired += 1;
+          markFired(qid, e, item, pr.rank);
+          maybeArm(item); // 兑现文本本身可能是新预告(改期):统一走 maybeArm 重定位窗口
+          saveState(state);
+          if (fired > PREARM_FIRE_SOLO_MAX) {
             batchPending.set(qid, { e, item, latencyS });
-            // 立即记账"见过新文本":批量邮件若恰在窗口尾部失败,条目出窗过期
-            // 也不发假"无澄清落地"面包屑(核验发现的回归;邮件本身下 tick 重试)。
-            e.sawUpdate = true;
             continue;
           }
-          const pr = priorityOf(item);
           const searchUrl = item.title
             ? `https://polymarket.com/search?q=${encodeURIComponent(safeSlice(item.title, 80))}`
             : "https://polymarket.com";
@@ -1791,9 +1999,10 @@ async function main(): Promise<void> {
             item.exec?.bestAsk != null
               ? `<div style="margin-top:2px;font-size:13px"><b style="color:${item.exec.executable ? "#16a34a" : "#d97706"}">盘口: 买 ${escapeHtml(item.exec.outcome)} @${item.exec.bestAsk.toFixed(3)} · 近档深度 $${Math.round(item.exec.askUsdNear)}</b>${item.exec.fill100 ? ` · $100 市价单均价 ${item.exec.fill100.avgPrice.toFixed(3)}` : ""}${item.exec.marketUrl ? ` · <a href="${item.exec.marketUrl}">直达市场</a>` : ""}</div>`
               : "";
-          await sendMail({
-            subject: `[PredEdge链上] ⏰预告兑现 ${pr.label}${execBit}${tradeSubjectBit(item)} | ${safeSlice(item.title ?? qid, 48)}`,
-            html: `<div style="font-family:system-ui,sans-serif;max-width:640px">
+          try {
+            await sendMail({
+              subject: `[PredEdge链上] ⏰预告兑现 ${pr.label}${execBit}${tradeSubjectBit(item)} | ${safeSlice(item.title ?? qid, 48)}`,
+              html: `<div style="font-family:system-ui,sans-serif;max-width:640px">
               <p><b>预告澄清承诺兑现</b>:承诺时点 ${new Date(e.commitAtMs).toISOString().slice(0, 16).replace("T", " ")}Z → 快轮询检出 ${latencyS >= 0 ? "+" : ""}${latencyS}s(bt5:入场断崖在 2-5 分钟,此刻是窗口)。</p>
               <div style="font-weight:600">${escapeHtml(item.title ?? qid)}</div>
               <div style="margin-top:4px">${isDirectionalStance(item.stance) ? `<b style="color:#d97706">官方方向: ${escapeHtml(item.stance)} (${escapeHtml(item.confidence)})</b>` : `正则立场: ${escapeHtml(item.stance)} (${escapeHtml(item.confidence)})`}</div>
@@ -1806,17 +2015,33 @@ async function main(): Promise<void> {
               <div style="margin-top:4px"><a href="${searchUrl}">在 Polymarket 搜索</a> · qid ${escapeHtml(qid.slice(0, 10))}…</div>
               <p style="font-size:12px;color:#888">盘口为发信时刻快照;预告模板家族自动执行走三闸门制(2026-07-14 研究,paper 验证期),执行结果见上方注解。</p>
             </div>`,
-            text: `预告兑现 +${latencyS}s | ${item.title ?? qid} | ${pr.label} | stance=${item.stance}(${item.confidence})${item.llm && isDirectionalStance(item.llm.stance) ? ` llm=${item.llm.stance}(${item.llm.confidence})` : ""}${item.exec?.bestAsk != null ? ` ask=${item.exec.bestAsk.toFixed(3)}` : ""}${tradeTextBit(item)}`,
-          });
-          fired += 1;
-          markFired(qid, e, item, pr.rank);
-          // 兑现文本本身可能是新预告(改期):统一走 maybeArm(48h 上界与指纹
-          // 携带一体适用),新窗口自动重定位(核验发现的 >48h 改期残留边缘)。
-          maybeArm(item);
-          saveState(state);
+              text: `预告兑现 +${latencyS}s | ${item.title ?? qid} | ${pr.label} | stance=${item.stance}(${item.confidence})${item.llm && isDirectionalStance(item.llm.stance) ? ` llm=${item.llm.stance}(${item.llm.confidence})` : ""}${item.exec?.bestAsk != null ? ` ask=${item.exec.bestAsk.toFixed(3)}` : ""}${tradeTextBit(item)}`,
+            });
+          } catch (mailErr) {
+            // §13:已留痕/已执行,邮件失败只损失通知 —— 落 digest 面包屑可见,
+            // 不再靠重新检出整段重试(那正是重锚追高的来源)。
+            console.warn(
+              `[chain-watch] P1 ⏰ 邮件发送失败(已留痕/已执行,通知转 digest): ${mailErr instanceof Error ? mailErr.message : String(mailErr)}`
+            );
+            state.digestQueue.push({
+              qid,
+              title: item.title,
+              label: `⏰ 预告兑现(+${latencyS}s)通知邮件失败 — ${pr.label}`,
+              stance: item.stance,
+              llmStance: item.llm?.stance ?? null,
+              bestAsk: item.exec?.bestAsk ?? null,
+              askUsd: item.exec?.askUsdNear ?? null,
+              marketUrl: item.exec?.marketUrl ?? null,
+              trade: item.trade ? `${item.trade.status}${item.trade.filledUsd ? ` $${item.trade.filledUsd}` : ""}` : null,
+              reason: "prearm_mail_failed",
+              at: Date.now(),
+            });
+            saveState(state);
+          }
         } catch (err) {
-          // RPC/SMTP 瞬断:firedFp 未置位,下一轮重新检出即重试(at-least-once)。
-          // 必须留日志:这是全系统最高价值的发信时刻,静默失败不可接受。
+          // RPC/判读/盘口注解瞬断(执行与留痕之前的失败):firedFp 未置位,
+          // 下一轮重新检出即重试(at-least-once)。必须留日志:这是全系统
+          // 最高价值的时刻,静默失败不可接受。
           console.warn(
             `[chain-watch] P1 快轮询 ${qid.slice(0, 10)} 处理失败(下轮重试): ${err instanceof Error ? err.message : String(err)}`
           );
@@ -1825,8 +2050,9 @@ async function main(): Promise<void> {
       if (elapsed() + PREARM_POLL_MS >= PREARM_LOOP_END_MS) break;
       await new Promise((resolve) => setTimeout(resolve, PREARM_POLL_MS));
     }
-    // 批量冲洗:第 PREARM_FIRE_SOLO_MAX+1 个起的兑现合并单封。失败不置
-    // firedFp,下一 tick 重新检出重试(独立额度重置,届时前几个又可独立发)。
+    // 批量冲洗:第 PREARM_FIRE_SOLO_MAX+1 个起的兑现合并单封。§13:条目已在
+    // 检出时留痕(firedFp/执行/paper 登记),这里只是通知 —— 失败落 digest
+    // 面包屑,不再靠重新检出重试。
     if (batchPending.size > 0) {
       try {
         const rows = [...batchPending.entries()]
@@ -1846,16 +2072,26 @@ async function main(): Promise<void> {
             .map(([qid, { item, latencyS }]) => `${item.title ?? qid} | ${priorityOf(item).label} | +${latencyS}s | stance=${item.stance}`)
             .join("\n"),
         });
-        for (const [qid, { e, item }] of batchPending) {
-          fired += 1;
-          markFired(qid, e, item, priorityOf(item).rank);
-          maybeArm(item); // 兑现文本本身是新预告(改期)时重定位窗口
-        }
-        saveState(state);
       } catch (err) {
         console.warn(
-          `[chain-watch] P1 批量兑现邮件发送失败(下一 tick 重新检出): ${err instanceof Error ? err.message : String(err)}`
+          `[chain-watch] P1 批量兑现邮件发送失败(已留痕/已执行,通知转 digest): ${err instanceof Error ? err.message : String(err)}`
         );
+        for (const [qid, { item, latencyS }] of batchPending) {
+          state.digestQueue.push({
+            qid,
+            title: item.title,
+            label: `⏰ 预告批量兑现(+${latencyS}s)通知邮件失败 — ${priorityOf(item).label}`,
+            stance: item.stance,
+            llmStance: item.llm?.stance ?? null,
+            bestAsk: item.exec?.bestAsk ?? null,
+            askUsd: item.exec?.askUsdNear ?? null,
+            marketUrl: item.exec?.marketUrl ?? null,
+            trade: item.trade ? `${item.trade.status}${item.trade.filledUsd ? ` $${item.trade.filledUsd}` : ""}` : null,
+            reason: "prearm_mail_failed",
+            at: Date.now(),
+          });
+        }
+        saveState(state);
       }
     }
     console.log(
@@ -1905,20 +2141,16 @@ async function main(): Promise<void> {
   };
 
   if (immediate.length === 0) {
-    // 无需即时邮件(可能全部进了汇总队列):cursor+指纹+队列先落盘(队列就是
-    // digested 条目的持久记录),再 best-effort 处理 gap 告警与队列冲洗。
-    commitState();
+    // 无需即时邮件(可能全部进了汇总队列):本 tick 的 gap 先并入暂存(随
+    // commitState 持久化),cursor+指纹+队列落盘后再 best-effort 发送。
     if (gap > 0) {
-      try {
-        await sendMail({
-          subject: `[PredEdge 链上] ⚠️ 永久漏扫 ${gap} 个块`,
-          html: `<div style="font-family:system-ui,sans-serif;max-width:640px"><p style="color:#d97706">⚠️ chain-watch 停机追赶超出回看窗口(${HEAD_WINDOW} 块),块 ${idealFrom}–${from - 1}(共 ${gap} 个)未被扫描且不可回补。若此区间有争议事件,可能已漏报。</p><p style="font-size:12px;color:#888">建议核对 Polymarket 争议区,或考虑接入更深回看能力的付费 RPC。</p></div>`,
-          text: `chain-watch 永久漏扫 ${gap} 个块(${idealFrom}–${from - 1});停机超出回看窗口 ${HEAD_WINDOW}。`,
-        });
-      } catch (err) {
-        console.error(`[chain-watch] gap alert send failed (gap=${gap}): ${err instanceof Error ? err.message : String(err)}`);
-      }
+      const prev = state.pendingGapAlert;
+      state.pendingGapAlert = prev
+        ? { gap: prev.gap + gap, detail: `${prev.detail}; ${idealFrom}–${from - 1}` }
+        : { gap, detail: `${idealFrom}–${from - 1}` };
     }
+    commitState();
+    await flushGapAlert();
     await flushDigest();
     await flushPreArmMail();
     await reconcileTrades();
@@ -2027,6 +2259,8 @@ async function main(): Promise<void> {
     if (priorityOf(n).rank <= 2) state.mailLog.push(routeNow);
   }
   commitState();
+  // 本 tick 的 gap 已随主邮件送达;这里只补送此前失败暂存的 gap 告警。
+  await flushGapAlert();
   await flushDigest();
   await flushPreArmMail();
   await reconcileTrades();

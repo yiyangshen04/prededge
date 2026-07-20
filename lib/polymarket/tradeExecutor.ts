@@ -66,6 +66,7 @@ import path from "path";
 import { homedir } from "os";
 import { CLOB_API, GAMMA_API } from "./config";
 import { ethCall } from "./oracleState";
+import { writeFileAtomic } from "../fsAtomic";
 
 export type ExecMode = "off" | "dry" | "live";
 
@@ -83,6 +84,9 @@ export interface TradeAttempt {
   filledUsd?: number;
   filledShares?: number;
   avgPrice?: number;
+  /** 实收 taker 费(Fee Structure V2;成交时按 filledUsd×rate×(1−均价) 计,
+   * 费率未知按平费 0.002 保守兜底)。结算盈亏的 cost 含此项。 */
+  feeUsd?: number;
   /** postOrder 是否已发出(true/false/"unknown" 超时未知)——资金占用按此计。 */
   posted?: boolean | "unknown";
   latencyMs?: number;
@@ -111,6 +115,11 @@ export interface TradeSignalInput {
    * bucket-* 白名单拦截在 chain-watch 的 maybeExecuteTrade。 */
   dirMethod?: string;
   negRisk?: boolean;
+  /** 市场费注解(execCheck feeSchedule 透传,taker 费记账用;2026-07-19 审查
+   * §2:此前 execCheck 明明取到了却在组装时丢弃,实盘盈亏全程不含费,
+   * won/连亏链系统性偏乐观)。undefined/null = 未知,按平费兜底。 */
+  feesEnabled?: boolean | null;
+  feeRate?: number | null;
   forecastTemplate?: boolean;
   correction?: boolean;
   /** 本 tick 剩余墙钟预算;不足则跳过,绝不拖垮告警路径。 */
@@ -142,9 +151,18 @@ interface LedgerEntry extends Omit<TradeAttempt, "status"> {
   raw?: unknown;
 }
 
+/** 数值环境变量。显式 0 是合法配置(如 EXEC_SLIPPAGE=0);未设/空串走默认;
+ * 垃圾值(NaN/负数)loud-warn 后走默认 —— 原实现把 0 与垃圾一样静默吞成默认,
+ * 操作员"设了 0"与"没设"不可区分(2026-07-19 审查顺手项)。 */
 const num = (name: string, dflt: number): number => {
-  const v = Number(process.env[name]);
-  return Number.isFinite(v) && v > 0 ? v : dflt;
+  const raw = process.env[name]?.trim();
+  if (!raw) return dflt;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v < 0) {
+    console.warn(`[trade-executor] 环境变量 ${name}="${raw}" 非法,使用默认 ${dflt}`);
+    return dflt;
+  }
+  return v;
 };
 const expandHome = (p: string): string => (p.startsWith("~") ? path.join(homedir(), p.slice(1)) : p);
 const rel = (p: string): string => (path.isAbsolute(p) ? p : path.join(process.cwd(), p));
@@ -245,6 +263,24 @@ export const upDriftBand = (signalAsk: number, slippage: number, edgeFrac: numbe
 export const crashDropThreshold = (signalAsk: number, slippage: number, dropFrac: number): number =>
   Math.max(slippage, dropFrac * signalAsk);
 
+/** 实收 taker 费(Fee Structure V2,2026-03-30 起 8 品类实收):买入侧
+ * fee = shares×rate×p×(1−p) = filledUsd×rate×(1−p)。feesEnabled=false → $0;
+ * 费率未知(注解缺失/字段不可信)按平费 0.002 保守近似 —— 与 paper 侧
+ * takerFeePct 的 config.feePct 兜底同源,宁多计不少计。 */
+export const takerFeeUsd = (
+  filledUsd: number,
+  avgPrice: number,
+  feesEnabled: boolean | null | undefined,
+  feeRate: number | null | undefined
+): number => {
+  if (feesEnabled === false) return 0;
+  const frac =
+    feesEnabled === true && feeRate != null && Number.isFinite(feeRate) && feeRate >= 0 && feeRate <= 0.2
+      ? feeRate * (1 - avgPrice)
+      : 0.002;
+  return Math.round(filledUsd * frac * 100) / 100;
+};
+
 /** 更正翻向双腿保护(§7):同 conditionId 已有敞口但 tokenId 不同 = 买对手边,
  * 两腿结算合计 ≤ $1,确定性锁损。返回冲突的已有持仓条目。 */
 export const findOppositeLeg = <
@@ -267,7 +303,7 @@ const PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 async function proxyUsdcBalance(funder: string): Promise<number | null> {
   try {
     const data = `0x70a08231${funder.toLowerCase().replace(/^0x/, "").padStart(64, "0")}`;
-    const result = await withTimeout(ethCall(PUSD_ADDRESS, data), 8_000, "pUSD balanceOf");
+    const result = await withTimeout(ethCall(PUSD_ADDRESS, data, 8_000), 8_000, "pUSD balanceOf");
     return Number(BigInt(result)) / 1e6;
   } catch {
     return null;
@@ -311,17 +347,26 @@ function settledCachePath(cfg: ReturnType<typeof execConfig>): string {
 }
 
 function loadSettledCache(cfg: ReturnType<typeof execConfig>): SettledCache {
+  const p = settledCachePath(cfg);
+  if (!existsSync(p)) return {}; // 首次运行,不是损坏
   try {
-    const parsed = JSON.parse(readFileSync(settledCachePath(cfg), "utf8"));
+    const parsed = JSON.parse(readFileSync(p, "utf8"));
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {}; // 首次/缓存损坏:全部重查,查不到的按未结算保守计
+  } catch (err) {
+    // 损坏静默清零 = 连亏水位/已通知标记全丢:连亏熔断链断裂 + 结算邮件整批
+    // 重发。仍按 {} 继续(fail-open,重查能自愈),但必须留下响声。
+    console.error(
+      `[trade-executor] trade-settled.json 损坏,按空缓存重查(连亏水位已丢失): ${err instanceof Error ? err.message : String(err)}`
+    );
+    return {};
   }
 }
 
 function saveSettledCache(cfg: ReturnType<typeof execConfig>, cache: SettledCache): void {
   try {
-    writeFileSync(settledCachePath(cfg), JSON.stringify(cache, null, 1));
+    // 连亏水位/结算通知的事实源:裸 writeFileSync 在崩溃/断电时留半截 JSON,
+    // 下次 load 静默清零。writeFileAtomic(临时文件+rename)保证旧新二选一。
+    writeFileAtomic(settledCachePath(cfg), JSON.stringify(cache, null, 1));
   } catch {
     // 缓存写失败只是下次重查,不影响本次口径
   }
@@ -329,9 +374,10 @@ function saveSettledCache(cfg: ReturnType<typeof execConfig>, cache: SettledCach
 
 /** 按 Gamma 结算价计算一组同 conditionId 持仓的已实现盈亏。只统计有成交明细
  * (filledUsd/filledShares)的条目;outcome 在 outcomes 里匹配不上时返回 null
- * —— 记结算但不记盈亏,宁缺毋错。 */
+ * —— 记结算但不记盈亏,宁缺毋错。cost 含成交时记账的实收 taker 费(feeUsd,
+ * 2026-07-19 审查 §2:不含费的 won/连亏链系统性偏乐观;存量无 feeUsd 行按 0)。 */
 export function computeSettlementPnl(
-  entries: Array<Pick<LedgerEntry, "outcome" | "filledUsd" | "filledShares">>,
+  entries: Array<Pick<LedgerEntry, "outcome" | "filledUsd" | "filledShares" | "feeUsd">>,
   outcomes: string[],
   outcomePrices: number[]
 ): { costUsd: number; payoutUsd: number; pnlUsd: number; won: boolean; outcomePrice: number } | null {
@@ -344,7 +390,7 @@ export function computeSettlementPnl(
     const idx = e.outcome ? lower.indexOf(e.outcome.toLowerCase().trim()) : -1;
     const p = idx >= 0 ? outcomePrices[idx] : NaN;
     if (!Number.isFinite(p)) return null;
-    cost += e.filledUsd!;
+    cost += e.filledUsd! + (e.feeUsd ?? 0);
     payout += e.filledShares! * p;
     price = p;
   }
@@ -723,17 +769,20 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
       if (cfg.skipForecastTemplate) {
         return finish({ mode, status: "skipped", reason: "预告模板家族(EXEC_SKIP_FORECAST_TEMPLATE=on,旧一刀切口径)" });
       }
-      // 闸1 boundary(核心):落地为 leans ∧ 事件窗口未结束 —— 与 tiering 的
-      // boundaryPending 同语义,在执行侧做成硬拦截(tiering 侧只降档,且
+      // 闸1 boundary(核心):落地为 leans ∧ 事件窗口未确认已决 —— 与 tiering
+      // 的 boundaryPending 同语义,在执行侧做成硬拦截(tiering 侧只降档,且
       // LLM_BOUNDARY_GUARD 可被关掉;-100% 级快照雷全部是此形态)。
+      // fail-closed(2026-07-19 审查 §10):eventStatus=null 是 llmStance 设计内
+      // 状态(v3 回复/字段缺失),原 === "pending" 对 null/unclear 放行 ——
+      // 硬闸对"未知"放行等于没闸。只有明确 decided 才过。
       if (
-        input.llmEventStatus === "pending" &&
+        input.llmEventStatus !== "decided" &&
         (/^leans_/i.test(input.llmStance ?? "") || /^leans_/i.test(input.stance))
       ) {
         return finish({
           mode,
           status: "skipped",
-          reason: "预告家族boundary闸:leans∧事件未决(快照雷形态,重放中无此闸家族净亏−$195)",
+          reason: `预告家族boundary闸:leans∧事件未确认已决(eventStatus=${input.llmEventStatus ?? "null"};快照雷形态,重放中无此闸家族净亏−$195;null/unclear 一律 fail-closed)`,
         });
       }
       // 闸2 防雷:方向侧信号价 <0.30 = 市场不跟随澄清方向(文本可疑/姊妹盘
@@ -1117,7 +1166,70 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
         resp
       );
     }
-    if (resp?.success === false || (errStr && !haveFill)) {
+    // 终态分类缺口(2026-07-19 审查 §6):success=false 但响应带成交金额 =
+    // 部分成交后被拒/撤(FAK 吃掉部分深度后余量无对手)。原第一析取不看
+    // haveFill,这类会被记成"拒单 $0"—— 真金已花却不占额、不封锁去重,同
+    // token 下轮重复买入(幽灵持仓)。按实际成交记账 + 主题告警。
+    if (resp?.success === false && haveFill) {
+      return finish(
+        {
+          mode,
+          status: usd >= orderUsd * 0.95 ? "filled" : "partial",
+          reason: `CLOB success=false 但含成交金额(按实际成交记账): ${errStr ?? ""}`.trim(),
+          orderId: resp?.orderID,
+          freshAsk,
+          limitPrice,
+          requestedUsd: orderUsd,
+          filledUsd: Math.round(usd * 100) / 100,
+          filledShares: Math.round(shares * 100) / 100,
+          avgPrice: Math.round((usd / shares) * 1000) / 1000,
+          feeUsd: takerFeeUsd(usd, usd / shares, input.feesEnabled, input.feeRate),
+          posted: true,
+          subjectAlert: "拒单响应含成交⚠",
+        },
+        resp
+      );
+    }
+    if (!haveFill && (resp?.success === false || errStr)) {
+      // §8:资金不足是容量问题不是运维故障 —— 持仓占满现金的批量日,每个
+      // 绿单都变 error,3 笔即误触发连续报错熔断把引擎停掉。记 skipped
+      // (不进 autoHalt 尾链),主题级告警留给人工补钱/赎回。
+      if (errStr && /insufficient|not enough|balance/i.test(errStr)) {
+        return finish(
+          {
+            mode,
+            status: "skipped",
+            reason: `CLOB 拒单(余额不足): ${errStr.slice(0, 160)}`,
+            orderId: resp?.orderID,
+            freshAsk,
+            limitPrice,
+            requestedUsd: orderUsd,
+            posted: true,
+            subjectAlert: "余额不足",
+          },
+          resp
+        );
+      }
+      // §6 相邻缺口:502/503/504 是网关错误,请求可能已到撮合后端 ——
+      // 不是确定性拒单,按 posted:"unknown" 保守占额,结算核销时终局。
+      const httpStatus = Number(resp?.status);
+      if (httpStatus === 502 || httpStatus === 503 || httpStatus === 504) {
+        const attempt = finish(
+          {
+            mode,
+            status: "error",
+            reason: `CLOB 网关错误 ${httpStatus}(结果未知): ${errStr ?? ""}`.trim(),
+            freshAsk,
+            limitPrice,
+            requestedUsd: orderUsd,
+            posted: "unknown",
+            subjectAlert: "下单结果未知",
+          },
+          resp
+        );
+        autoHaltOnRepeatedErrors(cfg);
+        return attempt;
+      }
       const attempt = finish(
         {
           mode,
@@ -1179,6 +1291,7 @@ export async function executeSignal(input: TradeSignalInput): Promise<TradeAttem
         filledUsd: Math.round(usd * 100) / 100,
         filledShares: Math.round(shares * 100) / 100,
         avgPrice: Math.round((usd / shares) * 1000) / 1000,
+        feeUsd: takerFeeUsd(usd, usd / shares, input.feesEnabled, input.feeRate),
         posted: true,
       },
       resp

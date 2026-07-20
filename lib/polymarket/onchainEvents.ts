@@ -1,5 +1,6 @@
 import type { GammaMarket } from "../types";
 import type { PolymarketClient } from "./client";
+import { guardHeadJump } from "./headGuard";
 
 /**
  * Incremental on-chain event sweep for the dispute-flow class.
@@ -74,8 +75,12 @@ interface LogEntry {
 }
 
 async function rpcRequest<T>(method: string, params: unknown[]): Promise<T> {
+  return rpcRequestVia(rpcUrls(), method, params);
+}
+
+async function rpcRequestVia<T>(urls: string[], method: string, params: unknown[]): Promise<T> {
   let lastError: Error | null = null;
-  for (const rpc of rpcUrls()) {
+  for (const rpc of urls) {
     try {
       // AbortSignal.timeout covers the body read too — a plain
       // controller+clearTimeout fires as soon as headers arrive, so a
@@ -182,11 +187,25 @@ export async function sweepDisputeEvents(
   if (!Number.isFinite(rawHead) || rawHead <= 0) {
     throw new Error(`bad eth_blockNumber result: ${rawHead}`);
   }
-  // Scan/advance the cursor only up to a confirmed depth (see CONFIRMATIONS).
-  const head = rawHead - CONFIRMATIONS;
 
   const cursorRaw = deps.getCursor();
   const cursor = cursorRaw != null ? Number(cursorRaw) : NaN;
+
+  // 头块守卫(2026-07-19 审查 §4,与 chain-watch 主循环共享 headGuard):
+  // 多链网关误路由的假高头会经 setCursor 毒化 kv 游标,此后每轮 "no new
+  // blocks" 静默死亡;假低头则静默空扫。chain-watch 侧同款 bug 已修,这里
+  // 原先只有 isFinite && >0。
+  await guardHeadJump({
+    rawHead,
+    lastCursor: Number.isFinite(cursor) ? cursor : 0,
+    crossCheckHead: async () =>
+      Number(await rpcRequestVia<string>([...rpcUrls()].reverse(), "eth_blockNumber", [])),
+    tag: "onchain-events",
+  });
+
+  // Scan/advance the cursor only up to a confirmed depth (see CONFIRMATIONS).
+  const head = rawHead - CONFIRMATIONS;
+
   const from = Number.isFinite(cursor)
     ? Math.max(cursor + 1, head - MAX_LOOKBACK_BLOCKS)
     : head - DEFAULT_LOOKBACK_BLOCKS;
